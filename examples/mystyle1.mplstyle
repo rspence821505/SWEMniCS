@@ -1,0 +1,40 @@
+# mystyle1.mplstyle
+
+# AXES
+axes.labelsize: 22.0
+axes.labelweight: bold
+axes.titlesize: 24.0
+axes.titleweight: bold
+axes.formatter.use_mathtext: True
+
+# LINES
+lines.linewidth: 3.0
+lines.markersize: 10.0
+
+# TICKS
+xtick.labelsize: 24.0
+ytick.labelsize: 24.0
+
+# FIGURE
+figure.labelsize: 22.0
+figure.labelweight: bold
+figure.titleweight: bold
+figure.titlesize: 24.0
+
+# FIGURE OUTPUT
+figure.dpi: 300
+savefig.dpi: 300
+savefig.bbox: tight
+
+# LEGEND
+legend.fontsize: 18.0
+legend.handlelength: 1.5
+legend.handleheight: 1.0
+legend.fancybox: True
+
+# FONT
+text.usetex: False
+mathtext.fontset: stix
+mathtext.default: bf
+font.family: STIXGeneral
+font.weight: bold

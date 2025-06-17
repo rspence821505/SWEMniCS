@@ -6,6 +6,7 @@ New numerical methods can be implemented by inheriting from the classes in this 
 
 from pathlib import Path
 from dolfinx import fem as fe, nls, log, geometry, io, cpp, mesh
+import sys
 
 try:
     from dolfinx.fem import functionspace
@@ -101,9 +102,9 @@ class BaseSolver:
         p_degree=[1, 1],
         p_type: Literal["CG", "DG"] = "CG",
         swe_type="full",
-        make_tangent=False,
-        make_tangent_every = 1,
-        verbose = True
+        get_adjoint=False,
+        get_adjoint_every=1,
+        verbose=True,
     ):
         r"""Iniitalize the solver.
 
@@ -127,18 +128,21 @@ class BaseSolver:
         self.names = ["eta", "u", "v"]
         # extra optional parameter added for linearized
         self.swe_type = swe_type
-        self.make_tangent = make_tangent
-        self.make_tangent_every = make_tangent_every
+        self.get_adjoint = get_adjoint
+        self.get_adjoint_every = get_adjoint_every
         self.F_no_dt = None
         self.verbose = verbose
+        self.saved_jacobians = []
+        self.saved_states = []
+
         if self.verbose:
             self.log("SWE TYPE", self.swe_type)
-        
+
         if self.wd:
-            if (self.verbose):
+            if self.verbose:
                 self.log("Wetting drying activated \n")
         else:
-            if (self.verbose):
+            if self.verbose:
                 self.log("Wetting drying NOT activated \n")
 
         self.init_fields()
@@ -248,8 +252,9 @@ class BaseSolver:
         res = fe.form(self.F)
         test_res = fe.petsc.create_vector(res)
         fe.petsc.assemble_vector(test_res, res)
-
+        print(f"Calling NewtonSolver", file=sys.stdout)
         solver = nls.petsc.NewtonSolver(MPI.COMM_WORLD, prob)
+        print("Solver created", file=sys.stdout)
         for k, v in solver_parameters.items():
             setattr(solver, k, v)
         solver.report = True
@@ -327,20 +332,20 @@ class CGImplicit(BaseSolver):
                     self.F += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
                         condition.marker
                     )
-                    if (self.make_tangent):
-                        self.F_no_dt += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
-                        condition.marker
-                    )
+                    # Rylan Todo: Exclude boundary conditions from adjoint
+                    # if self.get_adjoint:
+                    #     self.F_no_dt += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
+                    #         condition.marker
+                    #     )
                 if condition.type == "Wall":
                     self.F += dot(dot(self.Fu_wall, n), self.p) * ds_exterior(
                         condition.marker
                     )
-                    if (self.make_tangent):
-                        self.F_no_dt += dot(dot(self.Fu_wall, n), self.p) * ds_exterior(
-                        condition.marker
-                    )
-
-
+                    # Rylan Todo: Exclude boundary conditions from adjoint
+                    # if self.get_adjoint:
+                    #     self.F_no_dt += dot(dot(self.Fu_wall, n), self.p) * ds_exterior(
+                    #         condition.marker
+                    #     )
 
     def set_initial_condition(self):
         """Set the initial condition.
@@ -444,7 +449,6 @@ class CGImplicit(BaseSolver):
 
         # start adding to residual
         self.F = -inner(self.Fu, grad(self.p)) * dx
-        
 
         self.dt = self.problem.dt
 
@@ -481,13 +485,17 @@ class CGImplicit(BaseSolver):
             self.domain, PETSc.ScalarType(1 / self.dt)
         ) * (1.5 * u - 2 * u_n + 0.5 * u_n_old) + (1 - theta1) * fe.Constant(
             self.domain, PETSc.ScalarType(1 / self.dt)
-        ) * (u - u_n)
+        ) * (
+            u - u_n
+        )
 
-        #if we want to keep track of tangent model do not add this
-        #will this screw up, idk if just pointer or deep copy
-        #lets see
-        if (self.make_tangent):
-            self.F_no_dt = self.F
+        # Rylan Todo: Exclude this old code from adjoint
+
+        # if we want to keep track of tangent model do not add this
+        # will this screw up, idk if just pointer or deep copy
+        # lets see
+        # if self.get_adjoint:
+        #     self.F_no_dt = self.F
 
         self.add_bcs_to_weak_form()
         self.F += inner(self.dQdt, self.p) * dx
@@ -748,6 +756,12 @@ class CGImplicit(BaseSolver):
             inds = np.concatenate(gathered_inds)
         return inds, vals
 
+    # Rylan Todo: Added save_jacobians() method to save jacobians at end of each forward solve
+    def save_jacobians(self):
+        A_tangent = self.solver.assemble_A()
+        self.saved_jacobians.append(A_tangent)  # save A^T
+        self.saved_states.append(self.u.x.array.copy())  # save u
+
     def time_loop(
         self,
         solver_parameters,
@@ -805,16 +819,22 @@ class CGImplicit(BaseSolver):
             if a % plot_every == 0 and plot_every <= self.problem.nt:
                 self.plot_frame()
 
-            if (self.make_tangent):
-                if (a % self.make_tangent_every == 0):
-                    A_tangent = self.solver.form_tangent_mat()
-                    aa = A_tangent.getValuesCSR()
-                    huv_jacobian_array2 = csr_matrix((aa[2], aa[1], aa[0])).toarray()
-                    h_jacobian = huv_jacobian_array2[::3, ::3]  # h jacobian
-                    #how do we return this (it is in the solver object)
-                    #so we could stop every certain number of time steps to get this
+            # REPLACE This with save_jacobians() Rylan Todo
+            if self.get_adjoint:
+                self.save_jacobians()
+                # copy
+                # save jacobian
+                # save state
+                # if a % self.get_adjoint_every == 0: # want every step
+                # A_tangent = self.solver.form_tangent_mat()
+                # aa = A_tangent.getValuesCSR()
+                # huv_jacobian_array2 = csr_matrix((aa[2], aa[1], aa[0])).toarray()
+                # h_jacobian = huv_jacobian_array2[::3, ::3]  # h jacobian
+                # how do we return this (it is in the solver object)
+                # so we could stop every certain number of time steps to get this
 
         # switch to high order time stepping
+        print(f"Solver object {type(solver)} has been initialized")
         self.theta1.value = self.theta
         for a in range(2, self.problem.nt):
             if self.verbose:
@@ -831,14 +851,16 @@ class CGImplicit(BaseSolver):
             if a % plot_every == 0:
                 self.plot_frame()
 
-            if (self.make_tangent):
-                if (a % self.make_tangent_every == 0):
-                    A_tangent = self.solver.form_tangent_mat()
-                    aa = A_tangent.getValuesCSR()
-                    huv_jacobian_array2 = csr_matrix((aa[2], aa[1], aa[0])).toarray()
-                    h_jacobian = huv_jacobian_array2[::3, ::3]  # h jacobian
-                    #how do we return this (it is in the solver object)
-                    #so we could stop every certain number of time steps to get this
+            # REPLACE This with save_jacobians() Rylan Todo
+            if self.get_adjoint:
+                self.save_jacobians()
+                # if a % self.get_adjoint_every == 0:
+                #     A_tangent = self.solver.form_tangent_mat()
+                #     aa = A_tangent.getValuesCSR()
+                #     huv_jacobian_array2 = csr_matrix((aa[2], aa[1], aa[0])).toarray()
+                #     h_jacobian = huv_jacobian_array2[::3, ::3]  # h jacobian
+                # how do we return this (it is in the solver object)
+                # so we could stop every certain number of time steps to get this
 
         if plot_every <= self.problem.nt:
             self.finalize_video()
@@ -857,7 +879,10 @@ class CGImplicit(BaseSolver):
             e0 = self.problem.check_solution(self.u, self.V, self.problem.t)
             print("L2 error at t=", str(self.problem.t), " is ", str(e0))
 
-        return self.u, vals, self.eta_plot, h_jacobian
+        return (
+            self.u,
+            vals,
+        )
 
 
 class DGImplicit(CGImplicit):
@@ -946,11 +971,13 @@ class DGImplicit(CGImplicit):
 
         self.F += inner(flux, jump(self.p)) * dS
 
-        #if we want to keep track of tangent model do not add this
-        #will this screw up, idk if just pointer or deep copy
-        #lets see
-        if (self.make_tangent):
-            self.F_no_dt += inner(flux, jump(self.p)) * dS
+        # Rylan Todo: Exclude this old code from adjoint
+
+        # if we want to keep track of tangent model do not add this
+        # will this screw up, idk if just pointer or deep copy
+        # lets see
+        # if self.get_adjoint:
+        #     self.F_no_dt += inner(flux, jump(self.p)) * dS
 
     def add_bcs_to_weak_form(self):
         """Add boundary integrals to the variational form.
@@ -1017,24 +1044,32 @@ class DGImplicit(CGImplicit):
                         # Fix to this so we can analyze the BCs later
                         self.F += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
                             condition.marker
-                        )  
-                        if (self.make_tangent):
-                            self.F_no_dt += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
-                            condition.marker
-                            )
+                        )
+                        # Rylan Todo: Exclude boundary conditions from adjoint
+                        # if self.get_adjoint:
+                        #     self.F_no_dt += dot(
+                        #         dot(self.Fu_open, n), self.p
+                        #     ) * ds_exterior(condition.marker)
                     if condition.type == "Wall":
                         # self.F += dot(dot(self.Fu_wall, n), self.p)*ds_exterior(condition.marker) + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
                         self.F += dot(
                             0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
                         ) * ds_exterior(condition.marker) + dot(
                             0.5 * C_wall * jump_Q_wall, self.p
-                        ) * ds_exterior(condition.marker)
-                        if (self.make_tangent):
-                            self.F_no_dt += dot(
-                            0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
-                        ) * ds_exterior(condition.marker) + dot(
-                            0.5 * C_wall * jump_Q_wall, self.p
-                        ) * ds_exterior(condition.marker)
+                        ) * ds_exterior(
+                            condition.marker
+                        )
+                        # Rylan Todo: Exclude boundary conditions from adjoint
+                        # if self.get_adjoint:
+                        #     self.F_no_dt += dot(
+                        #         0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n),
+                        #         self.p,
+                        #     ) * ds_exterior(condition.marker) + dot(
+                        #         0.5 * C_wall * jump_Q_wall, self.p
+                        #     ) * ds_exterior(
+                        #         condition.marker
+                        #     )
+
                     # if condition.type == "OF":
                     #    self.F += dot(dot(self.Fu_side_wall, n), self.p)*ds_exterior(condition.marker)
             elif self.swe_type == "linear":
@@ -1081,26 +1116,38 @@ class DGImplicit(CGImplicit):
                             0.5 * dot(self.Fu_open, n) + 0.5 * dot(self.Fu, n), self.p
                         ) * ds_exterior(condition.marker) + dot(
                             0.5 * C_open * jump_Q_open, self.p
-                        ) * ds_exterior(condition.marker)
-                        if (self.make_tangent):
-                            self.F_no_dt += dot(
-                            0.5 * dot(self.Fu_open, n) + 0.5 * dot(self.Fu, n), self.p
-                        ) * ds_exterior(condition.marker) + dot(
-                            0.5 * C_open * jump_Q_open, self.p
-                        ) * ds_exterior(condition.marker)
+                        ) * ds_exterior(
+                            condition.marker
+                        )
+                        # Rylan Todo: Exclude boundary conditions from adjoint
+                        # if self.get_adjoint:
+                        #     self.F_no_dt += dot(
+                        #         0.5 * dot(self.Fu_open, n) + 0.5 * dot(self.Fu, n),
+                        #         self.p,
+                        #     ) * ds_exterior(condition.marker) + dot(
+                        #         0.5 * C_open * jump_Q_open, self.p
+                        #     ) * ds_exterior(
+                        #         condition.marker
+                        #     )
                     if condition.type == "Wall":
                         # self.F += dot(dot(self.Fu_wall, n), self.p)*ds_exterior(condition.marker) + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
                         self.F += dot(
                             0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
                         ) * ds_exterior(condition.marker) + dot(
                             0.5 * C_wall * jump_Q_wall, self.p
-                        ) * ds_exterior(condition.marker)
-                        if (self.make_tangent):
-                            self.F_no_dt += dot(
-                            0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
-                        ) * ds_exterior(condition.marker) + dot(
-                            0.5 * C_wall * jump_Q_wall, self.p
-                        ) * ds_exterior(condition.marker)
+                        ) * ds_exterior(
+                            condition.marker
+                        )
+                        # Rylan Todo: Exclude boundary conditions from adjoint
+                        # if self.get_adjoint:
+                        #     self.F_no_dt += dot(
+                        #         0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n),
+                        #         self.p,
+                        #     ) * ds_exterior(condition.marker) + dot(
+                        #         0.5 * C_wall * jump_Q_wall, self.p
+                        #     ) * ds_exterior(
+                        #         condition.marker
+                        #     )
 
                     # if condition.type == "OF":
                     #    self.F += dot(dot(self.Fu_side_wall, n), self.p)*ds_exterior(condition.marker)
@@ -1278,9 +1325,8 @@ class DGImplicitNonConservative(DGImplicit):
                             condition.marker
                         )
                     if condition.type == "Wall":
-                        self.F += (
-                            dot(dot(self.Fu_wall, n), self.p)
-                            * ds_exterior(condition.marker)
+                        self.F += dot(dot(self.Fu_wall, n), self.p) * ds_exterior(
+                            condition.marker
                         )  # + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
                         # self.F += dot(
                         #    0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
@@ -1333,14 +1379,18 @@ class DGImplicitNonConservative(DGImplicit):
                             0.5 * dot(self.Fu_open, n) + 0.5 * dot(self.Fu, n), self.p
                         ) * ds_exterior(condition.marker) + dot(
                             0.5 * C_open * jump_Q_open, self.p
-                        ) * ds_exterior(condition.marker)
+                        ) * ds_exterior(
+                            condition.marker
+                        )
                     if condition.type == "Wall":
                         # self.F += dot(dot(self.Fu_wall, n), self.p)*ds_exterior(condition.marker) + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
                         self.F += dot(
                             0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
                         ) * ds_exterior(condition.marker) + dot(
                             0.5 * C_wall * jump_Q_wall, self.p
-                        ) * ds_exterior(condition.marker)
+                        ) * ds_exterior(
+                            condition.marker
+                        )
                     # if condition.type == "OF":
                     #    self.F += dot(dot(self.Fu_side_wall, n), self.p)*ds_exterior(condition.marker)
 
@@ -1612,10 +1662,13 @@ class SUPGImplicit(CGImplicit):
             self.F += (
                 inner(dQdt + div(self.Fu) + self.S, (T1 * temp_x + T2 * temp_y)) * dx
             )
-            if (self.make_tangent):
-                self.F_no_dt += (
-                inner(dQdt + div(self.Fu) + self.S, (T1 * temp_x + T2 * temp_y)) * dx
-            )
+            # Rylan Todo: Exclude non time dependent terms from adjoint
+            # if self.get_adjoint:
+            #     self.F_no_dt += (
+            #         inner(dQdt + div(self.Fu) + self.S, (T1 * temp_x + T2 * temp_y))
+            #         * dx
+            #     )
+
             # attempt adding interior penalty
             # still may need work, but appears to help stability in channel case
             #####################################################################
@@ -1637,14 +1690,15 @@ class SUPGImplicit(CGImplicit):
                     )
                     * dx
                 )
-                if (self.make_tangent):
-                    self.F_no_dt += (
-                    inner(
-                        dQ_ncdt + T1 * self.u.dx(0) + T2 * self.u.dx(1) + S_nc,
-                        T1 * temp_x + T2 * temp_y,
-                    )
-                    * dx
-                )
+                # Rylan Todo: Exclude non time dependent terms from adjoint
+                # if self.get_adjoint:
+                #     self.F_no_dt += (
+                #         inner(
+                #             dQ_ncdt + T1 * self.u.dx(0) + T2 * self.u.dx(1) + S_nc,
+                #             T1 * temp_x + T2 * temp_y,
+                #         )
+                #         * dx
+                #     )
             else:
                 self.F += (
                     inner(
@@ -1653,14 +1707,15 @@ class SUPGImplicit(CGImplicit):
                     )
                     * dx
                 )
-                if (self.make_tangent):
-                    self.F_no_dt += (
-                    inner(
-                        dQ_ncdt + T1 * self.u.dx(0) + T2 * self.u.dx(1) + S_nc,
-                        (T1 * temp_x + T2 * temp_y),
-                    )
-                    * dx
-                )
+                # Rylan Todo: Exclude non time dependent terms from adjoint
+                # if self.get_adjoint:
+                #     self.F_no_dt += (
+                #         inner(
+                #             dQ_ncdt + T1 * self.u.dx(0) + T2 * self.u.dx(1) + S_nc,
+                #             (T1 * temp_x + T2 * temp_y),
+                #         )
+                #         * dx
+                #     )
 
             ######################################################################
             # attempt adding interior penalty

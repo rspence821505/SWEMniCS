@@ -80,15 +80,16 @@ class CustomNewtonProblem:
             self.pc = self.solver.getPC()
             self.pc.setType(self.pc_type)
 
+        # Don't need at all?
         # Rylan Todo: Get rid of this: do I need to take a derivative of the form? (Probably not dRdQ is in solve)
         # for tangent linear model work
-        self.make_tangent = obj1.make_tangent
-        if self.make_tangent:
-            self.F_no_dt = obj1.F_no_dt
-            # self.tangent_form = fe.form(self.F_no_dt)
-            self.tangent_J = ufl.derivative(self.F_no_dt, self.u)
-            self.tangent_jacobian = fe.form(self.tangent_J)
-            self.A_tangent = petsc.create_matrix(self.tangent_jacobian)
+        # self.make_tangent = obj1.make_tangent
+        # if self.make_tangent:
+        #     self.F_no_dt = obj1.F_no_dt
+        #     # self.tangent_form = fe.form(self.F_no_dt)
+        #     self.tangent_J = ufl.derivative(self.F_no_dt, self.u)
+        #     self.tangent_jacobian = fe.form(self.tangent_J)
+        #     self.A_tangent = petsc.create_matrix(self.tangent_jacobian)
 
     def log(self, *msg):
         if self.comm.rank == 0:
@@ -216,12 +217,19 @@ class CustomNewtonProblem:
         # print(L.getArray().size)
         # print(u.x.array[:])
 
-    # make A assemble function here
-    def form_tangent_mat(self):
-        self.A_tangent.zeroEntries()
-        petsc.assemble_matrix(self.A_tangent, self.tangent_jacobian, bcs=self.bcs)
-        self.A_tangent.assemble()
-        return self.A_tangent
+    # Rylan todo: make A assemble function here
+    # def form_tangent_mat(self):
+    #     self.A_tangent.zeroEntries()
+    #     petsc.assemble_matrix(self.A_tangent, self.tangent_jacobian, bcs=self.bcs)
+    #     self.A_tangent.assemble()
+    #     return self.A_tangent
+
+    def assemble_A(self):
+        # Rylan Todo: Make this into a function assemble_A use self.A instead of A
+        self.A.zeroEntries()
+        petsc.assemble_matrix(self.A, self.jacobian, bcs=self.bcs)
+        self.A.assemble()
+        return self.A.copy().transpose()
 
 
 class ElementBlockPreconditioner:

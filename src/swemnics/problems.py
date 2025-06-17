@@ -849,7 +849,9 @@ class TidalProblem(BaseProblem):
             boundary_conditions.append(bc)
 
         self._boundary_conditions = boundary_conditions
-        self._dirichlet_bcs = []  # [bc._bc for bc in self.boundary_conditions if bc.type == "Open"]
+        self._dirichlet_bcs = (
+            []
+        )  # [bc._bc for bc in self.boundary_conditions if bc.type == "Open"]
 
     def make_h_init(self, V):
         self.h_init = fe.Function(V)
@@ -891,7 +893,6 @@ class TidalProblem(BaseProblem):
 
             bc = self._hb_boundary + tide
             self.u_bc.sub(0).x.array[self.dof_open] = bc
-
 
 
 @dataclass
