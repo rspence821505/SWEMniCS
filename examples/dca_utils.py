@@ -26,7 +26,8 @@ def create_problem_solver(
                 friction_law="linear",
                 solution_var=problem_params["sol_var"],
                 wd=False,
-                # verbose=False,
+                adjoint_method=True,
+                verbose=False,
             )
             # print(f"True signal, using h_b: {prob.h_b}")
             # Create solver for TidalProblem
@@ -35,8 +36,7 @@ def create_problem_solver(
                 theta=1,
                 p_degree=[1, 1],
                 verbose=False,
-                get_adjoint=True,
-                get_adjoint_every=4,
+                adjoint_method=True,
             )
         else:
             prob = TidalProblem(
@@ -47,7 +47,8 @@ def create_problem_solver(
                 friction_law=problem_params["fric_law"],
                 solution_var=problem_params["sol_var"],
                 wd=False,
-                # verbose=False,
+                adjoint_method=True,
+                verbose=False,
                 # mag=0.11,
                 # alpha=0.00010538918781,
                 # h_b=6.0,
@@ -59,8 +60,7 @@ def create_problem_solver(
                 theta=1,
                 p_degree=[1, 1],
                 verbose=False,
-                get_adjoint=True,
-                get_adjoint_every=4,
+                adjoint_method=True,
             )
 
     else:
@@ -80,8 +80,7 @@ def create_problem_solver(
             theta=1,
             p_degree=[1, 1],
             verbose=False,
-            make_tangent=True,
-            make_tangent_every=4,
+            adjoint_method=True,
         )
         # Set the start time if provided
         if "t" in problem_params:
@@ -114,6 +113,7 @@ def get_true_signal(
         plot_every=60,
         plot_name="SUPG_Tide",
         u_0=u_0,
+        adjoint_method=True,
     )
 
     return solver, prob, stations, V_coords

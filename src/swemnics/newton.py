@@ -229,7 +229,7 @@ class CustomNewtonProblem:
         self.A.zeroEntries()
         petsc.assemble_matrix(self.A, self.jacobian, bcs=self.bcs)
         self.A.assemble()
-        return self.A.copy().transpose()
+        return self.A.copy()
 
 
 class ElementBlockPreconditioner:

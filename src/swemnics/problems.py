@@ -73,6 +73,8 @@ class BaseProblem(abc.ABC):
     wd: bool = False
     # wetting-and-drying parameter
     wd_alpha: float = 0.05
+    adjoint_method: bool = False
+    verbose: bool = True
 
     def __post_init__(self):
         """Initialize the mesh and other variables needed for BC's"""
@@ -89,7 +91,7 @@ class BaseProblem(abc.ABC):
     def log(self, *msg):
         """Log a message"""
 
-        if self.mesh.comm.Get_rank() == 0:
+        if self.mesh.comm.Get_rank() == 0 and self.verbose:
             print(*msg)
 
     def init_V(self, V):
@@ -137,7 +139,7 @@ class BaseProblem(abc.ABC):
                 if form == "h" or form == "flux":
                     h = h + self._wd_f(h)
             else:
-                print("WD NONACTIVE")
+                self.log("WD NONACTIVE")
             hux, huy = h * ux, h * uy
         elif self.solution_var == "eta":
             eta, ux, uy = u[0], u[1], u[2]
@@ -196,7 +198,7 @@ class BaseProblem(abc.ABC):
         if self.wd:
             eta, _, _ = self._get_standard_vars(u, form="eta")
             # fully comnservative
-            print("Fully conservative flux")
+            self.log("Fully conservative flux")
             components = [
                 [h * ux, h * uy],
                 [h * ux * ux + 0.5 * g * (eta * eta + 2 * eta * h_b), h * ux * uy],
@@ -264,7 +266,7 @@ class BaseProblem(abc.ABC):
         # but doesnt seem to work very well anyway
         eta, _, _ = self._get_standard_vars(u, form="eta")
         # fully comnservative
-        print("Fully nonconservative flux")
+        self.log("Fully nonconservative flux")
         components = [
             [h * ux, h * uy],
             [0.5 * ux * ux + g * eta, ux * uy],
@@ -419,7 +421,7 @@ class BaseProblem(abc.ABC):
                         )
                 else:
                     # no non-well balanced version
-                    print("WD nonspherical\n")
+                    self.log("WD nonspherical\n")
                     g_vec = as_vector((0, -g * eta * h_b.dx(0), -g * eta * h_b.dx(1)))
             # no wd
             else:
@@ -508,7 +510,7 @@ class BaseProblem(abc.ABC):
                     g_vec = as_vector((0, 0, 0))
             else:
                 # no non-well balanced version
-                print("WD nonconservative nonspherical\n")
+                self.log("WD nonconservative nonspherical\n")
                 g_vec = as_vector((0, -ux * uy.dx(1), -uy * ux.dx(0)))
 
         source = g_vec + self.get_friction(u, momentum_form=mom_form)
@@ -609,7 +611,7 @@ class BaseProblem(abc.ABC):
         # just a linear friction term
         cf = 0.0001
         # cf=0.000001
-        print("Linear source terms!! Using friction coefficient of ", cf)
+        self.log("Linear source terms!! Using friction coefficient of ", cf)
         # linear law which is same as ADCIRC option
         return as_vector((0, ux * cf, uy * cf))
 
@@ -978,7 +980,7 @@ class WellBalancedProblem(TidalProblem):
         """Initialize the mesh and other variables needed for BC's"""
         """for now, hard coded size of mesh
         """
-        print("nx,ny cells", self.nx, self.ny)
+        self.log("nx,ny cells", self.nx, self.ny)
 
         self.mesh = mesh.create_rectangle(
             MPI.COMM_WORLD, [[self.x0, self.y0], [self.x1, self.y1]], [self.nx, self.ny]
@@ -1058,7 +1060,7 @@ class RainProblem(TidalProblem):
         """Initialize the mesh and other variables needed for BC's"""
         """for now, hard coded size of mesh
         """
-        print("nx,ny cells", self.nx, self.ny)
+        self.log("nx,ny cells", self.nx, self.ny)
 
         self.mesh = mesh.create_rectangle(
             MPI.COMM_WORLD, [[self.x0, self.y0], [self.x1, self.y1]], [self.nx, self.ny]
@@ -1131,7 +1133,7 @@ class DamProblem(TidalProblem):
         """Initialize the mesh and other variables needed for BC's"""
         """for now, hard coded size of mesh
         """
-        print("nx,ny cells", self.nx, self.ny)
+        self.log("nx,ny cells", self.nx, self.ny)
         # for nondimensionalization
         x0, x1, y0, y1 = self.x0, self.x1, self.y0, self.y1
         self.mesh = mesh.create_rectangle(
@@ -1152,7 +1154,7 @@ class DamProblem(TidalProblem):
             ),
         ]  # ,
         # (3, lambda x: np.isclose(x[0],0))]
-        print("created mesh and boundaries")
+        self.log("created mesh and boundaries")
 
     def create_bathymetry(self, V):
         h_b = fe.Function(V.sub(0).collapse()[0])
@@ -1388,19 +1390,19 @@ class ConvergenceProblem(TidalProblem):
         # evaluate error L2
         e0 = u_sol.sub(0) - u_analytic.sub(0)
         l2_err = self.l2_norm(e0)
-        print("L2 error for h:", l2_err)
+        self.log("L2 error for h:", l2_err)
         e1 = u_sol.sub(1) - u_analytic.sub(1)
-        print("L2 error for u:", self.l2_norm(e1))
+        self.log("L2 error for u:", self.l2_norm(e1))
 
         # evaluate error Linf
         linf = self.error_infinity(
             u_sol.sub(0).collapse(), u_analytic.sub(0).collapse()
         )
-        print("L infinity error for h:", linf)
+        self.log("L infinity error for h:", linf)
         linf_u = self.error_infinity(
             u_sol.sub(1).collapse(), u_analytic.sub(1).collapse()
         )
-        print("L infinity error for u:", linf_u)
+        self.log("L infinity error for u:", linf_u)
         return l2_err
 
 
