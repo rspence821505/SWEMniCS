@@ -760,19 +760,27 @@ class CGImplicit(BaseSolver):
         """Save the transpose of the Jacobian matrix at each time step for adjoint calculations."""
         A_tangent = self.solver.assemble_A()  # returns Jacobian matrix A
         A_adjoint = A_tangent.transpose()  # Adjoint A^T
+        # print("A_adjoint copy", A_adjoint.copy())
         A_adjoint_array = A_adjoint.getValues(
             *map(range, A_adjoint.getSize())
-        )  # convert to numpy arrayt
+        )  # convert to numpy array
         self.saved_adjoints.append(A_adjoint_array.copy())  # save A^T
+        # self.saved_adjoints.append(A_adjoint)
 
     def save_height_adjoints(self):
         """Save the transpose of the Jacobian matrix at each time step for adjoint calculations."""
         A_tangent = self.solver.assemble_A()  # returns Jacobian matrix A
+
+        # A_temp = A_tangent.sub(0)  # copy A
+        # A_temp_adjoint = A_temp.transpose()  # Adjoint A^T
+        # self.saved_adjoints.append(A_temp_adjoint.copy())  # save A^T for h jacobian
+
         A_adjoint = A_tangent.transpose()  # Adjoint A^T
         A_adjoint_array = A_adjoint.getValues(
             *map(range, A_adjoint.getSize())
         )  # convert to numpy array
         H_adjoint_array = A_adjoint_array[::3, ::3]  # h adjoint
+        # print(f"H_adjoint_array: \n {H_adjoint_array} \n\n")
         self.saved_adjoints.append(H_adjoint_array.copy())  # save A^T
 
     def save_states(self):

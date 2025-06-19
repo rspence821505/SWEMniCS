@@ -86,7 +86,7 @@ def bayes_cost_function(
     """
     # Set up environment
     solver.problem.t = init_time
-
+    # print(f"Cost Function Solver Time 1: {solver.problem.t}")
     # Get model trajectory at observation times = H(z_k)
     Qz, solver, V = get_trajectory_observations(
         z,
@@ -96,6 +96,7 @@ def bayes_cost_function(
         hb,
         solver,
     )
+    # print(f"Cost Function Solver Time 1: {solver.problem.t}")
     # Compute background loss term = 0.5 * (z - z_b)^T B_inv (z - z_b)
     J_b = background_loss(z, z_b, B_inv)
 
@@ -111,93 +112,95 @@ def swe_adjoint(
     solver, H, obs_data, obs_spatial_idxs, obs_time_idxs, R_inv
 ) -> np.ndarray:
     """
-    Solves the adjoint equation backward in time using UFL's automatic differentiation.
+    Solves the adjoint equation backward in time using precomputed adjoint matrices.
 
     Parameters:
-        solver: Solver object containing the forward problem solution and adjoint forms
-        H: Observation operator
-        obs_time_idxs: List of observation times (indices)
-        obs_data: List of np.ndarrays of observation data
-        obs_spatial_idxs: DOF indices of observations
-        R_inv: Inverse of observation covariance matrix
+    solver: Solver object containing the forward problem solution and precomputed adjoint matrices
+    H: Observation operator
+    obs_time_idxs: List of observation times (indices)
+    obs_data: List of np.ndarrays of observation data
+    obs_spatial_idxs: DOF indices of observations
+    R_inv: Inverse of observation covariance matrix
     Returns:
-        grad_init: NumPy array representing ∇J(z0)
+    grad_init: NumPy array representing ∇J(z0)
     """
-    adjoints = solver.saved_adjoints  # List of adjoint forms for each time step
+    adjoints = (
+        solver.saved_adjoints
+    )  # List of precomputed adjoint matrices (numpy arrays)
     trajectories = solver.saved_states  # List of states at each time step
-
     nt = solver.vals.shape[0] - 1  # Number of time steps
     V = solver.V  # Function space for the problem
-    h_space = V.sub(0).collapse()[0]
-    λ = fe.Function(h_space)
-    λ_vec = np.zeros((nt + 1, len(λ.x.array)))
+    h_space = V.sub(0).collapse()[0]  # Collapsed function space for h (water depth)
+    λ = fe.Function(h_space)  # Create a function for the adjoint variable λ
+    λ_vec = np.zeros(
+        (nt + 1, len(λ.x.array))
+    )  # Initialize a vector to store adjoint solutions at each time step
     λ.x.array[:] = 0.0
 
-    print(
-        f"\n\n"
-        f"Number of Time Steps: {nt + 1}\n"
-        f"Trajectories Length: {len(trajectories)}\n"
-        f"Adjoints Length: {len(adjoints)}\n"
-        f"Observation Spatial Indices Length: {len(obs_spatial_idxs)}\n"
-        f"Observation Time Indices Length: {len(obs_time_idxs)}\n"
-        f"Single Trajectory Shape: {trajectories[0].shape}\n"
-        f"Single Adjoint Shape: {adjoints[0].shape}\n"
-        f"Lambda Shape: {λ.x.array.shape}\n"
-        f"Observation Spatial Indices: {obs_spatial_idxs}\n"
-        f"Observation Time Indices: {obs_time_idxs}\n"
-        f"Observation Data Shape: {obs_data.shape}\n"
-        f"R_inv Shape: {R_inv.shape}\n"
-        f"\n\n"
-    )
+    #     print(
+    #         f"\n\n"
+    #         f"Number of Time Steps: {nt + 1}\n"
+    #         f"Trajectories Length: {len(trajectories)}\n"
+    #         f"Adjoints Length: {len(adjoints)}\n"
+    #         f"Observation Spatial Indices Length: {len(obs_spatial_idxs)}\n"
+    #         f"Observation Time Indices Length: {len(obs_time_idxs)}\n"
+    #         f"Single Trajectory Shape: {trajectories[0].shape}\n"
+    #         f"Single Adjoint Shape: {adjoints[0].shape}\n"
+    #         f"Lambda Shape: {λ.x.array.shape}\n"
+    #         f"Observation Spatial Indices: {obs_spatial_idxs}\n"
+    #         f"Observation Time Indices: {obs_time_idxs}\n"
+    #         f"Observation Data Shape: {obs_data.shape}\n"
+    #         f"R_inv Shape: {R_inv.shape}\n"
+    #         f"\n\n"
+    #     )
+
+    # print(f"λ.x.array: {λ.x.array.shape}")
 
     # possible that λ_nt = Initial Misfit
     for n in reversed(range(nt)):
 
-        # build rhs of the adjoint equation H^TRinv(HQ - y)
+        # print(f"\n\n Adjoint: {adjoints[n]} \n\n")
+
+        # Initialize RHS vector (right-hand side of adjoint equation)
+        rhs = np.zeros(len(λ.x.array))
+
         # Add the observation term if this is an observation time
         if n in obs_time_idxs:
-            print(f"Processing observation at time step {n}")
+            # print(f"Processing observation at time step {n}")
+
             idx = np.where(obs_time_idxs == n)[0][0]  # Get index of observation time
-            # state at next time step: (126, 1) note 378 = 126 * 3
-            z_n = trajectories[n + 1].copy()
-            print(f"z_n shape: {z_n.shape}")
+
+            z_n = trajectories[n + 1].copy()  #
             Hz_n = z_n[obs_spatial_idxs]
-            print(f"Hz_n shape: {Hz_n.shape}")
             yobs = obs_data[idx, :].copy()
-            print(f"yobs shape: {yobs.shape}")
-            residual = Hz_n - yobs  # HQ - y
-            print(f"Residual shape: {residual.shape}")
+            residual = Hz_n - yobs  # Hz - y
 
-            # Create a function to represent the observation term
-            obs_func = fe.Function(h_space)
-            obs_func.x.array[:] = 0.0
-            temp = obs_func.x.array[obs_spatial_idxs]
-            obs_func.x.array[:] = H.T @ R_inv @ residual
+            # Create observation contribution and add to RHS
+            obs_contribution = H.T @ R_inv @ residual
 
-            # Add contribution to the adjoint right-hand side
-            λ.x.array[:] += obs_func.x.array[:]
+            # Add observation term to the RHS vector
+            rhs += obs_contribution
 
-        # Solve the adjoint equation
-        A, b = fe.petsc.assemble_matrix(adjoints[n], bcs=[])
-        A.assemble()
-        b.assemble()
+            # print(f"z_n shape: {z_n.shape}")
+            # print(f"Hz_n shape: {Hz_n.shape}")
+            # print(f"yobs shape: {yobs.shape}")
+            # print(f"Residual shape: {residual.shape}")
+            # print(f"Observation contribution shape: {obs_contribution.shape}")
 
-        # Create solution vector
-        λ_sol = fe.Function(h_space)
+        # Solve the adjoint system: A^T @ λ_sol = H^T @ R_inv @ (Hz- y)
+        try:
+            λ_sol = np.linalg.solve(adjoints[n], rhs)
+            # print(f"Adjoint system solution at time step {n}\n\n: {λ_sol}\n\n")
+        except np.linalg.LinAlgError:
+            # If matrix is singular, use pseudo-inverse
+            print(f"Warning: Using pseudo-inverse for singular matrix at time step {n}")
+            λ_sol = np.linalg.pinv(adjoints[n]) @ rhs
 
-        # Set up PETSc linear solver
-        solver_petsc = PETSc.KSP().create()
-        solver_petsc.setOperators(A)
-        solver_petsc.setType(PETSc.KSP.Type.PREONLY)  # Direct solver
-        pc = solver_petsc.getPC()
-        pc.setType(PETSc.PC.Type.LU)
-
-        # Solve the system
-        solver_petsc.solve(b, λ_sol.vector)
-        λ_sol.x.scatter_forward()
-
-        λ.x.array[:] = λ_sol.x.array[:]
+        # Update λ function and store in λ_vec
+        λ.x.array[:] = λ_sol
         λ_vec[n, :] = λ.x.array.copy()
+
+    # print(f"Adjoint system solution at Final Solution \n\n: {λ_vec[0, :]}\n\n")
 
     return λ_vec[0, :]
 
@@ -234,13 +237,14 @@ def grad_bayes_cost_function(
     #     hb,
     #     solver,
     # )
-    _, _, _, _, V = _setup_function_spaces(solver)
-
+    # print(f"Grad Cost Function Solver Time 1: {solver.problem.t}")
     # Compute Adjoint
     λ_0 = swe_adjoint(
         solver, H, y_obs, obs_spatial_indices, obs_time_indices, R_inv
     )  # Rylan Todo: These inputs are just placeholders, need to be updated
 
+    # loss = B_inv @ (z - z_b) + λ_0
+    # print(f"Grad Loss: {loss}")
     return B_inv @ (z - z_b) + λ_0
 
 
@@ -378,14 +382,18 @@ def run_assimilation(
     analysis = []
     analysis_state = None
 
+    # obs_times_current_window = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36]
+
     for idx in tqdm(
         range(problem_params["num_windows"]), desc="Processing windows", unit="window"
     ):
 
-        # Observe the current window's observation time indices
-        start = idx * obs_per_window
-        end = start + obs_per_window
-        obs_times_current_window = obs_time_indices[start:end]
+        if idx == 0:
+            # Observe the current window's observation time indices
+            start = idx * obs_per_window
+            end = start + obs_per_window
+            obs_times_current_window = obs_time_indices[start:end]
+            print(f"obs times:{obs_times_current_window}\n")
 
         # Extract observations for current window
         indices = np.arange(obs_per_window) + (idx * obs_per_window)
@@ -439,8 +447,13 @@ def run_assimilation(
         ].copy()  # (steps, num_stations, huv) 0 is h index
         # print(f"Backgound shape: {background_h.shape}")
         background_wse = background_h - hb
+        # print(f"Background WSE shape: {background_wse.shape}")
 
+        # print(
+        #     f"obs_times_current_window: {len(obs_times_current_window)} \n\n {obs_times_current_window}"
+        # )
         # Create background QoI map
+        # Q_zb = background_wse[obs_times_current_window]
         Q_zb = background_wse[obs_times_current_window]
 
         # Compute initial state
@@ -498,6 +511,10 @@ def run_assimilation(
         if idx < problem_params["num_windows"] - 1:
             current_analysis = current_analysis[:-1, :, :]
         analysis.append(current_analysis)
+
+        print(
+            f"/////////////////////////////////////// Window {idx + 1} Completed ////////////////////////////////////////////////// \n\n"
+        )
 
     # Combine all windows
     return np.concatenate(analysis, axis=0)
