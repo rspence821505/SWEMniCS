@@ -3,10 +3,6 @@ from mpi4py import MPI
 from swemnics.problems import SlopedBeachProblem, TidalProblem
 from swemnics import solvers as Solvers
 
-# import swemnics.solvers
-
-# print(swemnics.solvers.__file__)
-
 
 def create_problem_solver(
     problem_params, problem_type="sloped_beach", true_signal=True
@@ -14,84 +10,61 @@ def create_problem_solver(
     """
     Create a problem and solver based on the problem type and parameters.
     """
-    # Determine which problem type to create based on parameters
+    common_solver_kwargs = {
+        "theta": 1,
+        "p_degree": [1, 1],
+        "verbose": False,
+        "adjoint_method": True,
+    }
+
+    optional_solver_kwargs = {
+        "mag": 0.11,
+        "alpha": 0.00010538918781,
+        "h_b": 6.0,
+    }
+
     if problem_type == "tidal":
-        # Create TidalProblem
+        tidal_kwargs = {
+            "nx": problem_params["nx"],
+            "ny": problem_params["ny"],
+            "dt": problem_params["dt"],
+            "nt": problem_params["num_steps"],
+            "solution_var": problem_params["sol_var"],
+            "wd": False,
+            "adjoint_method": True,
+            "verbose": False,
+        }
+
         if true_signal:
-            prob = TidalProblem(
-                nx=problem_params["nx"],
-                ny=problem_params["ny"],
-                dt=problem_params["dt"],
-                nt=problem_params["num_steps"],
-                friction_law="linear",
-                solution_var=problem_params["sol_var"],
-                wd=False,
-                adjoint_method=True,
-                verbose=False,
-            )
-            # print(f"True signal, using h_b: {prob.h_b}")
-            # Create solver for TidalProblem
-            solver = Solvers.SUPGImplicit(
-                prob,
-                theta=1,
-                p_degree=[1, 1],
-                verbose=False,
-                adjoint_method=True,
-            )
+            tidal_kwargs["friction_law"] = "linear"
+            prob = TidalProblem(**tidal_kwargs)
         else:
-            prob = TidalProblem(
-                nx=problem_params["nx"],
-                ny=problem_params["ny"],
-                dt=problem_params["dt"],
-                nt=problem_params["num_steps"],
-                friction_law=problem_params["fric_law"],
-                solution_var=problem_params["sol_var"],
-                wd=False,
-                adjoint_method=True,
-                verbose=False,
-                # mag=0.11,
-                # alpha=0.00010538918781,
-                # h_b=6.0,
-            )
-            # print(f"No true signal, using h_b: {prob.h_b}")
-            # Create solver for TidalProblem
-            solver = Solvers.SUPGImplicit(
-                prob,
-                theta=1,
-                p_degree=[1, 1],
-                verbose=False,
-                adjoint_method=True,
-            )
+            tidal_kwargs["friction_law"] = problem_params["fric_law"]
+            prob = TidalProblem(**tidal_kwargs)  # Inverse crime case
+            # prob = TidalProblem(**tidal_kwargs, **optional_solver_kwargs)
+
+        solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
 
     else:
-        # Default to SlopedBeachProblem
-        prob = SlopedBeachProblem(
-            dt=problem_params["dt"],
-            nt=problem_params["num_steps"],
-            friction_law=problem_params["fric_law"],
-            solution_var=problem_params["sol_var"],
-            wd_alpha=0.36,
-            wd=True,
-            # verbose=False,
-        )
-        # Create solver for SlopedBeachProblem
-        solver = Solvers.DGImplicit(
-            prob,
-            theta=1,
-            p_degree=[1, 1],
-            verbose=False,
-            adjoint_method=True,
-        )
-        # Set the start time if provided
+        sloped_kwargs = {
+            "dt": problem_params["dt"],
+            "nt": problem_params["num_steps"],
+            "friction_law": problem_params["fric_law"],
+            "solution_var": problem_params["sol_var"],
+            "wd_alpha": 0.36,
+            "wd": True,
+        }
+
+        prob = SlopedBeachProblem(**sloped_kwargs)
+        solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
+
         if "t" in problem_params:
             solver.problem.t = problem_params["t"]
 
     return prob, solver
 
 
-def get_true_signal(
-    problem_params, problem_type, solver_params, create_problem_solver, obs_frequency=1
-):
+def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1):
     """
     Default values are sea level and 0 velocity
     """
@@ -102,7 +75,9 @@ def get_true_signal(
     u_0 = solver.u_n  # full initial condition
 
     V = solver.V  # create full function space
-    V_coords = V.sub(0).collapse()[0].tabulate_dof_coordinates()
+    V_coords = (
+        V.sub(0).collapse()[0].tabulate_dof_coordinates()
+    )  # collapse to height function space
     print(f"V_coords shape: {V_coords.shape}")
 
     stations = V_coords[::obs_frequency, :]
@@ -132,12 +107,16 @@ def generate_observations(true_signal, h_b, obs_indices, obs_std=0.1):
     """
 
     # Get true water surface elevation
-    wse = true_signal.vals[:, :, 0] - h_b
+    # wse = true_signal.vals[:, :, 0] - h_b
+    wse = true_signal.vals[:, :, 0]
 
     # Extract observations at specified indices
     y_obs = wse[obs_indices]
 
-    # Add Gaussian noise to observations
+    # Extract observations at specified indices: Hu
+    # y_obs = true_signal.vals[obs_indices, :, :]
+
+    # Add Gaussian noise to observations Hu + noise
     y_obs += obs_std * np.random.randn(*y_obs.shape)
 
     return y_obs
@@ -201,44 +180,6 @@ def barycentric_interpolation(triangle, values, point):
     weights = [lambda1, lambda2, lambda3]
 
     return interpolated_value, weights
-
-
-# def bayes_cost_function(
-#     z,
-#     z_b,
-#     y_obs,
-#     obs_indices,
-#     H,
-#     B_inv,
-#     R_inv,
-#     P_inv,
-#     Q_zb,
-#     solver_params,
-#     stations,
-#     hb,
-#     solver,
-#     init_time,
-# ):
-#     """
-#     Vectorized cost function for standard 4D-Var with a generic model.
-#     """
-#     # Set up environment
-#     V, _, _, wse_0 = _setup_function_spaces(solver, init_time)
-#     solver.problem.t = init_time
-#     # Compute background loss term
-#     J_b = background_loss(z, z_b, B_inv)
-
-#     # Get model trajectory observations
-#     Qz, _ = get_trajectory_observations(
-#         z, obs_indices, solver_params, stations, hb, wse_0, V, solver
-#     )
-
-#     # Compute observation loss term
-#     J_o = observation_loss(Qz, y_obs, R_inv)
-
-#     # print(f"J_b: {J_b}, J_o: {J_o}")
-
-#     return J_b + J_o
 
 
 def build_observation_matrix(prob, true_signal, stations):

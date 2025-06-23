@@ -48,26 +48,43 @@ def plot_simulation_results(
         _create_plot(
             x_data=plot_grid,
             y_data=[true_signal.vals[obs_indices, 0, 0], analysis[obs_indices, 0, 0]],
-            styles=["solid", "dashed"],
-            colors=["blue", "red"],
-            labels=["True", "Analysis"],
+            y_data=[
+                true_signal.vals[obs_indices, 0, 0],
+                analysis[obs_indices, 0, 0],
+                y_obs[:, station_idx],
+            ],
+            styles=["solid", "dashed", "o"],
+            colors=["blue", "red", "black"],
+            labels=["True", "Analysis", "Observed"],
             title="Tidal Height at 800 m for SUPG Scheme",
             xlabel="Time (days)",
             ylabel="Height (m)",
             filename=f"{save_prefix}tidal_height_SUPG.png" if save else None,
         )
 
-        # Plot 3: Tidal Velocity
+        # Plot 3: Tidal Velocity U
         _create_plot(
             x_data=plot_grid,
-            y_data=[true_signal.vals[obs_indices, 0, 1]],
-            styles=["solid"],
-            colors=["blue"],
-            labels=["True"],
-            title="Tidal Velocity at 800 m for SUPG Scheme",
+            y_data=[true_signal.vals[obs_indices, 0, 1], analysis[obs_indices, 0, 1]],
+            styles=["solid", "dashed"],
+            colors=["blue", "red"],
+            labels=["True", "Analysis"],
+            title="Tidal Velocity u at 800 m for SUPG Scheme",
             xlabel="Time (Days)",
             ylabel="Velocity (m/s)",
             filename=f"{save_prefix}tidal_velocity_SUPG.png" if save else None,
+        )
+        # Plot 4: Tidal Velocity V
+        _create_plot(
+            x_data=plot_grid,
+            y_data=[true_signal.vals[obs_indices, 0, 2], analysis[obs_indices, 0, 2]],
+            styles=["solid", "dashed"],
+            colors=["blue", "red"],
+            labels=["True", "Analysis"],
+            title="Tidal Velocity v at 800 m for SUPG Scheme",
+            xlabel="Time (Days)",
+            ylabel="Velocity (m/s)",
+            filename=f"{save_prefix}tidal_velocity_v_SUPG.png" if save else None,
         )
 
 

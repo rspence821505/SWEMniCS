@@ -1,359 +1,113 @@
 import numpy as np
 from dolfinx import fem as fe
 from petsc4py import PETSc
-from scipy.optimize import minimize
+from scipy.optimize import minimize, OptimizeResult
 from tqdm import tqdm
 from typing import List, Dict, Tuple, Callable
+import sys
+
+from dca_utils import create_problem_solver
+
+from cost_functions import (
+    bayes_cost_function,
+    dci_cost_function,
+    dci_wme_cost_function,
+    grad_cost_function,
+)
 
 
-# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Cost Function Helper Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
-
-
-def background_loss(z, z_b, B_inv):
-    """Calculate the background loss term."""
-    diff_b = z - z_b
-    return 0.5 * np.dot(diff_b, np.dot(B_inv, diff_b))
-
-
-def observation_loss(Qz, y_obs, R_inv):
-    """Calculate the observation loss term."""
-    obs_diff = (y_obs - Qz).T
-    return 0.5 * np.sum(obs_diff * (R_inv @ obs_diff))
-
-
-def _setup_function_spaces(solver):
+def print_optimization_summary(result: OptimizeResult) -> None:
     """
-    Set up common environment for all cost functions
+    Print a formatted summary of an optimization result.
+
+    Parameters
+    ----------
+    result : OptimizeResult
+        The result object returned by `scipy.optimize.minimize`.
     """
-    # solver.problem.t = init_time
-    V = solver.V
-    h_b = solver.problem.h_b
-    V_scalar = h_b._V
-    wse_0 = fe.Function(V_scalar)
-    u_0 = fe.Function(V)
-    h_0 = u_0.sub(0)  # just water depth
-    h_b = solver.problem.h_b  # bathymetry
-
-    return u_0, h_0, h_b, wse_0, V
-
-
-def get_trajectory_observations(
-    z, obs_time_indices, solver_params, stations, hb, solver
-):
-    """Propagate state through model and get observations."""
-
-    # Convert initial state vector in h space to full initial state vector in u space
-    u_0, h_0, h_b, wse_0, V = _setup_function_spaces(solver)
-
-    wse_0.x.array[:] = z
-
-    h_0.interpolate(fe.Expression(wse_0 + h_b, V.sub(0).element.interpolation_points()))
-
-    u_0.sub(0).interpolate(h_0)
-
-    (
-        _,
-        _,
-    ) = solver.time_loop(
-        solver_parameters=solver_params, stations=stations, u_0=u_0, adjoint_method=True
-    )
-
-    trajectory = solver.vals[:, :, 0]  # get h at station locations
-    wse = trajectory - hb  # convert h to wse
-    wse_obs = wse[obs_time_indices]  # get wse at observed times
-
-    return wse_obs, solver, V
+    print("\nOptimization completed:")
+    print(f"  Success: {result.success}")
+    print(f"  Status: {result.status}")
+    print(f"  Message: {result.message}")
+    print(f"  Final cost: {result.fun:.6e}")
+    print(f"  Iterations: {result.nit}")
+    print(f"  Function evaluations: {result.nfev}")
+    print(f"  Gradient norm at solution: {np.linalg.norm(result.jac):.6e}")
+    print("\n" + "-" * 60 + "\n")
 
 
-def bayes_cost_function(
-    z,
-    z_b,
-    y_obs,
-    obs_time_indices,
-    H,
-    B_inv,
-    R_inv,
-    P_inv,
-    Q_zb,
-    solver_params,
-    stations,
-    hb,
-    solver,
-    init_time,
-):
+def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) -> None:
     """
-    Vectorized cost function for standard 4D-Var with a generic model.
+    Print a summary of the initial and optimized state vectors.
+
+    Parameters
+    ----------
+    u0 : np.ndarray
+        Initial guess for the state vector.
+    result : OptimizeResult
+        Result object returned by `scipy.optimize.minimize`.
+    step : int, optional
+        Step size for subsampling the state vector when printing. Default is 20.
     """
-    # Set up environment
-    solver.problem.t = init_time
-    # print(f"Cost Function Solver Time 1: {solver.problem.t}")
-    # Get model trajectory at observation times = H(z_k)
-    Qz, solver, V = get_trajectory_observations(
-        z,
-        obs_time_indices,
-        solver_params,
-        stations,
-        hb,
-        solver,
-    )
-    # print(f"Cost Function Solver Time 1: {solver.problem.t}")
-    # Compute background loss term = 0.5 * (z - z_b)^T B_inv (z - z_b)
-    J_b = background_loss(z, z_b, B_inv)
-
-    # Compute observation loss term = 0.5 * (y_obs - Qz_k)^T R_inv (y_obs - Qz_k)
-    J_o = observation_loss(Qz, y_obs, R_inv)
-
-    # print(f"J_b: {J_b}, J_o: {J_o}")
-
-    return J_b + J_o
-
-
-def swe_adjoint(
-    solver, H, obs_data, obs_spatial_idxs, obs_time_idxs, R_inv
-) -> np.ndarray:
-    """
-    Solves the adjoint equation backward in time using precomputed adjoint matrices.
-
-    Parameters:
-    solver: Solver object containing the forward problem solution and precomputed adjoint matrices
-    H: Observation operator
-    obs_time_idxs: List of observation times (indices)
-    obs_data: List of np.ndarrays of observation data
-    obs_spatial_idxs: DOF indices of observations
-    R_inv: Inverse of observation covariance matrix
-    Returns:
-    grad_init: NumPy array representing ∇J(z0)
-    """
-    adjoints = (
-        solver.saved_adjoints
-    )  # List of precomputed adjoint matrices (numpy arrays)
-    trajectories = solver.saved_states  # List of states at each time step
-    nt = solver.vals.shape[0] - 1  # Number of time steps
-    V = solver.V  # Function space for the problem
-    h_space = V.sub(0).collapse()[0]  # Collapsed function space for h (water depth)
-    λ = fe.Function(h_space)  # Create a function for the adjoint variable λ
-    λ_vec = np.zeros(
-        (nt + 1, len(λ.x.array))
-    )  # Initialize a vector to store adjoint solutions at each time step
-    λ.x.array[:] = 0.0
-
-    #     print(
-    #         f"\n\n"
-    #         f"Number of Time Steps: {nt + 1}\n"
-    #         f"Trajectories Length: {len(trajectories)}\n"
-    #         f"Adjoints Length: {len(adjoints)}\n"
-    #         f"Observation Spatial Indices Length: {len(obs_spatial_idxs)}\n"
-    #         f"Observation Time Indices Length: {len(obs_time_idxs)}\n"
-    #         f"Single Trajectory Shape: {trajectories[0].shape}\n"
-    #         f"Single Adjoint Shape: {adjoints[0].shape}\n"
-    #         f"Lambda Shape: {λ.x.array.shape}\n"
-    #         f"Observation Spatial Indices: {obs_spatial_idxs}\n"
-    #         f"Observation Time Indices: {obs_time_idxs}\n"
-    #         f"Observation Data Shape: {obs_data.shape}\n"
-    #         f"R_inv Shape: {R_inv.shape}\n"
-    #         f"\n\n"
-    #     )
-
-    # print(f"λ.x.array: {λ.x.array.shape}")
-
-    # possible that λ_nt = Initial Misfit
-    for n in reversed(range(nt)):
-
-        # print(f"\n\n Adjoint: {adjoints[n]} \n\n")
-
-        # Initialize RHS vector (right-hand side of adjoint equation)
-        rhs = np.zeros(len(λ.x.array))
-
-        # Add the observation term if this is an observation time
-        if n in obs_time_idxs:
-            # print(f"Processing observation at time step {n}")
-
-            idx = np.where(obs_time_idxs == n)[0][0]  # Get index of observation time
-
-            z_n = trajectories[n + 1].copy()  #
-            Hz_n = z_n[obs_spatial_idxs]
-            yobs = obs_data[idx, :].copy()
-            residual = Hz_n - yobs  # Hz - y
-
-            # Create observation contribution and add to RHS
-            obs_contribution = H.T @ R_inv @ residual
-
-            # Add observation term to the RHS vector
-            rhs += obs_contribution
-
-            # print(f"z_n shape: {z_n.shape}")
-            # print(f"Hz_n shape: {Hz_n.shape}")
-            # print(f"yobs shape: {yobs.shape}")
-            # print(f"Residual shape: {residual.shape}")
-            # print(f"Observation contribution shape: {obs_contribution.shape}")
-
-        # Solve the adjoint system: A^T @ λ_sol = H^T @ R_inv @ (Hz- y)
-        try:
-            λ_sol = np.linalg.solve(adjoints[n], rhs)
-            # print(f"Adjoint system solution at time step {n}\n\n: {λ_sol}\n\n")
-        except np.linalg.LinAlgError:
-            # If matrix is singular, use pseudo-inverse
-            print(f"Warning: Using pseudo-inverse for singular matrix at time step {n}")
-            λ_sol = np.linalg.pinv(adjoints[n]) @ rhs
-
-        # Update λ function and store in λ_vec
-        λ.x.array[:] = λ_sol
-        λ_vec[n, :] = λ.x.array.copy()
-
-    # print(f"Adjoint system solution at Final Solution \n\n: {λ_vec[0, :]}\n\n")
-
-    return λ_vec[0, :]
-
-
-def grad_bayes_cost_function(
-    z,
-    z_b,
-    y_obs,
-    obs_spatial_indices,
-    obs_time_indices,
-    H,
-    B_inv,
-    R_inv,
-    P_inv,
-    Q_zb,
-    solver_params,
-    stations,
-    hb,
-    solver,
-    init_time,
-):
-    """
-    Vectorized cost function for standard 4D-Var with a generic model.
-    """
-    # Set up environment
-    # solver.problem.t = init_time
-
-    # # Get model trajectory at observation times = H(z_k)
-    # Qz, solver, V = get_trajectory_observations(
-    #     z,
-    #     obs_time_indices,
-    #     solver_params,
-    #     stations,
-    #     hb,
-    #     solver,
-    # )
-    # print(f"Grad Cost Function Solver Time 1: {solver.problem.t}")
-    # Compute Adjoint
-    λ_0 = swe_adjoint(
-        solver, H, y_obs, obs_spatial_indices, obs_time_indices, R_inv
-    )  # Rylan Todo: These inputs are just placeholders, need to be updated
-
-    # loss = B_inv @ (z - z_b) + λ_0
-    # print(f"Grad Loss: {loss}")
-    return B_inv @ (z - z_b) + λ_0
+    print("State comparison (subsampled):")
+    print(f"  Initial state (every {step}th entry):   {u0[::step]}")
+    print(f"  Optimized state (every {step}th entry): {result.x[::step]}\n")
 
 
 def optimize_4dvar(
-    z0: np.ndarray,
-    z_b: np.ndarray,
-    y_obs: np.ndarray,
-    obs_spatial_indices: np.ndarray,
-    obs_time_indices: np.ndarray,
-    H: np.ndarray,
-    B_inv: np.ndarray,
-    R_inv: np.ndarray,
-    P_inv: np.ndarray,
-    Q_zb: np.ndarray,
-    stations: List,
-    hb: np.ndarray,
-    solver_params: Dict,
-    cost_function: Callable,
-    grad_cost_function: Callable,
+    u0: np.ndarray,
+    cost_function_type: str,
     solver: Callable,
     init_time: Callable,
+    **kwargs,
 ) -> Tuple[np.ndarray, dict]:
     """
-    Perform 4D-Var optimization to minimize the cost function using SciPy's L-BFGS-B optimizer.
-
-    Returns
-    -------
-    Tuple[np.ndarray, dict]
-        The optimized state estimate and the optimization result information.
+    Perform 4D-Var optimization using a specified cost function and its gradient.
     """
 
-    def cost_fn(z0):
-        total_cost = cost_function(
-            z0,
-            z_b,
-            y_obs,
-            obs_time_indices,
-            H,
-            B_inv,
-            R_inv,
-            P_inv,
-            Q_zb,
-            solver_params,
-            stations,
-            hb,
-            solver,
-            init_time,
-        )
-        return total_cost
-
-    def grad_fn(z0):
-        total_gradient = grad_cost_function(
-            z0,
-            z_b,
-            y_obs,
-            obs_spatial_indices,
-            obs_time_indices,
-            H,
-            B_inv,
-            R_inv,
-            P_inv,
-            Q_zb,
-            solver_params,
-            stations,
-            hb,
-            solver,
-            init_time,
-        )
-        return total_gradient
+    # Mapping of cost function types to their implementations
+    cost_function_map = {
+        "bayes": bayes_cost_function,
+        "dci": dci_cost_function,
+        "dci_wme": dci_wme_cost_function,
+    }
 
     cost_function_values = []
+
+    # Cost function wrapper
+    def cost_fn(u0):
+        return cost_function_map[cost_function_type](
+            u0=u0, solver=solver, init_time=init_time, **kwargs
+        )
+
+    # Gradient function wrapper
+    def grad_fn(u0):
+        return grad_cost_function(
+            u0=u0, solver=solver, adjoint_type=cost_function_type, **kwargs
+        )
 
     def callback(x):
         cost = cost_fn(x)
         cost_function_values.append(cost)
         print(f"Iteration {len(cost_function_values)}: Cost = {cost:.6f}")
 
-    # options = {"maxfun": 10}
-    # options = {"gtol": 1e-6, "ftol": 1e-12, "maxiter": 1000, "disp": True}
-    # print("New Expirement")
-    # options = {"maxiter": 5, "disp": True}
+    # options = {"gtol": 1e-6, "ftol": 1e-12, "maxfun": 10, "maxiter": 1000, "disp": True}
 
     result = minimize(
-        cost_fn,
-        z0,
+        fun=cost_fn,
+        x0=u0,
         method="L-BFGS-B",
         jac=grad_fn,
         callback=callback,
         # options=options,
-        tol=1e-8,
     )
 
     # Print optimization results
-    print("\n Optimization completed:")
-    print(f"  Success: {result.success}")
-    print(f"  Status: {result.status}")
-    print(f"  Message: {result.message}")
-    print(f"  Final cost: {result.fun}")
-    print(f"  Iterations: {result.nit}")
-    print(f"  Function evaluations: {result.nfev}")
-    print("Gradient at solution:", result.jac)
-    print("Gradient norm at solution:", np.linalg.norm(result.jac))
-    # print(f"  Gradient evaluations: {result.njev}")
-    print("\n\n")
+    print_optimization_summary(result)
 
-    print(f"  Initial state: {z0[::10]}")  # Print every 10th element for brevity
-    print(
-        f"  Optimized state: {result.x[::10]}"
-    )  # Print every 10th element for brevity
+    # Print state comparison
+    print_state_summary(u0, result)
+
     return result.x, result
 
 
@@ -366,14 +120,10 @@ def run_assimilation(
     obs_spatial_indices,
     obs_time_indices,
     H,
-    B_inv,
-    R_inv,
-    P_inv,
+    covs,
     hb,
     problem_type,
-    create_problem_solver,
-    cost_function,
-    grad_cost_function,
+    cost_function_type,
 ):
     """
     Run 4DVar analysis with over assimilation windows
@@ -381,57 +131,37 @@ def run_assimilation(
     name = "Hotstart"
     analysis = []
     analysis_state = None
+    num_windows = problem_params["num_windows"]
+    steps_per_window = problem_params["num_steps"]
+    obs_times_current_window = obs_time_indices[:obs_per_window]
 
-    # obs_times_current_window = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36]
-
-    for idx in tqdm(
-        range(problem_params["num_windows"]), desc="Processing windows", unit="window"
-    ):
-
-        if idx == 0:
-            # Observe the current window's observation time indices
-            start = idx * obs_per_window
-            end = start + obs_per_window
-            obs_times_current_window = obs_time_indices[start:end]
-            print(f"obs times:{obs_times_current_window}\n")
+    for idx in tqdm(range(num_windows), desc="Processing windows", unit="window"):
 
         # Extract observations for current window
         indices = np.arange(obs_per_window) + (idx * obs_per_window)
         yobs_current_window = y_obs[indices]
 
         # Update initial time for model
-        initial_time = int(idx * problem_params["num_steps"] * problem_params["dt"])
+        initial_time = int(idx * steps_per_window * problem_params["dt"])
         problem_params.update({"t": initial_time})
 
         # Create problem and solver
         _, solver = create_problem_solver(
             problem_params, problem_type, true_signal=False
         )
-        solver.problem.t = initial_time
 
-        # print(f"Solver Time 1: {solver.problem.t}")
-
-        # Set up function spaces
-        V = solver.V
-        V_scalar = solver.problem.h_b._V
+        solver.problem.t = initial_time  # reset time to initial time
+        V = solver.V  # get function spaces
 
         # Initialize state
         u_0 = fe.Function(V)
-        if analysis_state is None:
-            u_0.x.array[:] = solver.u_n.x.array[:]
-        else:
-            # Use previous window's analysis state
-            u_0.x.array[:] = analysis_state
-
-        # Extract components
-        h_0 = u_0.sub(0)
-        h_b = solver.problem.h_b
-        wse_0 = fe.Function(V_scalar)
-
-        initial_u0 = u_0.copy()
+        u_0.x.array[:] = (
+            solver.u_n.x.array[:] if analysis_state is None else analysis_state
+        )
 
         # Generate background z_b
         print(f"Solver Time 1: {solver.problem.t}")
+        initial_u0 = u_0.copy()
         solver.time_loop(
             solver_parameters=solver_params,
             stations=stations,
@@ -442,54 +172,38 @@ def run_assimilation(
         )
 
         # Process background state
-        background_h = solver.vals[
-            :, :, 0
-        ].copy()  # (steps, num_stations, huv) 0 is h index
-        # print(f"Backgound shape: {background_h.shape}")
-        background_wse = background_h - hb
-        # print(f"Background WSE shape: {background_wse.shape}")
+        background = solver.vals.copy()  # (steps, num_stations, huv) 0 is h index
+        # print(f"Background shape: {background.shape}")
 
-        # print(
-        #     f"obs_times_current_window: {len(obs_times_current_window)} \n\n {obs_times_current_window}"
-        # )
         # Create background QoI map
-        # Q_zb = background_wse[obs_times_current_window]
-        Q_zb = background_wse[obs_times_current_window]
-
-        # Compute initial state
-        wse_0.interpolate(
-            fe.Expression(u_0.sub(0) - h_b, V.sub(0).element.interpolation_points())
-        )
+        Q_zb = background[obs_times_current_window]
+        # print(f"Q_zb shape: {Q_zb.shape}")
 
         # Get initial state vectors
-        z0 = wse_0.x.array[:]
-        z_b = wse_0.x.array[:]
+        z0 = initial_u0.x.array[:]
+        z_b = initial_u0.x.array[:]
+        # print(f"z0 shape: {z0.shape}")
 
-        wse_0.x.array[:], solver_state_info = optimize_4dvar(
-            z0,
-            z_b,
-            yobs_current_window,
-            obs_spatial_indices,
-            obs_times_current_window,
-            H,
-            B_inv,
-            R_inv,
-            P_inv,
-            Q_zb,
-            stations,
-            hb,
-            solver_params,
-            cost_function,
-            grad_cost_function,
-            solver,
-            initial_time,
+        # Assimilation Step
+        optimized_state, _ = optimize_4dvar(
+            u0=z0,
+            cost_function_type=cost_function_type,
+            solver=solver,
+            init_time=initial_time,
+            u_b=z_b,
+            y_obs=yobs_current_window,
+            obs_spatial_idxs=obs_spatial_indices,
+            obs_time_idxs=obs_times_current_window,
+            H=H,
+            covs=covs,
+            Q_zb=Q_zb,
+            stations=stations,
+            hb=hb,
+            solver_params=solver_params,
         )
 
         # Update state with optimized values
-        h_0.interpolate(
-            fe.Expression(wse_0 + h_b, V.sub(0).element.interpolation_points())
-        )
-        u_0.sub(0).interpolate(h_0)
+        u_0.x.array[:] = optimized_state
 
         # Run analysis forward
         solver.problem.t = initial_time
@@ -508,7 +222,7 @@ def run_assimilation(
 
         # Collect results
         current_analysis = solver.vals.copy()
-        if idx < problem_params["num_windows"] - 1:
+        if idx < num_windows - 1:
             current_analysis = current_analysis[:-1, :, :]
         analysis.append(current_analysis)
 

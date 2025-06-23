@@ -858,8 +858,10 @@ class CGImplicit(BaseSolver):
 
             # REPLACE This with save_adjoints() Rylan Todo
             if adjoint_method:
-                self.save_height_adjoints()
-                self.save_height_states()
+                self.save_adjoints()
+                self.save_states()
+                # self.save_height_adjoints()
+                # self.save_height_states()
                 # copy
                 # save jacobian
                 # save state
@@ -891,8 +893,10 @@ class CGImplicit(BaseSolver):
 
             # REPLACE This with save_adjoints() Rylan Todo
             if adjoint_method:
-                self.save_height_adjoints()
-                self.save_height_states()
+                self.save_adjoints()
+                self.save_states()
+                # self.save_height_adjoints()
+                # self.save_height_states()
                 # if a % self.get_adjoint_every == 0:
                 #     A_tangent = self.solver.form_tangent_mat()
                 #     aa = A_tangent.getValuesCSR()
