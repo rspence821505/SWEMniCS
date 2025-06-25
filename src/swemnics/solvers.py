@@ -171,7 +171,7 @@ class BaseSolver:
         # for plotting
         self.V_vel = self.V.sub(1).collapse()[0]
         self.V_scalar = self.V.sub(0).collapse()[0]
-        print("V scalar", self.V_scalar)
+        # print("V scalar", self.V_scalar)
 
         # split these up
 
@@ -637,6 +637,7 @@ class CGImplicit(BaseSolver):
 
     def record_stations(self, u_sol, points_on_proc):
         """saves time series at stations into a numpy array"""
+        # print(f"Points on proc: {points_on_proc.shape}, \n\n cells: {self.cells}")
         h_values = u_sol.sub(0).eval(points_on_proc, self.cells)
         if self.problem.solution_var in ["h", "flux"]:
             h_values -= self.station_bathy
@@ -790,13 +791,14 @@ class CGImplicit(BaseSolver):
 
     def save_height_states(self):
         """Save the current state of the solution at each time step for adjoint calculations."""
-        current_height = self.u.sub(0).collapse().x.array[:].copy()
-        self.saved_states.append(current_height)  # save state u
+        current_state = self.u.copy()
+        h_values = current_state.sub(0).eval(self.points_on_proc, self.cells)
+        if self.problem.solution_var in ["h", "flux"]:
+            h_values -= self.station_bathy
+        self.saved_states.append(h_values)  # save state height at stations: HPi_1u
 
-    # def get_adjoint_height(self, A):
-    #     A_arr = A.getValuesCSR()
-    #     huv_jacobian_array2 = csr_matrix((A_arr[2], A_arr[1], A_rr[0])).toarray()
-    #     return huv_jacobian_array2[::3, ::3]  # h jacobian
+        # current_height = self.u.sub(0).collapse().x.array[:].copy()
+        # self.saved_states.append(current_height)  # save state u
 
     def time_loop(
         self,
@@ -859,9 +861,9 @@ class CGImplicit(BaseSolver):
             # REPLACE This with save_adjoints() Rylan Todo
             if adjoint_method:
                 self.save_adjoints()
-                self.save_states()
+                # self.save_states()
                 # self.save_height_adjoints()
-                # self.save_height_states()
+                self.save_height_states()
                 # copy
                 # save jacobian
                 # save state
@@ -894,9 +896,9 @@ class CGImplicit(BaseSolver):
             # REPLACE This with save_adjoints() Rylan Todo
             if adjoint_method:
                 self.save_adjoints()
-                self.save_states()
+                # self.save_states()
                 # self.save_height_adjoints()
-                # self.save_height_states()
+                self.save_height_states()
                 # if a % self.get_adjoint_every == 0:
                 #     A_tangent = self.solver.form_tangent_mat()
                 #     aa = A_tangent.getValuesCSR()

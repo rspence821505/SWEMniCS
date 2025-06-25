@@ -47,7 +47,6 @@ def plot_simulation_results(
         # Plot 2: Tidal Height
         _create_plot(
             x_data=plot_grid,
-            y_data=[true_signal.vals[obs_indices, 0, 0], analysis[obs_indices, 0, 0]],
             y_data=[
                 true_signal.vals[obs_indices, 0, 0],
                 analysis[obs_indices, 0, 0],

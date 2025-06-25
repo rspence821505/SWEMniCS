@@ -107,8 +107,9 @@ def generate_observations(true_signal, h_b, obs_indices, obs_std=0.1):
     """
 
     # Get true water surface elevation
-    # wse = true_signal.vals[:, :, 0] - h_b
-    wse = true_signal.vals[:, :, 0]
+    wse = true_signal.vals[
+        :, :, 0
+    ]  # Observations are saved as water surface elevation h - h_b
 
     # Extract observations at specified indices
     y_obs = wse[obs_indices]
