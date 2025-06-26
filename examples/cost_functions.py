@@ -41,6 +41,46 @@ def initialize_wme_terms(y_obs, R_inv, L_inv):
     return num_obs, obs_var, L_inv_wme
 
 
+# def get_trajectory(
+#     u0: np.ndarray,
+#     solver_params: dict,
+#     stations: np.ndarray,
+#     solver,
+#     initial_time: float,
+# ) -> any:
+#     """
+#     Safely reset and run the forward model from a given initial condition `u0`.
+
+#     This version clears mutable solver state to ensure reproducibility between
+#     cost function and adjoint gradient computations.
+#     """
+#     V = solver.V
+#     u_0 = fe.Function(V)
+
+#     # Set initial condition
+#     u_0.x.array[:] = u0
+
+#     # ⛔️ Clear any stale state
+#     if hasattr(solver, "saved_states"):
+#         solver.saved_states.clear()
+
+#     if hasattr(solver, "saved_adjoints"):
+#         solver.saved_adjoints.clear()
+
+#     if hasattr(solver, "vals"):
+#         solver.vals.fill(0.0)
+
+#     # Reset solver time (important for multi-window assimilation)
+#     solver.problem.t = initial_time
+
+#     # Run forward model (this must populate saved states and adjoints)
+#     _, _ = solver.time_loop(
+#         solver_parameters=solver_params, stations=stations, u_0=u_0, adjoint_method=True
+#     )
+
+#     return solver
+
+
 def get_trajectory(u0, solver_params, stations, solver):
     """Propagate state through model and get observations."""
 
@@ -89,14 +129,16 @@ def bayes_cost_function(u0, solver, init_time, **kwargs):
     solver.problem.t = init_time
 
     # Run model
+    # solver = get_trajectory(u0, solver_params, stations, solver, init_time)
     solver = get_trajectory(u0, solver_params, stations, solver)
+    # print(f"Cost Time : {solver.problem.t}")  # Debugging line
 
     # Extract height field (h) and convert to WSE
-    trajectory = solver.vals[:, :, 0].copy()
-    wse = trajectory - hb
+    trajectory = solver.vals[:, :, 0].copy()  # solver.vals height is saved as wse
+    # trajectory = solver.vals.copy()  # solver.vals height is saved as wse
 
     # Evaluate QoI map (extract obs times)
-    Qz = wse[obs_time_indices]
+    Qz = trajectory[obs_time_indices]
 
     # Loss terms
 
@@ -299,8 +341,7 @@ def print_adjoint_debug_info(
 
 
 def print_observation_debug_info(
-    z_n: np.ndarray,
-    Hz_n: np.ndarray,
+    Hu: np.ndarray,
     yobs: np.ndarray,
     n: int,
 ):
@@ -308,9 +349,8 @@ def print_observation_debug_info(
     Print debug information for a single observation time step during the adjoint solve.
     """
     print(f"\n--- Observation Debug Info at Time Step {n} ---")
-    print(f"z_n shape: {z_n.shape}")
-    print(f"Hz_n shape: {Hz_n.shape}")
-    print(f"yobs shape: {yobs.shape}")
+    print(f"Hu shape: {Hu.shape}", f"Hu: {Hu[::10]}")
+    print(f"yobs shape: {yobs.shape}, yobs: {yobs[::10]}")
     print("----------------------------------------------\n")
 
 
@@ -367,13 +407,13 @@ def swe_adjoint(
         If the adjoint matrix at a time step is singular and cannot be pseudo-inverted.
     """
     adjoints = solver.saved_adjoints  # List of adjoint matrices (NumPy arrays)
-    trajectories = solver.saved_states  # List of forward states
-    nt = solver.vals.shape[0] - 1  # Number of time steps
-    V = solver.V  # Function space
-    λ = fe.Function(V)  # Adjoint function
+    # trajectories = solver.saved_states  # List of forward states
+    trajectories = solver.vals[:, :, 0].copy()
 
-    λ_vec = np.zeros((nt + 1, len(λ.x.array)))  # Store adjoint solution over time
-    λ.x.array[:] = 0.0
+    nt = len(adjoints)
+    N_dof = adjoints[0].shape[0]  # Number of spatial points
+    λ = np.zeros(N_dof)
+
     num_obs = len(obs_data)
 
     # print_adjoint_debug_info(
@@ -388,31 +428,25 @@ def swe_adjoint(
     # )
 
     for n in reversed(range(nt)):
-        rhs = np.zeros(len(λ.x.array))
-
         if n in obs_time_idxs:
             idx = np.where(obs_time_idxs == n)[0][0]
-            u = trajectories[n + 1].copy()
-            Hu = u[obs_spatial_idxs]
+            Hu = trajectories[n + 1].copy()  # Hu:
+            # rhs = np.zeros(N_dof)
             yobs = obs_data[idx].copy()
+            obs_residual = Hu - yobs
 
-            # print_observation_debug_info(u, Hu, yobs, n)
+            # print_observation_debug_info(Hu, yobs, n)
 
-            obs_contribution = adjoint_rhs(
-                H, Hu, yobs, R_inv, L_inv, Q_zb, num_obs, adjoint_type
-            )
-            rhs += obs_contribution
+            rhs = H.T @ R_inv @ obs_residual
+            λ += rhs
 
-        try:
-            λ_sol = np.linalg.solve(adjoints[n], rhs)
-        except np.linalg.LinAlgError:
-            print(f"Warning: Using pseudo-inverse for singular matrix at time step {n}")
-            λ_sol = np.linalg.pinv(adjoints[n]) @ rhs
+        # Solve A_n^T λ_n = λ
+        A_T = adjoints[n]  # Adjoint matrix at time step n
 
-        λ.x.array[:] = λ_sol
-        λ_vec[n, :] = λ.x.array.copy()
+        # Solve the linear system: A_T @ λ_new = λ
+        λ = np.linalg.solve(A_T, λ)
 
-    return λ_vec[0, :]
+    return λ  # This is λ_0 = ∇J(z_0)
 
 
 def grad_cost_function(u0, solver, adjoint_type="bayes", **kwargs):
@@ -439,6 +473,12 @@ def grad_cost_function(u0, solver, adjoint_type="bayes", **kwargs):
     B_inv, R_inv, L_inv = kwargs["covs"].values()
     Q_zb = kwargs["Q_zb"]
 
+    # print(f"Adjoint Time: {solver.problem.t}")  # Debugging line
+    # check if saved adjoints are available
+    if not hasattr(solver, "saved_adjoints") or not solver.saved_adjoints:
+        raise ValueError(
+            "Solver does not have saved adjoints. Ensure the model was run with adjoint_method=True."
+        )
     # Compute adjoint λ₀
     λ_0 = swe_adjoint(
         solver,

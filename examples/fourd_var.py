@@ -184,12 +184,6 @@ def run_assimilation(
         z_b = initial_u0.x.array[:]
         # print(f"z0 shape: {z0.shape}")
 
-        if idx == 0:
-            # save initial state numpy array
-            np.save("z0.npy", z0)
-            np.save("z_b.npy", z_b)
-            np.save("Q_zb.npy", Q_zb)
-
         # Assimilation Step
         optimized_state, _ = optimize_4dvar(
             u0=z0,

@@ -101,26 +101,32 @@ def setup_observation_indices(window_size, obs_frequency, total_steps):
     return obs_indices_per_window, obs_indices
 
 
-def generate_observations(true_signal, h_b, obs_indices, obs_std=0.1):
+def generate_observations(true_signal, obs_indices, obs_std=0.1):
     """
     Generate water surface elevation observations with noise.
     """
 
-    # Get true water surface elevation
-    wse = true_signal.vals[
-        :, :, 0
-    ]  # Observations are saved as water surface elevation h - h_b
-
-    # Extract observations at specified indices
-    y_obs = wse[obs_indices]
-
     # Extract observations at specified indices: Hu
-    # y_obs = true_signal.vals[obs_indices, :, :]
+    station_data = true_signal.vals[:, :, 0].copy()
+    y_obs = station_data[obs_indices]
 
     # Add Gaussian noise to observations Hu + noise
     y_obs += obs_std * np.random.randn(*y_obs.shape)
 
     return y_obs
+
+
+# def generate_observations(true_signal, obs_indices, obs_std=0.1):
+#     """
+#     Generate water surface elevation observations with noise.
+#     """
+#     # Extract observations at specified times
+#     y_obs = true_signal.vals[obs_indices, :, :]
+
+#     # Add Gaussian noise to observations Hu + noise
+#     y_obs += obs_std * np.random.randn(*y_obs.shape)
+
+#     return y_obs
 
 
 def find_obs_indices(array1, array2):
