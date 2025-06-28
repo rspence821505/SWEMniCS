@@ -74,6 +74,7 @@ def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1
     prob, solver = create_problem_solver(problem_params, problem_type)
     u_0 = solver.u_n  # full initial condition
 
+    # Doesn't work for DG Case
     V = solver.V  # create full function space
     V_coords = (
         V.sub(0).collapse()[0].tabulate_dof_coordinates()
@@ -88,6 +89,7 @@ def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1
         plot_every=60,
         plot_name="SUPG_Tide",
         u_0=u_0,
+        save_states=True,
         adjoint_method=True,
     )
 
@@ -97,7 +99,7 @@ def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1
 def setup_observation_indices(window_size, obs_frequency, total_steps):
     """Setup observation indices for windows"""
     obs_indices_per_window = np.arange(0, window_size, obs_frequency)
-    obs_indices = np.arange(0, total_steps, obs_frequency)
+    obs_indices = np.arange(0, total_steps - 1, obs_frequency)
     return obs_indices_per_window, obs_indices
 
 
@@ -189,54 +191,54 @@ def barycentric_interpolation(triangle, values, point):
     return interpolated_value, weights
 
 
-def build_observation_matrix(prob, true_signal, stations):
-    """
-    Build the observation matrix H that maps from FEM solution space to station observations.
+# def build_observation_matrix(prob, true_signal, stations):
+#     """
+#     Build the observation matrix H that maps from FEM solution space to station observations.
 
-    Parameters:
-    -----------
-    prob : Problem
-        The problem object containing the mesh
-    true_signal : Signal
-        Signal object with station initialization capability
-    stations : array-like
-        List of station coordinates
+#     Parameters:
+#     -----------
+#     prob : Problem
+#         The problem object containing the mesh
+#     true_signal : Signal
+#         Signal object with station initialization capability
+#     stations : array-like
+#         List of station coordinates
 
-    Returns:
-    --------
-    H : numpy.ndarray
-        Observation matrix mapping from FEM solution to station observations
-    """
-    # Create and get connectivity between cells and vertices
-    prob.mesh.topology.create_connectivity(2, 0)
-    connectivity = prob.mesh.topology.connectivity(2, 0)
-    node_coordinates = prob.mesh.geometry.x
+#     Returns:
+#     --------
+#     H : numpy.ndarray
+#         Observation matrix mapping from FEM solution to station observations
+#     """
+#     # Create and get connectivity between cells and vertices
+#     prob.mesh.topology.create_connectivity(2, 0)
+#     connectivity = prob.mesh.topology.connectivity(2, 0)
+#     node_coordinates = prob.mesh.geometry.x
 
-    # Initialize stations
-    true_signal.init_stations(stations)
-    station_cells = true_signal.cells
+#     # Initialize stations
+#     solver.init_stations(stations)
+#     station_cells = solver.cells
 
-    # Get collapsed function space information
-    V_collapsed = true_signal.V.sub(0).collapse()[0]
-    dofmap = V_collapsed.dofmap
+#     # Get collapsed function space information
+#     V_collapsed = solver.V.sub(0).collapse()[0]
+#     dofmap = V_collapsed.dofmap
 
-    # Create observation matrix
-    H = np.zeros((len(stations), dofmap.index_map.size_local))
+#     # Create observation matrix
+#     H = np.zeros((len(stations), dofmap.index_map.size_local))
 
-    for station_idx, station in enumerate(stations):
-        # Get cell nodes for this station
-        cell_id = station_cells[station_idx]
-        node_indices = connectivity.links(cell_id)
+#     for station_idx, station in enumerate(stations):
+#         # Get cell nodes for this station
+#         cell_id = station_cells[station_idx]
+#         node_indices = connectivity.links(cell_id)
 
-        # Get triangle coordinates and station point
-        triangle = node_coordinates[node_indices, :2]  # Drop z-coordinate
-        point = station[:2]  # Drop z-coordinate
+#         # Get triangle coordinates and station point
+#         triangle = node_coordinates[node_indices, :2]  # Drop z-coordinate
+#         point = station[:2]  # Drop z-coordinate
 
-        # Calculate barycentric weights
-        _, weights = barycentric_interpolation(triangle, node_indices, point)
+#         # Calculate barycentric weights
+#         _, weights = barycentric_interpolation(triangle, node_indices, point)
 
-        # Get equation numbers and populate H matrix
-        cell_dofs = dofmap.cell_dofs(cell_id)
-        H[station_idx, cell_dofs] = weights
+#         # Get equation numbers and populate H matrix
+#         cell_dofs = dofmap.cell_dofs(cell_id)
+#         H[station_idx, cell_dofs] = weights
 
-    return H
+#     return H

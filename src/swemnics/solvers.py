@@ -54,6 +54,14 @@ from petsc4py.PETSc import ScalarType
 from typing import Literal
 
 
+def petsc_to_csr(A):
+    """Convert a PETSc matrix to a CSR matrix."""
+    indptr, indices, data = (
+        A.getValuesCSR()
+    )  # row start locations, maps values to columns, and values
+    return csr_matrix((data, indices, indptr), shape=A.size)
+
+
 def create_element(mesh: mesh.Mesh, family: str, degree: int, shape: tuple[int] = ()):
     """Compatible element creation for UFL and Basix.
 
@@ -738,16 +746,12 @@ class CGImplicit(BaseSolver):
             inds = np.concatenate(gathered_inds)
         return inds, vals
 
-    # Rylan Todo: Added save_adjoints() method to save jacobians at end of each forward solve
     def save_adjoints(self):
         """Save the transpose of the Jacobian matrix at each time step for adjoint calculations."""
-        A_tangent = self.solver.assemble_A()  # returns Jacobian matrix A
-        A_adjoint = A_tangent.transpose()  # Adjoint A^T
-        A_adjoint_array = A_adjoint.getValues(
-            *map(range, A_adjoint.getSize())
-        )  # convert to numpy array
-        self.saved_adjoints.append(A_adjoint_array.copy())  # save A^T
-        # self.saved_adjoints.append(A_adjoint)
+        A_tlm = self.solver.assemble_A()  # returns Jacobian matrix A
+        A_adjoint = A_tlm.transpose()  # Adjoint A^T
+        adjoint_csr = petsc_to_csr(A_adjoint)  # convert to csr matrix
+        self.saved_adjoints.append(adjoint_csr.copy())  # save A^T
 
     def save_height_adjoints(self):
         """Save the transpose of the Jacobian matrix at each time step for adjoint calculations."""
@@ -788,6 +792,7 @@ class CGImplicit(BaseSolver):
         plot_every=999999,
         plot_name="debug_tide",
         u_0=None,
+        save_states=False,
         adjoint_method=False,
     ):
         h_jacobian = None
@@ -840,9 +845,12 @@ class CGImplicit(BaseSolver):
                 self.plot_frame()
 
             # REPLACE This with save_adjoints() Rylan Todo
+            if save_states:
+                self.save_states()
+
             if adjoint_method:
                 self.save_adjoints()
-                self.save_states()
+
                 # self.save_height_adjoints()
                 # self.save_height_states()
 
@@ -864,10 +872,12 @@ class CGImplicit(BaseSolver):
             if a % plot_every == 0:
                 self.plot_frame()
 
-            # REPLACE This with save_adjoints() Rylan Todo
+            if save_states:
+                self.save_states()
+
             if adjoint_method:
                 self.save_adjoints()
-                self.save_states()
+
                 # self.save_height_adjoints()
                 # self.save_height_states()
 

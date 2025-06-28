@@ -50,7 +50,7 @@ def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) 
         Step size for subsampling the state vector when printing. Default is 20.
     """
     print("State comparison (subsampled):")
-    print(f"  Initial state (every {step}th entry):   {u0[::step]}")
+    print(f"  Initial state (every {step}th entry):   {u0[::step]}\n")
     print(f"  Optimized state (every {step}th entry): {result.x[::step]}\n")
 
 
@@ -106,7 +106,7 @@ def optimize_4dvar(
     print_optimization_summary(result)
 
     # Print state comparison
-    print_state_summary(u0, result)
+    print_state_summary(u0, result, step=100)
 
     return result.x, result
 
@@ -168,16 +168,20 @@ def run_assimilation(
             plot_every=60,
             plot_name=name,
             u_0=initial_u0,
+            save_states=True,
             adjoint_method=False,
         )
 
         # Process background state
-        background = solver.vals.copy()  # (steps, num_stations, huv) 0 is h index
-        # print(f"Background shape: {background.shape}")
-
-        # Create background QoI map
-        Q_zb = background[obs_times_current_window]
-        # print(f"Q_zb shape: {Q_zb.shape}")
+        background = np.array(solver.saved_states)  # shape: (steps, num_stations)
+        print(f"Background shape: {background.shape}")
+        # print(f"obs_times_current_window: {obs_times_current_window}")
+        observed_background_states = background[
+            obs_times_current_window
+        ]  # shape: (n_obs, state_dim)
+        Q_zb = H @ observed_background_states.T  # shape: (n_obs,obs_dim)
+        solver.saved_states = []  # reset saved states for next window
+        print(f"Q_zb shape: {Q_zb.shape}")
 
         # Get initial state vectors
         z0 = initial_u0.x.array[:]

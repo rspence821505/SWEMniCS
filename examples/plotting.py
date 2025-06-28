@@ -31,8 +31,8 @@ def plot_simulation_results(
         _create_plot(
             x_data=plot_grid,
             y_data=[
-                (true_signal.vals[:, :, 0] - hb)[obs_indices, station_idx],
-                (analysis[:, :, 0] - hb)[obs_indices, station_idx],
+                (true_signal.vals[:, :, 0])[obs_indices, station_idx],
+                (analysis[:, :, 0])[obs_indices, station_idx],
                 y_obs[:, station_idx],
             ],
             styles=["solid", "dashed", "o"],
@@ -48,8 +48,8 @@ def plot_simulation_results(
         _create_plot(
             x_data=plot_grid,
             y_data=[
-                true_signal.vals[obs_indices, 0, 0],
-                analysis[obs_indices, 0, 0],
+                (true_signal.vals[:, :, 0])[obs_indices, station_idx] - hb,
+                (analysis[:, :, 0])[obs_indices, station_idx] - hb,
                 y_obs[:, station_idx],
             ],
             styles=["solid", "dashed", "o"],
