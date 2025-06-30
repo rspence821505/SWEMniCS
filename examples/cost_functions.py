@@ -10,27 +10,52 @@ from dolfinx import fem as fe
 # \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Cost Function Helper Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 
 
-def background_loss(z, z_b, B_inv):
+def _background_loss(z, z_b, B_inv):
     """Calculate the background loss term."""
     diff_b = z - z_b
     return 0.5 * np.dot(diff_b, np.dot(B_inv, diff_b))
 
 
-def observation_loss(Qz, y_obs, R_inv):
+def _observation_loss(Qz, y_obs, R_inv):
     """Calculate the observation loss term."""
     obs_diff = y_obs.T - Qz
     return 0.5 * np.sum(obs_diff * (R_inv @ obs_diff))
 
 
-def prediction_loss(Qz, Q_zb, L_inv):
+def _prediction_loss(Qz, Q_zb, L_inv):
     """Calculate the prediction loss term."""
     pred_diff = Qz - Q_zb
     return 0.5 * np.sum(pred_diff * (L_inv @ pred_diff))
 
 
+def _adjoint_rhs_bayes(H, Hu, yobs, R_inv, **kwargs):
+    """Compute the adjoint right-hand side for the Bayesian cost function."""
+    obs_residual = Hu - yobs
+    return H.T @ R_inv @ obs_residual
+
+
+def _adjoint_rhs_dci(H, Hu, yobs, R_inv, L_inv, Q_zb, **kwargs):
+    """Compute the adjoint right-hand side for the DCI cost function."""
+    obs_residual = Hu - yobs
+    pred_residual = Hu - Q_zb
+    return H.T @ R_inv @ obs_residual - H.T @ L_inv @ pred_residual
+
+
+def _adjoint_rhs_dci_wme(H, Hu, yobs, R_inv, L_inv, Q_zb, Q_zb_wme, Q_z_wme, **kwargs):
+    """Compute the adjoint right-hand side for the DCI WME cost function."""
+    num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(yobs, R_inv, L_inv)
+    # q_wme = wme_map(Hu, yobs, obs_var, num_obs)
+    # qzb_wme = wme_map(Q_zb, yobs, obs_var, num_obs)
+    gamma = (1 / np.sqrt(num_obs)) * obs_sum
+    return gamma * H.T @ (Q_z_wme - L_inv_wme @ (Q_z_wme - Q_zb_wme))
+
+
 def wme_map(Qz, y_obs, var, num_obs):
     """Calculate Weighted Mean Error terms."""
-    wme = (1 / np.sqrt(num_obs)) * np.sum((Qz - y_obs).T / np.sqrt(var), axis=1)
+    # print(f"Qz shape: {Qz.shape}, y_obs shape: {y_obs.shape}")
+    residual = (Qz.T - y_obs).T
+    # print(f"Residual shape: {residual.shape}")
+    wme = (1 / np.sqrt(num_obs)) * np.sum((Qz.T - y_obs).T / np.sqrt(var), axis=1)
     return wme
 
 
@@ -141,13 +166,13 @@ def bayes_cost_function(u0, solver, init_time, **kwargs):
     observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
     Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
 
+    # print(f"Qz shape: {Qz.shape}, y_obs shape: {y_obs.shape}")
     # Loss terms
-
     # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
-    J_b = background_loss(u0, u_b, B_inv)
+    J_b = _background_loss(u0, u_b, B_inv)
 
     # Compute Observation loss term 0.5 * (Qz - y_obs).T @ R_inv @ (Qz - y_obs)
-    J_o = observation_loss(Qz, y_obs, R_inv)
+    J_o = _observation_loss(Qz, y_obs, R_inv)
 
     return J_b + J_o
 
@@ -193,13 +218,13 @@ def dci_cost_function(u0, solver, init_time, **kwargs):
     # Loss terms
 
     # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
-    J_b = background_loss(u0, u_b, B_inv)
+    J_b = _background_loss(u0, u_b, B_inv)
 
     # Compute Observation loss term 0.5 * (Qz - y_obs).T @ R_inv @ (Qz - y_obs)
-    J_o = observation_loss(Qz, y_obs, R_inv)
+    J_o = _observation_loss(Qz, y_obs, R_inv)
 
     # Compute Prediction loss term 0.5 * (Qz - Q_zb).T @ P_inv @ (Qz - Q_zb)
-    J_p = prediction_loss(Qz, Q_zb, L_inv)
+    J_p = _prediction_loss(Qz, Q_zb, L_inv)
 
     return J_b + J_o - J_p
 
@@ -234,17 +259,19 @@ def dci_wme_cost_function(u0, solver, init_time, **kwargs):
     # Reset solver time to initial time
     solver.problem.t = init_time
 
-    # Initialize WME terms
-    num_obs, obs_var, L_inv_wme = initialize_wme_terms(y_obs, R_inv, L_inv)
-
-    # Background loss
-    J_b = background_loss(u0, u_b, B_inv)
-
-    # Run model trajectory
+    # Run model
     solver = get_trajectory(u0, solver_params, stations, solver)
-    trajectory = solver.vals[:, :, 0].copy()
-    wse = trajectory - hb
-    Qz = wse[obs_time_indices]
+    states = np.array(solver.saved_states)  # shape: (steps, num_stations)
+    observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
+    Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
+
+    # Initialize WME terms
+    num_obs, obs_var, _, L_inv_wme = initialize_wme_terms(y_obs, R_inv, L_inv)
+
+    # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
+    J_b = _background_loss(u0, u_b, B_inv)
+
+    # print(f"Qz shape: {Qz.shape}, y_obs shape: {y_obs.shape}")
 
     # Observation loss (WME)
     obs_wme = wme_map(Qz, y_obs, obs_var, num_obs)
@@ -259,26 +286,6 @@ def dci_wme_cost_function(u0, solver, init_time, **kwargs):
     return J_b + J_o - J_p
 
 
-def _adjoint_rhs_bayes(H, Hu, yobs, R_inv, **kwargs):
-    obs_residual = Hu - yobs
-    return H.T @ R_inv @ obs_residual
-
-
-def _adjoint_rhs_dci(H, Hu, yobs, R_inv, L_inv, Q_zb, **kwargs):
-    obs_residual = Hu - yobs
-    # print(f"Hu shape: {Hu.shape}, Q_zb shape: {Q_zb.shape}")
-    pred_residual = Hu - Q_zb
-    return H.T @ R_inv @ obs_residual - H.T @ L_inv @ pred_residual
-
-
-def _adjoint_rhs_dci_wme(H, Hu, yobs, R_inv, L_inv, Q_zb, num_obs, **kwargs):
-    num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(yobs, R_inv, L_inv)
-    q_wme = wme_map(Hu, yobs, obs_var, num_obs)
-    qzb_wme = wme_map(Q_zb, yobs, obs_var, num_obs)
-    gamma = (1 / np.sqrt(num_obs)) * obs_sum
-    return gamma * H.T @ (q_wme - L_inv_wme @ (q_wme - qzb_wme))
-
-
 def adjoint_rhs(
     H: np.ndarray,
     Hu: np.ndarray,
@@ -286,7 +293,8 @@ def adjoint_rhs(
     R_inv: np.ndarray,
     L_inv: np.ndarray,
     Q_zb: np.ndarray,
-    num_obs: int,
+    Q_zb_wme: Optional[np.ndarray] = None,
+    Q_z_wme: Optional[np.ndarray] = None,
     adjoint_type: Literal["bayes", "dci", "dci_wme"] = "bayes",
 ) -> np.ndarray:
     """
@@ -308,7 +316,8 @@ def adjoint_rhs(
         R_inv=R_inv,
         L_inv=L_inv,
         Q_zb=Q_zb,
-        num_obs=num_obs,
+        Q_zb_wme=Q_zb_wme,
+        Q_z_wme=Q_z_wme,
     )
 
 
@@ -429,17 +438,47 @@ def swe_adjoint(
     # )
     # print(f"y_obs shape: {obs_data.shape}, obs_time_idxs: {obs_time_idxs}")
 
+    if adjoint_type == "dci_wme":
+        states = np.array(trajectories)  # shape: (steps, num_stations)
+        observed_states = states[obs_time_idxs]  # shape: (n_obs, state_dim)
+        Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
+        num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(
+            obs_data, R_inv, L_inv
+        )
+        Qz_wme = wme_map(Qz, obs_data, obs_var, num_obs)
+        Qzb_wme = wme_map(Q_zb, obs_data, obs_var, num_obs)
+        # print(
+        #     f"Qzb_wme shape: {Qzb_wme.shape},Qz_wme shape {Qz_wme.shape},  y_obs shape : {obs_data.shape}"
+        # )
+    else:
+        Qz = None
+        Qz_wme = None
+        Qzb_wme = None
+
     for n in reversed(range(nt)):
         if n in obs_time_idxs:
             idx = np.where(obs_time_idxs == n)[0][0]
             u = trajectories[n + 1].copy()  # u:
             Hu = H @ u
+            # print(f"Hu shape: {Hu.shape}, obs_data shape: {obs_data.shape}")
 
             yobs = obs_data[idx].copy()
             q_zb = Qzb[idx].copy() if Q_zb is not None else None
+            # q_zb_wme = Qzb_wme[idx].copy() if Q_zb is not None else None
+            # q_z_wme = Qz_wme[idx].copy() if Q_zb is not None else None
 
             # print_observation_debug_info(Hu, yobs, n)
-            rhs = adjoint_rhs(H, Hu, yobs, R_inv, L_inv, q_zb, num_obs, adjoint_type)
+            rhs = adjoint_rhs(
+                H,
+                Hu,
+                yobs,
+                R_inv,
+                L_inv,
+                q_zb,
+                Q_zb_wme=Qzb_wme,
+                Q_z_wme=Qz_wme,
+                adjoint_type=adjoint_type,
+            )
 
             # rhs = H.T @ R_inv @ obs_residual
             λ += rhs  # λ_n = λ_n+1 + H^T R_inv (Hu - yobs)
