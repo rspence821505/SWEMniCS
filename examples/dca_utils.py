@@ -4,6 +4,9 @@ from swemnics.problems import SlopedBeachProblem, TidalProblem
 from swemnics import solvers as Solvers
 
 
+from mpi4py import MPI
+
+
 def create_problem_solver(
     problem_params, problem_type="sloped_beach", true_signal=True
 ):
@@ -16,13 +19,11 @@ def create_problem_solver(
         "verbose": False,
         "adjoint_method": True,
     }
-
     optional_solver_kwargs = {
         "mag": 0.11,
         "alpha": 0.00010538918781,
         "h_b": 6.0,
     }
-
     if problem_type == "tidal":
         tidal_kwargs = {
             "nx": problem_params["nx"],
@@ -34,7 +35,6 @@ def create_problem_solver(
             "adjoint_method": True,
             "verbose": False,
         }
-
         if true_signal:
             tidal_kwargs["friction_law"] = "linear"
             prob = TidalProblem(**tidal_kwargs)
@@ -42,9 +42,7 @@ def create_problem_solver(
             tidal_kwargs["friction_law"] = problem_params["fric_law"]
             prob = TidalProblem(**tidal_kwargs)  # Inverse crime case
             # prob = TidalProblem(**tidal_kwargs, **optional_solver_kwargs)
-
-        solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
-
+            solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
     else:
         sloped_kwargs = {
             "dt": problem_params["dt"],
@@ -54,13 +52,10 @@ def create_problem_solver(
             "wd_alpha": 0.36,
             "wd": True,
         }
-
         prob = SlopedBeachProblem(**sloped_kwargs)
         solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
-
-        if "t" in problem_params:
-            solver.problem.t = problem_params["t"]
-
+    if "t" in problem_params:
+        solver.problem.t = problem_params["t"]
     return prob, solver
 
 
@@ -79,7 +74,6 @@ def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1
     V_coords = (
         V.sub(0).collapse()[0].tabulate_dof_coordinates()
     )  # collapse to height function space
-    print(f"V_coords shape: {V_coords.shape}")
 
     stations = V_coords[::obs_frequency, :]
 

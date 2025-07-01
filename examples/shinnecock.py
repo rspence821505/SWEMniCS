@@ -15,7 +15,7 @@ rank = comm.Get_rank()
 
 if __name__ == "__main__":
     parser = ap.ArgumentParser()
-    parser.add_argument("--solver", choices=["dg", "supg", "dgnc"], default="supg")
+    parser.add_argument("--solver", choices=["dg", "supg", "dgnc"], default="dg")
     parser.add_argument("--dt", type=float, default=600)
     parser.add_argument("--alpha", type=float, default=1.5)
     args = parser.parse_args()
