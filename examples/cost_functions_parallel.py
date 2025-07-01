@@ -481,6 +481,7 @@ def swe_adjoint(
         A_T = adjoints[n]  # Adjoint matrix at time step n
 
         try:
+            # print(f"Solving adjoint system at step {n} with A_T: {A_T}", flush=True)
             λ = spsolve(A_T, λ)
         except Exception as e:
             if rank == 0:

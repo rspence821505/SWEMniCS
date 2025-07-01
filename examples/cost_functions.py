@@ -464,8 +464,6 @@ def swe_adjoint(
 
             yobs = obs_data[idx].copy()
             q_zb = Qzb[idx].copy() if Q_zb is not None else None
-            # q_zb_wme = Qzb_wme[idx].copy() if Q_zb is not None else None
-            # q_z_wme = Qz_wme[idx].copy() if Q_zb is not None else None
 
             # print_observation_debug_info(Hu, yobs, n)
             rhs = adjoint_rhs(
