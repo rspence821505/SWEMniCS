@@ -1,5 +1,3 @@
-# from swemnics.problems import SlopedBeachProblem
-# from swemnics import solvers as Solvers
 from mpi4py import MPI
 import numpy as np
 import pandas as pd
@@ -35,36 +33,18 @@ def create_problem_solver(
         "alpha": 0.00010538918781,
         "h_b": 6.0,
     }
-    if problem_type == "tidal":
-        tidal_kwargs = {
-            "nx": problem_params["nx"],
-            "ny": problem_params["ny"],
-            "dt": problem_params["dt"],
-            "nt": problem_params["num_steps"],
-            "solution_var": problem_params["sol_var"],
-            "wd": False,
-            "adjoint_method": True,
-            "verbose": False,
-        }
-        if true_signal:
-            tidal_kwargs["friction_law"] = "linear"
-            prob = TidalProblem(**tidal_kwargs)
-        else:
-            tidal_kwargs["friction_law"] = problem_params["fric_law"]
-            prob = TidalProblem(**tidal_kwargs)  # Inverse crime case
-            # prob = TidalProblem(**tidal_kwargs, **optional_solver_kwargs)
-            solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
-    else:
-        sloped_kwargs = {
-            "dt": problem_params["dt"],
-            "nt": problem_params["num_steps"],
-            "friction_law": problem_params["fric_law"],
-            "solution_var": problem_params["sol_var"],
-            "wd_alpha": 0.36,
-            "wd": True,
-        }
-        prob = SlopedBeachProblem(**sloped_kwargs)
-        solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
+
+    sloped_kwargs = {
+        "dt": problem_params["dt"],
+        "nt": problem_params["num_steps"],
+        "friction_law": problem_params["fric_law"],
+        "solution_var": problem_params["sol_var"],
+        "wd_alpha": 0.36,
+        "wd": True,
+    }
+    prob = SlopedBeachProblem(**sloped_kwargs)
+    solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
+
     if "t" in problem_params:
         solver.problem.t = problem_params["t"]
     return prob, solver
@@ -74,10 +54,17 @@ def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1
     """
     Default values are sea level and 0 velocity
     """
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-
+    # comm = MPI.COMM_WORLD
+    # rank = comm.Get_rank()
+    print(
+        f"[Rank {MPI.COMM_WORLD.Get_rank()}] Inside get_true_signal – Before create_problem_solver",
+        flush=True,
+    )
     prob, solver = create_problem_solver(problem_params, problem_type)
+    print(
+        f"[Rank {MPI.COMM_WORLD.Get_rank()}] Inside get_true_signal – After create_problem_solver",
+        flush=True,
+    )
     u_0 = solver.u_n  # full initial condition
 
     # Doesn't work for DG Case
@@ -87,7 +74,7 @@ def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1
     )  # collapse to height function space
 
     stations = V_coords[::obs_frequency, :]
-
+    print(f"[Rank {MPI.COMM_WORLD.Get_rank()}] Before solver.time_loop()", flush=True)
     solver.time_loop(
         solver_parameters=solver_params,
         stations=stations,
@@ -97,6 +84,7 @@ def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1
         save_states=True,
         adjoint_method=True,
     )
+    print(f"[Rank {MPI.COMM_WORLD.Get_rank()}] After solver.time_loop()", flush=True)
 
     return solver, prob, stations, V_coords
 
@@ -117,7 +105,7 @@ def build_observation_matrix(prob, V, obs_time_freq=2):
     station_cells = all_cells[obs_space_idx]  # select cells for observation
 
     # Create observation matrix
-    H = np.zeros((len(station_cells), V.dofmap.index_map.size_local))
+    H = np.zeros((len(station_cells), V.dofmap.index_map.size_global))
 
     # pick subset of cells for the stations
     station_coords = []
@@ -163,6 +151,7 @@ def setup_observation_indices(window_size, obs_frequency, total_steps):
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
+print(f"[Rank {rank}] Reached Initial MPI Call \n\n", flush=True)
 
 problem_params = {
     "dt": 600,
@@ -184,15 +173,20 @@ solver_params = {
     "ksp_ErrorIfNotConverged": False,
 }  # ,"pc_factor_mat_solver_type":"mumps"}
 
+if comm.size > 1:
+    solver_params["ksp_type"] = "preonly"
+    solver_params["pc_type"] = "lu"
+    solver_params["pc_factor_mat_solver_type"] = "mumps"
 
 assert problem_params["num_steps"] == int(
     np.ceil(problem_params["t_final"] / problem_params["dt"])
 )
 
-
+print(f"[Rank {rank}] Before True Signal \n\n ", flush=True)
 true_signal, prob, stations, state_coords = get_true_signal(
     problem_params, "sloped_beach", solver_params, 4
 )
+print(f"[Rank {rank}] After True Signal\n\n", flush=True)
 
 
 obs_std = 0.4
@@ -204,25 +198,30 @@ problem_params["num_steps"] = int(
 )  # Size of each assimilation window
 obs_per_window = problem_params["num_steps"] // obs_time_freq
 
+print(f"[Rank {rank}] Before build_observation_matrix \n\n", flush=True)
 H, stations, obs_spatial_indices = build_observation_matrix(
     prob, true_signal.V, obs_space_freq
 )
+print(f"[Rank {rank}] Before setup_observation_indices \n\n", flush=True)
 obs_indices_per_window, obs_time_indices = setup_observation_indices(
     problem_params["num_steps"], obs_time_freq, total_steps
 )
-
+print(f"[Rank {rank}] Before generate_observations \n\n", flush=True)
 # Create synthetic observations
 y_obs = generate_observations(true_signal.saved_states, H, obs_time_indices, obs_std)
 
-print(
-    f"Total Steps: {total_steps}\n"
-    f"Total Assimilation Windows: {problem_params['num_windows']}\n"
-    f"Steps per Window: {problem_params['num_steps']}\n"
-    f"Obs Frequency: {obs_time_freq}\n"
-    f"Total Obs: {obs_per_window * problem_params['num_windows']}\n"
-    f"Number Stations: {stations.shape[0]}\n"
-    f"Obs per Window: {obs_per_window}\n"
-)
+
+if rank == 0:
+    print(
+        f"Total Steps: {total_steps}\n"
+        f"Total Assimilation Windows: {problem_params['num_windows']}\n"
+        f"Steps per Window: {problem_params['num_steps']}\n"
+        f"Obs Frequency: {obs_time_freq}\n"
+        f"Total Obs: {obs_per_window * problem_params['num_windows']}\n"
+        f"Number Stations: {stations.shape[0]}\n"
+        f"Obs per Window: {obs_per_window}\n",
+        flush=True,
+    )
 
 
 # Generate Background,Observation, and Predicted Error Covariance Matrices
@@ -247,18 +246,20 @@ covs = {"B_inv": B_inv, "R_inv": R_inv, "L_inv": L_inv}
 
 hb = 5.0 / 13800 * (13800 - stations[:, 0])
 
-print(
-    f"State Dimension: {state_dim}\n"
-    f"Observation Dimension: {obs_dim}\n"
-    f"Background Covariance Matrix Shape B: {B.shape}\n"
-    f"Observation Covariance Matrix Shape R: {R.shape}\n"
-    f"Predicted Error Covariance Matrix shape L: {L.shape}\n"
-    f"Observation Matrix Shape H: {H.shape}\n",
-    f"y_obs shape: {y_obs.shape}\n",
-    f"Stations shape: {stations.shape}\n",
-)
+if rank == 0:
+    print(
+        f"State Dimension: {state_dim}\n"
+        f"Observation Dimension: {obs_dim}\n"
+        f"Background Covariance Matrix Shape B: {B.shape}\n"
+        f"Observation Covariance Matrix Shape R: {R.shape}\n"
+        f"Predicted Error Covariance Matrix shape L: {L.shape}\n"
+        f"Observation Matrix Shape H: {H.shape}\n",
+        f"y_obs shape: {y_obs.shape}\n",
+        f"Stations shape: {stations.shape}\n",
+        flush=True,
+    )
 
-
+print(f"[Rank {rank}] Before run_assimilation\n\n", flush=True)
 bayes_analysis = run_assimilation(
     problem_params,
     solver_params,
@@ -272,6 +273,7 @@ bayes_analysis = run_assimilation(
     hb,
     "sloped_beach",
     cost_function_type="bayes",
+    comm=comm,
 )
 
 true_states = np.array(true_signal.saved_states)

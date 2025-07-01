@@ -7,7 +7,9 @@
 import argparse
 from swemnics.problems import TidalProblem
 from swemnics.solvers import get_solver
-from swemnics import FrictionLaw
+from swemnics import solvers as Solvers
+
+# from swemnics import FrictionLaw
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
@@ -33,19 +35,19 @@ parser.add_argument(
     default=7 * 24 * 60 * 60,
     help="final time in seconds",
 )
-parser.add_argument(
-    "--friction",
-    dest="friction_law",
-    type=FrictionLaw,
-    choices=[FrictionLaw.linear, FrictionLaw.quadratic, FrictionLaw.mannings],
-    help="Choice of friction law",
-    default=FrictionLaw.mannings,
-)
+# parser.add_argument(
+#     "--friction",
+#     dest="friction_law",
+#     type=FrictionLaw,
+#     choices=[FrictionLaw.linear, FrictionLaw.quadratic, FrictionLaw.mannings],
+#     help="Choice of friction law",
+#     default=FrictionLaw.mannings,
+# )
 parser.add_argument(
     "--solver",
     dest="solver",
     type=str,
-    default="DGNC",
+    default="SUPG",
     help="solver type",
     choices=["CG", "SUPG", "DG", "DGCG", "DGNC"],
 )
@@ -82,7 +84,7 @@ prob = TidalProblem(
     ny=args.ny,
     dt=args.dt,
     nt=nt,
-    friction_law=args.friction_law,
+    friction_law="mannings  ",
     solution_var=sol_var,
 )
 p_degree = [1, 1]
@@ -110,8 +112,20 @@ if comm.size > 1:
     params["pc_type"] = "lu"
     params["pc_factor_mat_solver_type"] = "mumps"
 
+gathered_states = comm.gather(solver.u.x.array, root=0)
+gathered_state = np.concatenate(gathered_states, axis=0) if gathered_states else None
+
+if gathered_state is not None:
+    print(f"Initial Gathered state shape: {gathered_state.shape}", flush=True)
+
+
 solver.time_loop(
-    solver_parameters=params, stations=stations, plot_every=1, plot_name="SUPG_tide"
+    solver_parameters=params,
+    stations=stations,
+    plot_every=1,
+    plot_name="SUPG_tide",
+    save_states=True,
+    adjoint_method=True,
 )
 
 if rank == 0:

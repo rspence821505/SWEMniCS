@@ -38,6 +38,7 @@ def create_problem_solver(
         if true_signal:
             tidal_kwargs["friction_law"] = "linear"
             prob = TidalProblem(**tidal_kwargs)
+            solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
         else:
             tidal_kwargs["friction_law"] = problem_params["fric_law"]
             prob = TidalProblem(**tidal_kwargs)  # Inverse crime case

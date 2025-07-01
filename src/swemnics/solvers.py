@@ -40,7 +40,7 @@ from petsc4py import PETSc
 import numpy as np
 from swemnics.newton import CustomNewtonProblem
 from swemnics.constants import g, R
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, vstack
 
 try:
     import pyvista
@@ -60,6 +60,37 @@ def petsc_to_csr(A):
         A.getValuesCSR()
     )  # row start locations, maps values to columns, and values
     return csr_matrix((data, indices, indptr), shape=A.size)
+
+
+def gather_petsc_matrix_global(A: PETSc.Mat, comm: MPI.Comm):
+    """Gather full PETSc matrix to rank 0 as a global SciPy CSR matrix."""
+    rank = comm.Get_rank()
+
+    # Get local part of matrix
+    indptr, indices, data = A.getValuesCSR()
+    m_local = len(indptr) - 1
+    n_global = A.getSize()[1]
+
+    local = {
+        "indptr": indptr,
+        "indices": indices,
+        "data": data,
+        "shape": (m_local, n_global),
+    }
+
+    all_local = comm.gather(local, root=0)
+
+    if rank == 0:
+        blocks = []
+        for part in all_local:
+            part_csr = csr_matrix(
+                (part["data"], part["indices"], part["indptr"]), shape=part["shape"]
+            )
+            blocks.append(part_csr)
+        full = vstack(blocks).tocsr()
+        return full
+    else:
+        return None
 
 
 def create_element(mesh: mesh.Mesh, family: str, degree: int, shape: tuple[int] = ()):
@@ -111,7 +142,6 @@ class BaseSolver:
         p_type: Literal["CG", "DG"] = "CG",
         swe_type="full",
         adjoint_method=False,
-        get_adjoint_every=1,
         verbose=True,
     ):
         r"""Iniitalize the solver.
@@ -747,43 +777,40 @@ class CGImplicit(BaseSolver):
         return inds, vals
 
     def save_adjoints(self):
-        """Save the transpose of the Jacobian matrix at each time step for adjoint calculations."""
-        A_tlm = self.solver.assemble_A()  # returns Jacobian matrix A
-        A_adjoint = A_tlm.transpose()  # Adjoint A^T
-        adjoint_csr = petsc_to_csr(A_adjoint)  # convert to csr matrix
-        self.saved_adjoints.append(adjoint_csr.copy())  # save A^T
+        """Assemble Jacobian, transpose it, and gather full CSR matrix on rank 0."""
+        comm = (
+            self.problem.mesh.comm
+        )  # assumes self.problem.comm is MPI.COMM_WORLD or similar
 
-    def save_height_adjoints(self):
-        """Save the transpose of the Jacobian matrix at each time step for adjoint calculations."""
-        A_tangent = self.solver.assemble_A()  # returns Jacobian matrix A
+        A_tlm = self.solver.assemble_A()
+        A_adjoint = A_tlm.transpose()
+        A_adjoint.assemble()
 
-        # A_temp = A_tangent.sub(0)  # copy A
-        # A_temp_adjoint = A_temp.transpose()  # Adjoint A^T
-        # self.saved_adjoints.append(A_temp_adjoint.copy())  # save A^T for h jacobian
+        # if self.mpi_rank == 0:
+        #     print(f"[Rank 0] Gathering full A_adjoint matrix", flush=True)
 
-        A_adjoint = A_tangent.transpose()  # Adjoint A^T
-        A_adjoint_array = A_adjoint.getValues(
-            *map(range, A_adjoint.getSize())
-        )  # convert to numpy array
-        H_adjoint_array = A_adjoint_array[::3, ::3]  # h adjoint
-        # print(f"H_adjoint_array: \n {H_adjoint_array} \n\n")
-        self.saved_adjoints.append(H_adjoint_array.copy())  # save A^T
+        A_csr = gather_petsc_matrix_global(A_adjoint, comm)
+
+        if self.mpi_rank == 0:
+            self.saved_adjoints.append(A_csr.copy())
+            # print(f"[Rank 0] Saved full A_adjoint with shape {A_csr.shape}", flush=True)
 
     def save_states(self):
-        """Save the current state of the solution at each time step for adjoint calculations."""
-        current_state = self.u.x.array.copy()
-        self.saved_states.append(current_state)  # save state u
+        """Gather and save global state vector"""
+        comm = self.problem.mesh.comm
+        rank = comm.rank
 
-    def save_height_states(self):
-        """Save the current state of the solution at each time step for adjoint calculations."""
-        current_state = self.u.copy()
-        h_values = current_state.sub(0).eval(self.points_on_proc, self.cells)
-        if self.problem.solution_var in ["h", "flux"]:
-            h_values -= self.station_bathy
-        self.saved_states.append(h_values)  # save state height at stations: HPi_1u
+        # Safely slice only local (non-ghost) values
+        size_local = self.V.dofmap.index_map.size_local
+        u_local = self.u.x.array[:size_local]
 
-        # current_height = self.u.sub(0).collapse().x.array[:].copy()
-        # self.saved_states.append(current_height)  # save state u
+        # print(f"[Rank {rank}] Inside save_states – local size {size_local}", flush=True)
+        gathered_states = comm.gather(u_local, root=0)
+
+        if rank == 0:
+            gathered_state = np.concatenate(gathered_states)
+            # print(f"[Rank {rank}] Inside save_states – gathered state size {gathered_state.shape}", flush=True)
+            self.saved_states.append(gathered_state.copy())
 
     def time_loop(
         self,
@@ -844,7 +871,6 @@ class CGImplicit(BaseSolver):
             if a % plot_every == 0 and plot_every <= self.problem.nt:
                 self.plot_frame()
 
-            # REPLACE This with save_adjoints() Rylan Todo
             if save_states:
                 self.save_states()
 
@@ -877,9 +903,6 @@ class CGImplicit(BaseSolver):
 
             if adjoint_method:
                 self.save_adjoints()
-
-                # self.save_height_adjoints()
-                # self.save_height_states()
 
         if plot_every <= self.problem.nt:
             self.finalize_video()

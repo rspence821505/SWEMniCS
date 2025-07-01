@@ -8,7 +8,7 @@ import time
 
 from dca_utils import create_problem_solver
 
-from cost_functions_parallel import (
+from cost_functions import (
     bayes_cost_function,
     dci_cost_function,
     dci_wme_cost_function,
@@ -71,6 +71,7 @@ class MPIPETSc4DVarOptimizer:
         self.comm = comm if comm is not None else MPI.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
+        print(f"[Rank {self.rank}] Reached Inside MPIPETSc4DVarOptimizer", flush=True)
 
         # Mapping of cost function types
         self.cost_function_map = {
@@ -118,7 +119,7 @@ class MPIPETSc4DVarOptimizer:
             self.comm.Allgather(x_local, x_global)
         except Exception as e:
             if self.rank == 0:
-                print(f"Error accessing vector in objective function: {e}")
+                print(f"Error accessing vector in objective function: {e}", flush=True)
             return np.inf
 
         # Evaluate cost function (each process can do this independently)
@@ -128,7 +129,7 @@ class MPIPETSc4DVarOptimizer:
             )
         except Exception as e:
             if self.rank == 0:
-                print(f"Error in objective function evaluation: {e}")
+                print(f"Error in objective function evaluation: {e}", flush=True)
             return np.inf
 
         # Update counters on rank 0
@@ -175,6 +176,7 @@ class MPIPETSc4DVarOptimizer:
             )
         except Exception as e:
             if self.rank == 0:
+
                 print(f"Error in gradient function evaluation: {e}")
             grad_global = np.zeros_like(x_global)
 
@@ -228,7 +230,10 @@ class MPIPETSc4DVarOptimizer:
             self.comm.Allgather(x_local, x_global)
         except Exception as e:
             if self.rank == 0:
-                print(f"Error accessing vector in objective-gradient function: {e}")
+                print(
+                    f"Error accessing vector in objective-gradient function: {e}",
+                    flush=True,
+                )
             g_petsc.zeroEntries()
             return np.inf
 
@@ -239,7 +244,7 @@ class MPIPETSc4DVarOptimizer:
             )
         except Exception as e:
             if self.rank == 0:
-                print(f"Error in objective function evaluation: {e}")
+                print(f"Error in objective function evaluation: {e}", flush=True)
             cost = np.inf
             grad_global = np.zeros_like(x_global)
         else:
@@ -253,7 +258,7 @@ class MPIPETSc4DVarOptimizer:
                 )
             except Exception as e:
                 if self.rank == 0:
-                    print(f"Error in gradient function evaluation: {e}")
+                    print(f"Error in gradient function evaluation: {e}", flush=True)
                 grad_global = np.zeros_like(x_global)
 
         # Ensure gradient is finite
@@ -271,7 +276,7 @@ class MPIPETSc4DVarOptimizer:
             g_petsc.assemblyEnd()
         except Exception as e:
             if self.rank == 0:
-                print(f"Error setting gradient vector: {e}")
+                print(f"Error setting gradient vector: {e}", flush=True)
             g_petsc.zeroEntries()
 
         # Update counters on rank 0
@@ -296,9 +301,15 @@ class MPIPETSc4DVarOptimizer:
             self.iteration_count += 1
             try:
                 obj_value = tao.getFunctionValue()
-                print(f"Iteration {self.iteration_count}: Cost = {obj_value:.6f}")
+                print(
+                    f"Iteration {self.iteration_count}: Cost = {obj_value:.6f}",
+                    flush=True,
+                )
             except:
-                print(f"Iteration {self.iteration_count}: Cost evaluation failed")
+                print(
+                    f"Iteration {self.iteration_count}: Cost evaluation failed",
+                    flush=True,
+                )
 
     def optimize(
         self,
@@ -387,7 +398,7 @@ class MPIPETSc4DVarOptimizer:
             success = False
             message = f"Optimization failed: {str(e)}"
             if self.rank == 0:
-                print(f"TAO solve failed: {e}")
+                print(f"TAO solve failed: {e}", flush=True)
 
         # Synchronize after solving
         self.comm.Barrier()
@@ -559,6 +570,7 @@ def optimize_4dvar(
         comm = MPI.COMM_WORLD
 
     rank = comm.Get_rank()
+    print(f"[Rank {rank}] Reached Inside optimize_4dvar()", flush=True)
 
     # Create MPI-parallel PETSc optimizer
     optimizer = MPIPETSc4DVarOptimizer(
@@ -647,7 +659,7 @@ def run_assimilation(
 
     rank = comm.Get_rank()
     size = comm.Get_size()
-
+    print(f"[Rank {rank}] Reached checkpoint inside run_assimilation()", flush=True)
     name = "Hotstart"
     analysis = []
     analysis_state = None

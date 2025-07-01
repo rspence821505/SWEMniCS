@@ -2,6 +2,7 @@ import numpy as np
 from dolfinx import fem as fe
 from scipy.optimize import minimize
 from scipy.sparse.linalg import spsolve
+from mpi4py import MPI
 from tqdm import tqdm
 from typing import List, Dict, Tuple, Callable, Optional, Literal
 from dolfinx import fem as fe
@@ -109,8 +110,14 @@ def initialize_wme_terms(y_obs, R_inv, L_inv):
 #     return solver
 
 
-def get_trajectory(u0, solver_params, stations, solver):
+def get_trajectory(u0, solver_params, stations, solver, comm=None):
     """Propagate state through model and get observations."""
+
+    if comm is None:
+        comm = MPI.COMM_WORLD
+
+    rank = comm.Get_rank()
+    print(f"[Rank {rank}] Reached checkpoint D", flush=True)
 
     # Convert initial state vector in h space to full initial state vector in u space
     V = solver.V
@@ -118,17 +125,33 @@ def get_trajectory(u0, solver_params, stations, solver):
 
     u_0.x.array[:] = u0  # Set initial state vector
 
-    # Run the time loop to propagate the state through the model save adjoints and states
-    (
-        _,
-        _,
-    ) = solver.time_loop(
-        solver_parameters=solver_params,
-        stations=stations,
-        u_0=u_0,
-        save_states=True,
-        adjoint_method=True,
-    )
+    # ⛔️ Clear any stale state
+    if hasattr(solver, "saved_states"):
+        solver.saved_states.clear()
+
+    if hasattr(solver, "saved_adjoints"):
+        solver.saved_adjoints.clear()
+
+    # # Synchronize before starting the time loop
+    # comm.Barrier()
+
+    # Run the time loop to propagate the state through the model
+
+    try:
+        _, _ = solver.time_loop(
+            solver_parameters=solver_params,
+            stations=stations,
+            u_0=u_0,
+            save_states=True,
+            adjoint_method=True,
+        )
+    except Exception as e:
+        if rank == 0:
+            print(f"Error in time loop: {e}")
+        raise
+
+    # Synchronize after time loop
+    # comm.Barrier()
 
     return solver
 
@@ -147,6 +170,11 @@ def bayes_cost_function(u0, solver, init_time, **kwargs):
         - stations
         - hb
     """
+
+    # Get MPI communicator
+    comm = kwargs.get("comm", MPI.COMM_WORLD)
+    rank = comm.Get_rank()
+    print(f"[Rank {rank}] Reached checkpoint E", flush=True)
     # Unpack required arguments
     u_b = kwargs["u_b"]
     y_obs = kwargs["y_obs"]
@@ -160,11 +188,17 @@ def bayes_cost_function(u0, solver, init_time, **kwargs):
     # Reset solver time to initial time
     solver.problem.t = init_time
 
-    # Run model
-    solver = get_trajectory(u0, solver_params, stations, solver)
-    states = np.array(solver.saved_states)  # shape: (steps, num_stations)
-    observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
-    Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
+    try:
+        # Run model
+        solver = get_trajectory(u0, solver_params, stations, solver, comm)
+        states = np.array(solver.saved_states)  # shape: (steps, num_stations)
+        observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
+        Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
+
+    except Exception as e:
+        if rank == 0:
+            print(f"Error in bayes_cost_function get_trajectory: {e}", flush=True)
+        return 1e10
 
     # print(f"Qz shape: {Qz.shape}, y_obs shape: {y_obs.shape}")
     # Loss terms
@@ -330,38 +364,42 @@ def print_adjoint_debug_info(
     λ_shape: tuple,
     obs_data: np.ndarray,
     R_inv: np.ndarray,
+    rank: int = 0,
 ):
     """
     Print detailed debug information about adjoint setup.
     """
-    print("\n\n" + "=" * 40 + " Adjoint Debug Info " + "=" * 40)
-    print(f"Number of Time Steps: {nt + 1}")
-    print(f"Trajectories Length: {len(trajectories)}")
-    print(f"Adjoints Length: {len(adjoints)}")
-    print(f"Observation Spatial Indices Length: {len(obs_spatial_idxs)}")
-    print(f"Observation Time Indices Length: {len(obs_time_idxs)}")
-    print(f"Single Trajectory Shape: {trajectories[0].shape}")
-    print(f"Single Adjoint Shape: {adjoints[0].shape}")
-    print(f"Lambda Shape: {λ_shape}")
-    print(f"Observation Spatial Indices: {obs_spatial_idxs}")
-    print(f"Observation Time Indices: {obs_time_idxs}")
-    print(f"Observation Data Shape: {obs_data.shape}")
-    print(f"R_inv Shape: {R_inv.shape}")
-    print("=" * 100 + "\n\n")
+    if rank == 0:
+        print("\n\n" + "=" * 40 + " Adjoint Debug Info " + "=" * 40)
+        print(f"Number of Time Steps: {nt + 1}")
+        print(f"Trajectories Length: {len(trajectories)}")
+        print(f"Adjoints Length: {len(adjoints)}")
+        print(f"Observation Spatial Indices Length: {len(obs_spatial_idxs)}")
+        print(f"Observation Time Indices Length: {len(obs_time_idxs)}")
+        print(f"Single Trajectory Shape: {trajectories[0].shape}")
+        print(f"Single Adjoint Shape: {adjoints[0].shape}")
+        print(f"Lambda Shape: {λ_shape}")
+        print(f"Observation Spatial Indices: {obs_spatial_idxs}")
+        print(f"Observation Time Indices: {obs_time_idxs}")
+        print(f"Observation Data Shape: {obs_data.shape}")
+        print(f"R_inv Shape: {R_inv.shape}")
+        print("=" * 100 + "\n\n")
 
 
 def print_observation_debug_info(
     Hu: np.ndarray,
     yobs: np.ndarray,
     n: int,
+    rank: int = 0,
 ):
     """
     Print debug information for a single observation time step during the adjoint solve.
     """
-    print(f"\n--- Observation Debug Info at Time Step {n} ---")
-    print(f"Hu shape: {Hu.shape}", f"Hu: {Hu[::10]}")
-    print(f"yobs shape: {yobs.shape}, yobs: {yobs[::10]}")
-    print("----------------------------------------------\n")
+    if rank == 0:
+        print(f"\n--- Observation Debug Info at Time Step {n} ---")
+        print(f"Hu shape: {Hu.shape}", f"Hu: {Hu[::10]}")
+        print(f"yobs shape: {yobs.shape}, yobs: {yobs[::10]}")
+        print("----------------------------------------------\n")
 
 
 def swe_adjoint(
@@ -374,6 +412,7 @@ def swe_adjoint(
     L_inv: Optional[np.ndarray] = None,
     Q_zb: Optional[np.ndarray] = None,
     adjoint_type: Literal["bayes", "dci", "dci_wme"] = "bayes",
+    comm: Optional[MPI.Comm] = None,
 ) -> np.ndarray:
     """
     Compute the initial adjoint vector λ₀ for a 4D-Var cost functional.
@@ -416,6 +455,12 @@ def swe_adjoint(
     ValueError
         If the adjoint matrix at a time step is singular and cannot be pseudo-inverted.
     """
+    if comm is None:
+        comm = MPI.COMM_WORLD
+
+    rank = comm.Get_rank()
+    print(f"[Rank {rank}] Reached checkpoint F", flush=True)
+
     adjoints = solver.saved_adjoints  # List of adjoint matrices (NumPy arrays)
     trajectories = solver.saved_states  # List of forward states
 
@@ -424,7 +469,7 @@ def swe_adjoint(
     λ = np.zeros(N_dof)
 
     num_obs = len(obs_data)
-    Qzb = Q_zb.T
+    Qzb = Q_zb.T if Q_zb is not None else None
 
     # print_adjoint_debug_info(
     #     nt=nt,
@@ -485,8 +530,14 @@ def swe_adjoint(
         A_T = adjoints[n]  # Adjoint matrix at time step n
 
         # Solve the linear system: A_T @ λ_new = λ
-
-        λ = spsolve(A_T, λ)
+        try:
+            λ = spsolve(A_T, λ)
+        except Exception as e:
+            if rank == 0:
+                print(f"Error solving adjoint system at time step {n}: {e}", flush=True)
+            raise ValueError(
+                f"Adjoint matrix at time step {n} is singular or ill-conditioned."
+            )
 
     return λ  # This is λ_0 = ∇J(z_0)
 
@@ -506,6 +557,10 @@ def grad_cost_function(u0, solver, adjoint_type, **kwargs):
         - (optional) P_inv, Q_zb depending on adjoint_type
     """
 
+    # Get MPI communicator
+    comm = kwargs.get("comm", MPI.COMM_WORLD)
+    rank = comm.Get_rank()
+
     # Unpack required variables
     u_b = kwargs["u_b"]
     y_obs = kwargs["y_obs"]
@@ -520,24 +575,35 @@ def grad_cost_function(u0, solver, adjoint_type, **kwargs):
 
     # check of saved adjoints is empty
     if not solver.saved_adjoints:
-        raise ValueError(
-            "No saved adjoints found. Ensure the model was run with adjoint_method=True."
-        )
+        if rank == 0:
+            raise ValueError(
+                "No saved adjoints found. Ensure the model was run with adjoint_method=True."
+            )
     if not solver.saved_states:
-        raise ValueError(
-            "No saved states found. Ensure the model was run with adjoint_method=True."
+        if rank == 0:
+            raise ValueError(
+                "No saved states found. Ensure the model was run with adjoint_method=True."
+            )
+
+    # Sychronize before starting the adjoint solve
+    # comm.Barrier()
+
+    try:
+        # Compute adjoint λ₀
+        λ_0 = swe_adjoint(
+            solver,
+            H,
+            y_obs,
+            obs_spatial_indices,
+            obs_time_indices,
+            R_inv,
+            L_inv,
+            Q_zb,
+            adjoint_type,
         )
-    # Compute adjoint λ₀
-    λ_0 = swe_adjoint(
-        solver,
-        H,
-        y_obs,
-        obs_spatial_indices,
-        obs_time_indices,
-        R_inv,
-        L_inv,
-        Q_zb,
-        adjoint_type,
-    )
+    except Exception as e:
+        if rank == 0:
+            print(f"Error in swe_adjoint: {e}", flush=True)
+        raise
 
     return B_inv @ (u0 - u_b) + λ_0
