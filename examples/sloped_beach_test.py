@@ -156,8 +156,8 @@ print(f"[Rank {rank}] Reached Initial MPI Call \n\n", flush=True)
 problem_params = {
     "dt": 600,
     "t": 0,
-    "t_final": 7 * 24 * 60 * 60,
-    "num_steps": int(np.ceil((7 * 24 * 60 * 60) / 600)),
+    "t_final": 2 * 24 * 60 * 60,
+    "num_steps": int(np.ceil((2 * 24 * 60 * 60) / 600)),
     "num_windows": 4,
     "fric_law": "mannings",  # friction law either quadratic or linear
     "sol_var": "h",  # solution variable either h or hu

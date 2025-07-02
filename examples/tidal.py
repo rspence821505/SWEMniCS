@@ -129,34 +129,45 @@ solver.time_loop(
 )
 
 if rank == 0:
-    # note that station data is array with shape nt x nstattion x 3 (h,u,v)
-    plt.plot(
-        np.linspace(0, t_f / (60 * 60 * 24), nt + 1),
-        solver.vals[: nt + 1, 0, 0],
-        "k",
-        linewidth=2,
-        label="h at 800 m",
-    )
-    # plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")
-    plt.grid(True)
-    plt.xlabel("t(day)")
-    plt.title(f"Tidal Height for {args.solver} Scheme")
-    plt.savefig(f"tidal_height_{args.solver}.png")
+    # check if save_states is empty
+    if not solver.saved_states:
+        print("No states saved. Exiting.")
+        exit(1)
+    # check of save_adjoint is empty
+    if not solver.saved_adjoints:
+        print("No adjoint states saved. Exiting.")
+        exit(1)
 
-    plt.close()
+    print(len(solver.saved_states), "states saved.")
+    print(len(solver.saved_adjoints), "adjoint states saved.")
+    # # note that station data is array with shape nt x nstattion x 3 (h,u,v)
+    # plt.plot(
+    #     np.linspace(0, t_f / (60 * 60 * 24), nt + 1),
+    #     solver.vals[: nt + 1, 0, 0],
+    #     "k",
+    #     linewidth=2,
+    #     label="h at 800 m",
+    # )
+    # # plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")
+    # plt.grid(True)
+    # plt.xlabel("t(day)")
+    # plt.title(f"Tidal Height for {args.solver} Scheme")
+    # plt.savefig(f"tidal_height_{args.solver}.png")
 
-    plt.plot(
-        np.linspace(0, t_f / (60 * 60 * 24), nt + 1),
-        solver.vals[: nt + 1, 0, 1],
-        "k",
-        linewidth=2,
-        label="u at 800 m",
-    )
-    # plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")
-    plt.grid(True)
-    plt.xlabel("t(day)")
-    plt.title(f"Tidal Velocity for {args.solver} Scheme")
-    plt.savefig(f"tidal_velocity_{args.solver}.png")
+    # plt.close()
+
+    # plt.plot(
+    #     np.linspace(0, t_f / (60 * 60 * 24), nt + 1),
+    #     solver.vals[: nt + 1, 0, 1],
+    #     "k",
+    #     linewidth=2,
+    #     label="u at 800 m",
+    # )
+    # # plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")
+    # plt.grid(True)
+    # plt.xlabel("t(day)")
+    # plt.title(f"Tidal Velocity for {args.solver} Scheme")
+    # plt.savefig(f"tidal_velocity_{args.solver}.png")
 
 # Your statements here
 stop = time.perf_counter()
