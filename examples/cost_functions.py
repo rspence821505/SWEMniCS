@@ -117,7 +117,7 @@ def get_trajectory(u0, solver_params, stations, solver, comm=None):
         comm = MPI.COMM_WORLD
 
     rank = comm.Get_rank()
-    print(f"[Rank {rank}] Reached checkpoint D", flush=True)
+    # print(f"[Rank {rank}] Reached checkpoint D", flush=True)
 
     # Convert initial state vector in h space to full initial state vector in u space
     V = solver.V
@@ -174,7 +174,7 @@ def bayes_cost_function(u0, solver, init_time, **kwargs):
     # Get MPI communicator
     comm = kwargs.get("comm", MPI.COMM_WORLD)
     rank = comm.Get_rank()
-    print(f"[Rank {rank}] Reached checkpoint E", flush=True)
+    # print(f"[Rank {rank}] Reached checkpoint E", flush=True)
     # Unpack required arguments
     u_b = kwargs["u_b"]
     y_obs = kwargs["y_obs"]
@@ -459,7 +459,7 @@ def swe_adjoint(
         comm = MPI.COMM_WORLD
 
     rank = comm.Get_rank()
-    print(f"[Rank {rank}] Reached checkpoint F", flush=True)
+    # print(f"[Rank {rank}] Reached checkpoint F", flush=True)
 
     adjoints = solver.saved_adjoints  # List of adjoint matrices (NumPy arrays)
     trajectories = solver.saved_states  # List of forward states

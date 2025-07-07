@@ -206,28 +206,29 @@ class MPIPETSc4DVarOptimizer:
     def _objective_gradient_function(self, tao, x_petsc, g_petsc, user_context=None):
         """
         Combined objective and gradient function callback for MPI-parallel PETSc TAO.
-
-        Parameters
-        ----------
-        tao : PETSc TAO solver object
-        x_petsc : PETSc Vec
-            Current iterate (distributed)
-        g_petsc : PETSc Vec
-            Gradient vector to be filled (distributed)
-        user_context : optional
-            User-defined context (unused)
-
-        Returns
-        -------
-        float
-            Objective function value
+        Fixed to handle uneven vector distribution.
         """
+        # Get the global vector size
+        n_global = x_petsc.getSize()
+
         # Get local portion of the vector
         try:
             x_local = x_petsc.getArray(readonly=True)
-            # Gather full vector on all processes
-            x_global = np.zeros(x_petsc.getSize())
-            self.comm.Allgather(x_local, x_global)
+            local_range = x_petsc.getOwnershipRange()
+
+            # Gather the full vector using proper MPI collectives
+            x_global = np.zeros(n_global)
+
+            # Get local sizes from all processes
+            local_size = len(x_local)
+            local_sizes = self.comm.allgather(local_size)
+            displacements = [sum(local_sizes[:i]) for i in range(len(local_sizes))]
+
+            # Gather all local portions
+            self.comm.Allgatherv(
+                x_local, [x_global, local_sizes, displacements, MPI.DOUBLE]
+            )
+
         except Exception as e:
             if self.rank == 0:
                 print(
@@ -237,7 +238,7 @@ class MPIPETSc4DVarOptimizer:
             g_petsc.zeroEntries()
             return np.inf
 
-        # Evaluate cost function
+        # Evaluate cost function (each process can do this independently)
         try:
             cost = self.cost_function_map[self.cost_function_type](
                 u0=x_global, solver=self.solver, init_time=self.init_time, **self.kwargs
@@ -270,7 +271,9 @@ class MPIPETSc4DVarOptimizer:
         # Distribute gradient to local portions
         try:
             local_range = g_petsc.getOwnershipRange()
-            grad_local = grad_global[local_range[0] : local_range[1]]
+            local_start, local_end = local_range
+            grad_local = grad_global[local_start:local_end]
+
             g_petsc.setArray(grad_local)
             g_petsc.assemblyBegin()
             g_petsc.assemblyEnd()
@@ -319,33 +322,35 @@ class MPIPETSc4DVarOptimizer:
         tolerance: float = 1e-6,
     ) -> MPIPETScOptimizationResult:
         """
-        Perform MPI-parallel optimization using PETSc TAO.
-
-        Parameters
-        ----------
-        u0 : np.ndarray
-            Initial guess for the control variable
-        method : str, optional
-            TAO method to use. Default is "lmvm".
-        max_iterations : int, optional
-            Maximum number of iterations. Default is 1000.
-        tolerance : float, optional
-            Convergence tolerance. Default is 1e-6.
-
-        Returns
-        -------
-        MPIPETScOptimizationResult
-            Optimization result object
+        Perform MPI-parallel optimization using PETSc TAO with proper vector distribution.
         """
         n_global = len(u0)
 
-        # Create distributed PETSc vectors
-        self.x_petsc = PETSc.Vec().createMPI(n_global, comm=self.comm)
-        self.g_petsc = PETSc.Vec().createMPI(n_global, comm=self.comm)
+        # Calculate local sizes for each process
+        # PETSc will handle uneven distribution automatically
+        local_size = PETSc.DECIDE  # Let PETSc decide local sizes
 
-        # Set initial guess (distributed)
+        # Create distributed PETSc vectors with automatic sizing
+        self.x_petsc = PETSc.Vec().createMPI(
+            size=(local_size, n_global), comm=self.comm
+        )
+        self.g_petsc = PETSc.Vec().createMPI(
+            size=(local_size, n_global), comm=self.comm
+        )
+
+        # Get the actual local range assigned by PETSc
         local_range = self.x_petsc.getOwnershipRange()
-        u0_local = u0[local_range[0] : local_range[1]]
+        local_start, local_end = local_range
+        actual_local_size = local_end - local_start
+
+        if self.rank == 0:
+            print(f"Global vector size: {n_global}")
+            print(
+                f"Local size on rank {self.rank}: {actual_local_size} (range: {local_start}-{local_end})"
+            )
+
+        # Set initial guess (only local portion)
+        u0_local = u0[local_start:local_end]
         self.x_petsc.setArray(u0_local)
         self.x_petsc.assemblyBegin()
         self.x_petsc.assemblyEnd()
@@ -422,24 +427,25 @@ class MPIPETSc4DVarOptimizer:
         except AttributeError:
             gnorm = 0.0
 
-        # Gather solution from all processes
+        # Gather solution from all processes using proper MPI collectives
         solution_local = self.x_petsc.getArray()
         solution = np.zeros(n_global)
 
-        # Gather all local portions to get the full solution
-        local_range = self.x_petsc.getOwnershipRange()
+        # Gather local sizes from all processes
+        local_sizes = self.comm.allgather(actual_local_size)
+        displacements = [sum(local_sizes[:i]) for i in range(len(local_sizes))]
+
+        # Use Allgatherv with proper size specifications
         self.comm.Allgatherv(
-            solution_local,
-            [solution, np.diff(self.comm.allgather(local_range)).flatten()],
+            solution_local, [solution, local_sizes, displacements, MPI.DOUBLE]
         )
 
-        # Get final gradient
+        # Get final gradient using the same approach
         try:
             grad_local = self.g_petsc.getArray()
             final_gradient = np.zeros(n_global)
             self.comm.Allgatherv(
-                grad_local,
-                [final_gradient, np.diff(self.comm.allgather(local_range)).flatten()],
+                grad_local, [final_gradient, local_sizes, displacements, MPI.DOUBLE]
             )
         except Exception:
             if self.rank == 0:
@@ -713,8 +719,22 @@ def run_assimilation(
             save_states=True,
             adjoint_method=False,
         )
+        # Check if saved_states exists and has data on rank 0
+        if rank == 0:
+            background = (
+                np.array(solver.saved_states) if solver.saved_states else np.array([])
+            )
+            print(
+                f"[Rank {rank}] solver states length: {len(solver.saved_states)}",
+                flush=True,
+            )
+        else:
+            background = np.array([])
 
-        background = np.array(solver.saved_states)
+        # Broadcast the background from rank 0 to all other processes
+        background = comm.bcast(background, root=0)
+
+        # background = np.array(solver.saved_states)
         observed_background_states = background[obs_times_current_window]
         Q_zb = H @ observed_background_states.T
         solver.saved_states = []  # clear for next window
