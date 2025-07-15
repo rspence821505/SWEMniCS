@@ -229,13 +229,7 @@ def run_assimilation(
         analysis_state = solver.u.x.array[:]
 
         # Collect results
-        # current_analysis = solver.vals.copy()
         current_analysis = np.array(solver.saved_states)
-        # print(f"Current analysis shape: {current_analysis.shape}")
-        # if idx < num_windows - 1:
-        #     # current_analysis = current_analysis[:-1, :, :] # Exclude last time step
-        #     current_analysis = current_analysis.copy()
-        # current_analysis = current_analysis.copy()
         analysis.append(current_analysis)
 
         print(

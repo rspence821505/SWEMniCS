@@ -138,26 +138,26 @@ def create_problem_solver(
 #     return solver, prob, stations, V_coords
 
 
-def setup_observation_indices(window_size, obs_frequency, total_steps):
-    """Setup observation indices for windows"""
-    obs_indices_per_window = np.arange(0, window_size, obs_frequency)
-    obs_indices = np.arange(0, total_steps - 1, obs_frequency)
-    return obs_indices_per_window, obs_indices
+# def setup_observation_indices(window_size, obs_frequency, total_steps):
+#     """Setup observation indices for windows"""
+#     obs_indices_per_window = np.arange(0, window_size, obs_frequency)
+#     obs_indices = np.arange(0, total_steps - 1, obs_frequency)
+#     return obs_indices_per_window, obs_indices
 
 
-def generate_observations(true_signal, obs_indices, obs_std=0.1):
-    """
-    Generate water surface elevation observations with noise.
-    """
+# def generate_observations(true_signal, obs_indices, obs_std=0.1):
+#     """
+#     Generate water surface elevation observations with noise.
+#     """
 
-    # Extract observations at specified indices: Hu
-    station_data = true_signal.vals[:, :, 0].copy()
-    y_obs = station_data[obs_indices]
+#     # Extract observations at specified indices: Hu
+#     station_data = true_signal.vals[:, :, 0].copy()
+#     y_obs = station_data[obs_indices]
 
-    # Add Gaussian noise to observations Hu + noise
-    y_obs += obs_std * np.random.randn(*y_obs.shape)
+#     # Add Gaussian noise to observations Hu + noise
+#     y_obs += obs_std * np.random.randn(*y_obs.shape)
 
-    return y_obs
+#     return y_obs
 
 
 # def generate_observations(true_signal, obs_indices, obs_std=0.1):
