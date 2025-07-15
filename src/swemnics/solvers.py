@@ -303,7 +303,7 @@ class BaseSolver:
         return self.u
 
     def log(self, *msg):
-        if self.mpi_rank == 0:
+        if self.mpi_rank == 0 and self.verbose:
             print(*msg)
 
 
@@ -799,17 +799,15 @@ class CGImplicit(BaseSolver):
         """Gather and save global state vector"""
         comm = self.problem.mesh.comm
         rank = comm.rank
+        size = comm.size
 
         # Safely slice only local (non-ghost) values
         size_local = self.V.dofmap.index_map.size_local
         u_local = self.u.x.array[:size_local]
-
-        # print(f"[Rank {rank}] Inside save_states – local size {size_local}", flush=True)
         gathered_states = comm.gather(u_local, root=0)
 
         if rank == 0:
             gathered_state = np.concatenate(gathered_states)
-            # print(f"[Rank {rank}] Inside save_states – gathered state size {gathered_state.shape}", flush=True)
             self.saved_states.append(gathered_state.copy())
 
     def time_loop(

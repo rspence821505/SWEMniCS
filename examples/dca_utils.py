@@ -8,7 +8,7 @@ from mpi4py import MPI
 
 
 def create_problem_solver(
-    problem_params, problem_type="sloped_beach", true_signal=True
+    problem_params, problem_type="sloped_beach", true_signal=True, verbose=False
 ):
     """
     Create a problem and solver based on the problem type and parameters.
@@ -16,34 +16,24 @@ def create_problem_solver(
     common_solver_kwargs = {
         "theta": 1,
         "p_degree": [1, 1],
-        "verbose": False,
+        "verbose": verbose,
         "adjoint_method": True,
     }
-    optional_solver_kwargs = {
-        "mag": 0.11,
-        "alpha": 0.00010538918781,
-        "h_b": 6.0,
-    }
-    if problem_type == "tidal":
-        tidal_kwargs = {
-            "nx": problem_params["nx"],
-            "ny": problem_params["ny"],
+
+    if true_signal:
+
+        sloped_kwargs = {
             "dt": problem_params["dt"],
             "nt": problem_params["num_steps"],
+            "friction_law": problem_params["fric_law"],
             "solution_var": problem_params["sol_var"],
-            "wd": False,
-            "adjoint_method": True,
-            "verbose": False,
+            "wd_alpha": 0.36,
+            "wd": True,
+            "mag": 2.0,
+            "h_b_val": 5.0,  # Uncomment if needed
         }
-        if true_signal:
-            tidal_kwargs["friction_law"] = "linear"
-            prob = TidalProblem(**tidal_kwargs)
-            solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
-        else:
-            tidal_kwargs["friction_law"] = problem_params["fric_law"]
-            prob = TidalProblem(**tidal_kwargs)  # Inverse crime case
-            # prob = TidalProblem(**tidal_kwargs, **optional_solver_kwargs)
-            solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
+        prob = SlopedBeachProblem(**sloped_kwargs)
+        solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
     else:
         sloped_kwargs = {
             "dt": problem_params["dt"],
@@ -52,43 +42,100 @@ def create_problem_solver(
             "solution_var": problem_params["sol_var"],
             "wd_alpha": 0.36,
             "wd": True,
+            "mag": 2.0,
+            "h_b_val": 5.0,  # Uncomment if needed
+            # "alpha": 0.00024, # Uncomment if needed
         }
         prob = SlopedBeachProblem(**sloped_kwargs)
         solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
+
     if "t" in problem_params:
         solver.problem.t = problem_params["t"]
     return prob, solver
 
 
-def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1):
-    """
-    Default values are sea level and 0 velocity
-    """
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
+# def create_problem_solver(
+#     problem_params, problem_type="sloped_beach", true_signal=True
+# ):
+#     """
+#     Create a problem and solver based on the problem type and parameters.
+#     """
+#     common_solver_kwargs = {
+#         "theta": 1,
+#         "p_degree": [1, 1],
+#         "verbose": False,
+#         "adjoint_method": True,
+#     }
+#     optional_solver_kwargs = {
+#         "mag": 0.11,
+#         "alpha": 0.00010538918781,
+#         "h_b": 6.0,
+#     }
+#     if problem_type == "tidal":
+#         tidal_kwargs = {
+#             "nx": problem_params["nx"],
+#             "ny": problem_params["ny"],
+#             "dt": problem_params["dt"],
+#             "nt": problem_params["num_steps"],
+#             "solution_var": problem_params["sol_var"],
+#             "wd": False,
+#             "adjoint_method": True,
+#             "verbose": False,
+#         }
+#         if true_signal:
+#             tidal_kwargs["friction_law"] = "linear"
+#             prob = TidalProblem(**tidal_kwargs)
+#             solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
+#         else:
+#             tidal_kwargs["friction_law"] = problem_params["fric_law"]
+#             prob = TidalProblem(**tidal_kwargs)  # Inverse crime case
+#             # prob = TidalProblem(**tidal_kwargs, **optional_solver_kwargs)
+#             solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
+#     else:
+#         sloped_kwargs = {
+#             "dt": problem_params["dt"],
+#             "nt": problem_params["num_steps"],
+#             "friction_law": problem_params["fric_law"],
+#             "solution_var": problem_params["sol_var"],
+#             "wd_alpha": 0.36,
+#             "wd": True,
+#         }
+#         prob = SlopedBeachProblem(**sloped_kwargs)
+#         solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
+#     if "t" in problem_params:
+#         solver.problem.t = problem_params["t"]
+#     return prob, solver
 
-    prob, solver = create_problem_solver(problem_params, problem_type)
-    u_0 = solver.u_n  # full initial condition
 
-    # Doesn't work for DG Case
-    V = solver.V  # create full function space
-    V_coords = (
-        V.sub(0).collapse()[0].tabulate_dof_coordinates()
-    )  # collapse to height function space
+# def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1):
+#     """
+#     Default values are sea level and 0 velocity
+#     """
+#     comm = MPI.COMM_WORLD
+#     rank = comm.Get_rank()
 
-    stations = V_coords[::obs_frequency, :]
+#     prob, solver = create_problem_solver(problem_params, problem_type)
+#     u_0 = solver.u_n  # full initial condition
 
-    solver.time_loop(
-        solver_parameters=solver_params,
-        stations=stations,
-        plot_every=60,
-        plot_name="SUPG_Tide",
-        u_0=u_0,
-        save_states=True,
-        adjoint_method=True,
-    )
+#     # Doesn't work for DG Case
+#     V = solver.V  # create full function space
+#     V_coords = (
+#         V.sub(0).collapse()[0].tabulate_dof_coordinates()
+#     )  # collapse to height function space
 
-    return solver, prob, stations, V_coords
+#     stations = V_coords[::obs_frequency, :]
+
+#     solver.time_loop(
+#         solver_parameters=solver_params,
+#         stations=stations,
+#         plot_every=60,
+#         plot_name="SUPG_Tide",
+#         u_0=u_0,
+#         save_states=True,
+#         adjoint_method=True,
+#     )
+
+#     return solver, prob, stations, V_coords
 
 
 def setup_observation_indices(window_size, obs_frequency, total_steps):

@@ -106,7 +106,7 @@ def optimize_4dvar(
     print_optimization_summary(result)
 
     # Print state comparison
-    print_state_summary(u0, result, step=100)
+    # print_state_summary(u0, result, step=100)
 
     return result.x, result
 
@@ -139,6 +139,7 @@ def run_assimilation(
 
         # Extract observations for current window
         indices = np.arange(obs_per_window) + (idx * obs_per_window)
+        # print(f"[Window {idx + 1}] Processing indices: {indices}", flush=True)
         yobs_current_window = y_obs[indices]
 
         # Update initial time for model
@@ -174,14 +175,14 @@ def run_assimilation(
 
         # Process background state
         background = np.array(solver.saved_states)  # shape: (steps, num_stations)
-        print(f"Background shape: {background.shape}")
+        # print(f"Background shape: {background.shape}")
         # print(f"obs_times_current_window: {obs_times_current_window}")
         observed_background_states = background[
             obs_times_current_window
         ]  # shape: (n_obs, state_dim)
         Q_zb = H @ observed_background_states.T  # shape: (n_obs,obs_dim)
         solver.saved_states = []  # reset saved states for next window
-        print(f"Q_zb shape: {Q_zb.shape}")
+        # print(f"Q_zb shape: {Q_zb.shape}")
 
         # Get initial state vectors
         z0 = initial_u0.x.array[:]
@@ -211,6 +212,8 @@ def run_assimilation(
 
         # Run analysis forward
         solver.problem.t = initial_time
+        solver.saved_states = []  # reset saved states for analysis
+        solver.saved_adjoints = []  # reset saved adjoints for analysis
         print(f"Solver Time 2: {solver.problem.t}")  # Debugging line
         solver.time_loop(
             solver_parameters=solver_params,
@@ -218,6 +221,7 @@ def run_assimilation(
             plot_every=60,
             plot_name=name,
             u_0=u_0,
+            save_states=True,
             adjoint_method=False,
         )
 
@@ -225,9 +229,13 @@ def run_assimilation(
         analysis_state = solver.u.x.array[:]
 
         # Collect results
-        current_analysis = solver.vals.copy()
-        if idx < num_windows - 1:
-            current_analysis = current_analysis[:-1, :, :]
+        # current_analysis = solver.vals.copy()
+        current_analysis = np.array(solver.saved_states)
+        # print(f"Current analysis shape: {current_analysis.shape}")
+        # if idx < num_windows - 1:
+        #     # current_analysis = current_analysis[:-1, :, :] # Exclude last time step
+        #     current_analysis = current_analysis.copy()
+        # current_analysis = current_analysis.copy()
         analysis.append(current_analysis)
 
         print(
