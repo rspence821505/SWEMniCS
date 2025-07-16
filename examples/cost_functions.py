@@ -1,14 +1,13 @@
 import numpy as np
 from dolfinx import fem as fe
-from scipy.optimize import minimize
 from scipy.sparse.linalg import spsolve
 from mpi4py import MPI
-from tqdm import tqdm
-from typing import List, Dict, Tuple, Callable, Optional, Literal
+from typing import Optional, Literal, Any, Dict, Union, List
 from dolfinx import fem as fe
+import sys
 
 
-# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Cost Function Helper Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Cost Function Loss Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 
 
 def _background_loss(z, z_b, B_inv):
@@ -29,6 +28,7 @@ def _prediction_loss(Qz, Q_zb, L_inv):
     return 0.5 * np.sum(pred_diff * (L_inv @ pred_diff))
 
 
+# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Adjoint RHS Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 def _adjoint_rhs_bayes(H, Hu, yobs, R_inv, **kwargs):
     """Compute the adjoint right-hand side for the Bayesian cost function."""
     obs_residual = Hu - yobs
@@ -45,19 +45,14 @@ def _adjoint_rhs_dci(H, Hu, yobs, R_inv, L_inv, Q_zb, **kwargs):
 def _adjoint_rhs_dci_wme(H, Hu, yobs, R_inv, L_inv, Q_zb, Q_zb_wme, Q_z_wme, **kwargs):
     """Compute the adjoint right-hand side for the DCI WME cost function."""
     num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(yobs, R_inv, L_inv)
-    # q_wme = wme_map(Hu, yobs, obs_var, num_obs)
-    # qzb_wme = wme_map(Q_zb, yobs, obs_var, num_obs)
     gamma = (1 / np.sqrt(num_obs)) * obs_sum
     return gamma * H.T @ (Q_z_wme - L_inv_wme @ (Q_z_wme - Q_zb_wme))
 
 
+# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ WME Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 def wme_map(Qz, y_obs, var, num_obs):
     """Calculate Weighted Mean Error terms."""
-    # print(f"Qz shape: {Qz.shape}, y_obs shape: {y_obs.shape}")
-    residual = (Qz.T - y_obs).T
-    # print(f"Residual shape: {residual.shape}")
-    wme = (1 / np.sqrt(num_obs)) * np.sum((Qz.T - y_obs).T / np.sqrt(var), axis=1)
-    return wme
+    return (1 / np.sqrt(num_obs)) * np.sum((Qz.T - y_obs).T / np.sqrt(var), axis=1)
 
 
 def initialize_wme_terms(y_obs, R_inv, L_inv):
@@ -70,111 +65,156 @@ def initialize_wme_terms(y_obs, R_inv, L_inv):
     return num_obs, obs_var, obs_sum, L_inv_wme
 
 
-# def get_trajectory(
-#     u0: np.ndarray,
-#     solver_params: dict,
-#     stations: np.ndarray,
-#     solver,
-#     initial_time: float,
-# ) -> any:
-#     """
-#     Safely reset and run the forward model from a given initial condition `u0`.
-
-#     This version clears mutable solver state to ensure reproducibility between
-#     cost function and adjoint gradient computations.
-#     """
-#     V = solver.V
-#     u_0 = fe.Function(V)
-
-#     # Set initial condition
-#     u_0.x.array[:] = u0
-
-#     # ⛔️ Clear any stale state
-#     if hasattr(solver, "saved_states"):
-#         solver.saved_states.clear()
-
-#     if hasattr(solver, "saved_adjoints"):
-#         solver.saved_adjoints.clear()
-
-#     if hasattr(solver, "vals"):
-#         solver.vals.fill(0.0)
-
-#     # Reset solver time (important for multi-window assimilation)
-#     solver.problem.t = initial_time
-
-#     # Run forward model (this must populate saved states and adjoints)
-#     _, _ = solver.time_loop(
-#         solver_parameters=solver_params, stations=stations, u_0=u_0, adjoint_method=True
-#     )
-
-#     return solver
+# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Helper Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 
 
-def get_trajectory(u0, solver_params, stations, solver, comm=None):
-    """Propagate state through model and get observations."""
+def get_trajectory(
+    u0: np.ndarray,
+    solver_params: Dict[str, Any],
+    stations: Union[List[Any], np.ndarray],
+    solver: Any,
+) -> Any:
+    """
+    Propagate state through model and get observations.
 
-    if comm is None:
-        comm = MPI.COMM_WORLD
+    Parameters
+    ----------
+    u0 : np.ndarray
+        Initial state vector in h space (height/elevation space).
+    solver_params : dict
+        Dictionary containing solver configuration parameters for time integration.
+    stations : list or np.ndarray
+        Station locations or identifiers where observations will be collected.
+    solver : Any
+        Solver object containing the finite element function space V, time_loop method,
+        and storage for saved_states and saved_adjoints.
 
-    rank = comm.Get_rank()
-    # print(f"[Rank {rank}] Reached checkpoint D", flush=True)
+    Returns
+    -------
+    Any
+        The updated solver object with populated saved_states and saved_adjoints
+        from the forward model integration.
 
-    # Convert initial state vector in h space to full initial state vector in u space
-    V = solver.V
-    u_0 = fe.Function(V)
+    Raises
+    ------
+    AttributeError
+        If solver object is missing required attributes (V, time_loop, etc.).
+    ValueError
+        If initial state vector u0 cannot be properly assigned to the function space.
+    RuntimeError
+        If the time integration loop fails to complete successfully.
 
-    u_0.x.array[:] = u0  # Set initial state vector
+    Notes
+    -----
+    This function performs the forward model integration by:
+    1. Converting the initial state vector from h space to the full function space
+    2. Clearing any previously saved states and adjoints
+    3. Running the time integration loop with state saving enabled
+    4. Returning the solver with populated trajectory data
 
-    # ⛔️ Clear any stale state
-    if hasattr(solver, "saved_states"):
-        solver.saved_states.clear()
-
-    if hasattr(solver, "saved_adjoints"):
-        solver.saved_adjoints.clear()
-
-    # # Synchronize before starting the time loop
-    # comm.Barrier()
-
-    # Run the time loop to propagate the state through the model
+    The function requires that the solver object has:
+    - V: FEniCS function space
+    - time_loop: swemnics method for time integration
+    - saved_states: list for storing forward states
+    - saved_adjoints: list for storing adjoint states
+    """
+    try:
+        # Convert initial state vector in h space to full initial state vector in u space
+        V = solver.V
+        u_0 = fe.Function(V)
+        u_0.x.array[:] = u0  # Set initial state vector
+    except AttributeError as e:
+        print(f"Error accessing solver function space: {e}", flush=True)
+        raise AttributeError(
+            "Solver object missing required attribute 'V' (function space)"
+        )
+    except (ValueError, IndexError) as e:
+        print(f"Error setting initial state vector: {e}", flush=True)
+        raise ValueError(
+            f"Initial state vector u0 incompatible with function space: {e}"
+        )
 
     try:
-        _, _ = solver.time_loop(
+        # Clear any stale state
+        if hasattr(solver, "saved_states"):
+            solver.saved_states.clear()
+        if hasattr(solver, "saved_adjoints"):
+            solver.saved_adjoints.clear()
+    except AttributeError as e:
+        print(f"Warning: Could not clear solver state arrays: {e}", flush=True)
+
+    try:
+        # Run the time loop to propagate the state through the model
+        solver.time_loop(
             solver_parameters=solver_params,
             stations=stations,
             u_0=u_0,
             save_states=True,
             adjoint_method=True,
         )
+    except AttributeError as e:
+        print(f"Error: Solver missing time_loop method: {e}", flush=True)
+        raise AttributeError("Solver object missing required method 'time_loop'")
+    except (ValueError, RuntimeError) as e:
+        print(f"Error in time loop execution: {e}", flush=True)
+        raise RuntimeError(f"Time integration failed: {e}")
     except Exception as e:
-        if rank == 0:
-            print(f"Error in time loop: {e}")
-        raise
-
-    # Synchronize after time loop
-    # comm.Barrier()
+        print(f"Unexpected error in time loop: {e}", flush=True)
+        raise RuntimeError(f"Unexpected failure during time integration: {e}")
 
     return solver
 
 
-def bayes_cost_function(u0, solver, init_time, **kwargs):
+# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Cost Function Variants \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+
+def bayes_cost_function(
+    u0: np.ndarray, solver: Any, init_time: Union[float, int], **kwargs: Any
+) -> float:
     """
     Vectorized cost function for standard 4D-Var using kwargs.
-    Required kwargs:
-        - u_b
-        - y_obs
-        - obs_time_indices
-        - H
-        - B_inv
-        - R_inv
-        - solver_params
-        - stations
-        - hb
-    """
 
-    # Get MPI communicator
-    comm = kwargs.get("comm", MPI.COMM_WORLD)
-    rank = comm.Get_rank()
-    # print(f"[Rank {rank}] Reached checkpoint E", flush=True)
+    Parameters
+    ----------
+    u0 : np.ndarray
+        Initial state vector for the optimization.
+    solver : Any
+        Solver object containing the numerical model and integration methods.
+    init_time : float or int
+        Initial time for the solver integration.
+    **kwargs : dict
+        Keyword arguments containing required parameters:
+
+        u_b : np.ndarray
+            Background state vector.
+        y_obs : np.ndarray
+            Observation vector.
+        obs_time_idxs : np.ndarray
+            Time indices where observations are available.
+        H : np.ndarray
+            Observation operator matrix.
+        covs : dict
+            Dictionary containing covariance matrices with keys for B_inv, R_inv.
+        solver_params : dict
+            Parameters for the solver configuration.
+        stations : list or np.ndarray
+            Station locations or identifiers.
+        hb : list or np.ndarray
+            Bathymetry at stations.
+
+    Returns
+    -------
+    float
+        Combined cost function value (J_b + J_o) representing the sum of
+        background and observation terms. Returns 1e10 if computation fails.
+
+    Notes
+    -----
+    The cost function implements the standard 4D-Var formulation:
+    J(u0) = 0.5 * (u0 - u_b)^T * B_inv * (u0 - u_b) +
+            0.5 * (H*M(u0) - y_obs)^T * R_inv * (H*M(u0) - y_obs)
+    where M(u0) represents the model integration from initial state u0.
+    """
     # Unpack required arguments
     u_b = kwargs["u_b"]
     y_obs = kwargs["y_obs"]
@@ -183,25 +223,26 @@ def bayes_cost_function(u0, solver, init_time, **kwargs):
     B_inv, R_inv, _ = kwargs["covs"].values()
     solver_params = kwargs["solver_params"]
     stations = kwargs["stations"]
-    hb = kwargs["hb"]
 
     # Reset solver time to initial time
     solver.problem.t = init_time
 
     try:
         # Run model
-        solver = get_trajectory(u0, solver_params, stations, solver, comm)
+        solver = get_trajectory(u0, solver_params, stations, solver)
         states = np.array(solver.saved_states)  # shape: (steps, num_stations)
         observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
-        Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
-
+        Qz = H @ observed_states.T  # shape: (n_obs, obs_dim)
+    except (ValueError, IndexError, AttributeError) as e:
+        print(f"Error in bayes_cost_function get_trajectory: {e}", flush=True)
+        return 1e10  # Return a large value to indicate failure
     except Exception as e:
-        if rank == 0:
-            print(f"Error in bayes_cost_function get_trajectory: {e}", flush=True)
+        print(f"Unexpected error in bayes_cost_function: {e}", flush=True)
         return 1e10
 
-    # print(f"Qz shape: {Qz.shape}, y_obs shape: {y_obs.shape}")
-    # Loss terms
+    # Compute loss function terms
+    # Includes background and observation components
+
     # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
     J_b = _background_loss(u0, u_b, B_inv)
 
@@ -211,21 +252,57 @@ def bayes_cost_function(u0, solver, init_time, **kwargs):
     return J_b + J_o
 
 
-def dci_cost_function(u0, solver, init_time, **kwargs):
+def dci_cost_function(
+    u0: np.ndarray, solver: Any, init_time: Union[float, int], **kwargs: Any
+) -> float:
     """
-    DCI cost function variant using **kwargs.
-    Required kwargs:
-        - u_b
-        - y_obs
-        - obs_time_indices
-        - H
-        - B_inv
-        - R_inv
-        - P_inv
-        - Q_zb
-        - solver_params
-        - stations
-        - hb
+    DCI (Data-driven Control and Inference) cost function variant using kwargs.
+
+    Parameters
+    ----------
+    u0 : np.ndarray
+        Initial state vector for the optimization.
+    solver : Any
+        Solver object containing the numerical model and integration methods.
+    init_time : float or int
+        Initial time for the solver integration.
+    **kwargs : dict
+        Keyword arguments containing required parameters:
+
+        u_b : np.ndarray
+            Background state vector.
+        y_obs : np.ndarray
+            Observation vector.
+        obs_time_idxs : np.ndarray
+            Time indices where observations are available.
+        H : np.ndarray
+            Observation operator matrix.
+        covs : dict
+            Dictionary containing covariance matrices with keys for B_inv, R_inv, L_inv.
+        Q_zb : np.ndarray
+            Background prediction vector.
+        solver_params : dict
+            Parameters for the solver configuration.
+        stations : list or np.ndarray
+            Station locations or identifiers.
+        hb : Any
+            Additional parameter (purpose depends on implementation).
+
+    Returns
+    -------
+    float
+        Combined DCI cost function value (J_b + J_o - J_p) representing the sum of
+        background and observation terms minus the prediction term. Returns 1e10 if
+        computation fails.
+
+    Notes
+    -----
+    The DCI cost function implements a modified 4D-Var formulation with prediction term:
+    J(u0) = 0.5 * (u0 - u_b)^T * B_inv * (u0 - u_b) +
+            0.5 * (H*M(u0) - y_obs)^T * R_inv * (H*M(u0) - y_obs) -
+            0.5 * (H*M(u0) - Q_zb)^T * L_inv * (H*M(u0) - Q_zb)
+    where M(u0) represents the model integration from initial state u0, and the
+    prediction term J_p is subtracted to incorporate prior knowledge.
     """
     # Unpack required arguments
     u_b = kwargs["u_b"]
@@ -241,43 +318,82 @@ def dci_cost_function(u0, solver, init_time, **kwargs):
     # Reset solver time to initial time
     solver.problem.t = init_time
 
-    # Get model trajectory
-    solver = get_trajectory(u0, solver_params, stations, solver)
-    states = np.array(solver.saved_states)  # shape: (steps, num_stations)
-    # print(f"States shape: {states.shape}")
-    # print(f"Observation time indices: {obs_time_indices}")
-    observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
-    Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
+    try:
+        # Get model trajectory
+        solver = get_trajectory(u0, solver_params, stations, solver)
+        states = np.array(solver.saved_states)  # shape: (steps, num_stations)
+        observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
+        Qz = H @ observed_states.T  # shape: (n_obs, obs_dim)
+    except (ValueError, IndexError, AttributeError) as e:
+        print(f"Error in dci_cost_function get_trajectory: {e}", flush=True)
+        return 1e10  # Return a large value to indicate failure
+    except Exception as e:
+        print(f"Unexpected error in dci_cost_function: {e}", flush=True)
+        return 1e10
 
     # Loss terms
-
     # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
     J_b = _background_loss(u0, u_b, B_inv)
-
     # Compute Observation loss term 0.5 * (Qz - y_obs).T @ R_inv @ (Qz - y_obs)
     J_o = _observation_loss(Qz, y_obs, R_inv)
-
-    # Compute Prediction loss term 0.5 * (Qz - Q_zb).T @ P_inv @ (Qz - Q_zb)
+    # Compute Prediction loss term 0.5 * (Qz - Q_zb).T @ L_inv @ (Qz - Q_zb)
     J_p = _prediction_loss(Qz, Q_zb, L_inv)
 
     return J_b + J_o - J_p
 
 
-def dci_wme_cost_function(u0, solver, init_time, **kwargs):
+def dci_wme_cost_function(
+    u0: np.ndarray, solver: Any, init_time: Union[float, int], **kwargs: Any
+) -> float:
     """
-    DCI WME (Weighted Mean Error) cost function variant using **kwargs.
-    Required kwargs:
-        - u_b
-        - y_obs
-        - obs_time_indices
-        - H
-        - B_inv
-        - R_inv
-        - P_inv
-        - Q_zb
-        - solver_params
-        - stations
-        - hb
+    DCI WME (Weighted Mean Error) cost function variant using kwargs.
+
+    Parameters
+    ----------
+    u0 : np.ndarray
+        Initial state vector for the optimization.
+    solver : Any
+        Solver object containing the numerical model and integration methods.
+    init_time : float or int
+        Initial time for the solver integration.
+    **kwargs : dict
+        Keyword arguments containing required parameters:
+
+        u_b : np.ndarray
+            Background state vector.
+        y_obs : np.ndarray
+            Observation vector.
+        obs_time_idxs : np.ndarray
+            Time indices where observations are available.
+        H : np.ndarray
+            Observation operator matrix.
+        covs : dict
+            Dictionary containing covariance matrices with keys for B_inv, R_inv, L_inv.
+        Q_zb : np.ndarray
+            Background prediction vector.
+        solver_params : dict
+            Parameters for the solver configuration.
+        stations : list or np.ndarray
+            Station locations or identifiers.
+        hb : Any
+            Additional parameter (purpose depends on implementation).
+
+    Returns
+    -------
+    float
+        Combined DCI WME cost function value (J_b + J_o - J_p) representing the sum of
+        background and weighted observation terms minus the weighted prediction term.
+        Returns 1e10 if computation fails.
+
+    Notes
+    -----
+    The DCI WME cost function implements a modified 4D-Var formulation with weighted
+    mean error (WME) terms applied to observations and predictions:
+    J(u0) = 0.5 * (u0 - u_b)^T * B_inv * (u0 - u_b) +
+            0.5 * WME(H*M(u0), y_obs)^T * R_inv * WME(H*M(u0), y_obs) -
+            0.5 * (WME_z - WME_zb)^T * L_inv_wme * (WME_z - WME_zb)
+    where M(u0) represents the model integration from initial state u0, and WME
+    transforms are applied to reduce the impact of outliers in observations and predictions.
     """
     # Unpack required arguments
     u_b = kwargs["u_b"]
@@ -293,33 +409,50 @@ def dci_wme_cost_function(u0, solver, init_time, **kwargs):
     # Reset solver time to initial time
     solver.problem.t = init_time
 
-    # Run model
-    solver = get_trajectory(u0, solver_params, stations, solver)
-    states = np.array(solver.saved_states)  # shape: (steps, num_stations)
-    observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
-    Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
+    try:
+        # Run model
+        solver = get_trajectory(u0, solver_params, stations, solver)
+        states = np.array(solver.saved_states)  # shape: (steps, num_stations)
+        observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
+        Qz = H @ observed_states.T  # shape: (n_obs, obs_dim)
+    except (ValueError, IndexError, AttributeError) as e:
+        print(f"Error in dci_wme_cost_function get_trajectory: {e}", flush=True)
+        return 1e10  # Return a large value to indicate failure
+    except Exception as e:
+        print(f"Unexpected error in dci_wme_cost_function: {e}", flush=True)
+        return 1e10
 
-    # Initialize WME terms
-    num_obs, obs_var, _, L_inv_wme = initialize_wme_terms(y_obs, R_inv, L_inv)
+    try:
+        # Initialize WME terms
+        num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(y_obs, R_inv, L_inv)
 
-    # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
-    J_b = _background_loss(u0, u_b, B_inv)
+        # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
+        J_b = _background_loss(u0, u_b, B_inv)
 
-    # print(f"Qz shape: {Qz.shape}, y_obs shape: {y_obs.shape}")
+        # Observation loss (WME)
+        obs_wme = wme_map(Qz, y_obs, obs_var, num_obs)
+        J_o = 0.5 * np.sum(obs_wme * (R_inv @ obs_wme))
 
-    # Observation loss (WME)
-    obs_wme = wme_map(Qz, y_obs, obs_var, num_obs)
-    J_o = 0.5 * np.sum(obs_wme * (R_inv @ obs_wme))
+        # Prediction loss (WME)
+        Qz_wme = wme_map(Qz, y_obs, obs_var, num_obs)
+        Qzb_wme = wme_map(Q_zb, y_obs, obs_var, num_obs)
+        pred_diff = Qz_wme - Qzb_wme
+        J_p = 0.5 * np.sum(pred_diff * (L_inv_wme @ pred_diff))
 
-    # Prediction loss (WME)
-    Qz_wme = wme_map(Qz, y_obs, obs_var, num_obs)
-    Qzb_wme = wme_map(Q_zb, y_obs, obs_var, num_obs)
-    pred_diff = Qz_wme - Qzb_wme
-    J_p = 0.5 * np.sum(pred_diff * (L_inv_wme @ pred_diff))
+    except (ValueError, IndexError, AttributeError) as e:
+        print(f"Error in dci_wme_cost_function WME computation: {e}", flush=True)
+        return 1e10
+    except Exception as e:
+        print(
+            f"Unexpected error in dci_wme_cost_function WME computation: {e}",
+            flush=True,
+        )
+        return 1e10
 
     return J_b + J_o - J_p
 
 
+# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Adjoint Function Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 def adjoint_rhs(
     H: np.ndarray,
     Hu: np.ndarray,
@@ -355,6 +488,22 @@ def adjoint_rhs(
     )
 
 
+def print_observation_debug_info(
+    Hu: np.ndarray,
+    yobs: np.ndarray,
+    n: int,
+    rank: int = 0,
+):
+    """
+    Print debug information for a single observation time step during the adjoint solve.
+    """
+    if rank == 0:
+        print(f"\n--- Observation Debug Info at Time Step {n} ---")
+        print(f"Hu shape: {Hu.shape}", f"Hu: {Hu[::10]}")
+        print(f"yobs shape: {yobs.shape}, yobs: {yobs[::10]}")
+        print("----------------------------------------------\n")
+
+
 def print_adjoint_debug_info(
     nt: int,
     trajectories: list,
@@ -384,22 +533,6 @@ def print_adjoint_debug_info(
         print(f"Observation Data Shape: {obs_data.shape}")
         print(f"R_inv Shape: {R_inv.shape}")
         print("=" * 100 + "\n\n")
-
-
-def print_observation_debug_info(
-    Hu: np.ndarray,
-    yobs: np.ndarray,
-    n: int,
-    rank: int = 0,
-):
-    """
-    Print debug information for a single observation time step during the adjoint solve.
-    """
-    if rank == 0:
-        print(f"\n--- Observation Debug Info at Time Step {n} ---")
-        print(f"Hu shape: {Hu.shape}", f"Hu: {Hu[::10]}")
-        print(f"yobs shape: {yobs.shape}, yobs: {yobs[::10]}")
-        print("----------------------------------------------\n")
 
 
 def swe_adjoint(
@@ -471,17 +604,16 @@ def swe_adjoint(
     num_obs = len(obs_data)
     Qzb = Q_zb.T if Q_zb is not None else None
 
-    # print_adjoint_debug_info(
-    #     nt=nt,
-    #     trajectories=trajectories,
-    #     adjoints=adjoints,
-    #     obs_spatial_idxs=obs_spatial_idxs,
-    #     obs_time_idxs=obs_time_idxs,
-    #     λ_shape=λ.x.array.shape,
-    #     obs_data=obs_data,
-    #     R_inv=R_inv,
-    # )
-    # print(f"y_obs shape: {obs_data.shape}, obs_time_idxs: {obs_time_idxs}")
+    print_adjoint_debug_info(
+        nt=nt,
+        trajectories=trajectories,
+        adjoints=adjoints,
+        obs_spatial_idxs=obs_spatial_idxs,
+        obs_time_idxs=obs_time_idxs,
+        λ_shape=λ.x.array.shape,
+        obs_data=obs_data,
+        R_inv=R_inv,
+    )
 
     if adjoint_type == "dci_wme":
         states = np.array(trajectories)  # shape: (steps, num_stations)
@@ -492,9 +624,6 @@ def swe_adjoint(
         )
         Qz_wme = wme_map(Qz, obs_data, obs_var, num_obs)
         Qzb_wme = wme_map(Q_zb, obs_data, obs_var, num_obs)
-        # print(
-        #     f"Qzb_wme shape: {Qzb_wme.shape},Qz_wme shape {Qz_wme.shape},  y_obs shape : {obs_data.shape}"
-        # )
     else:
         Qz = None
         Qz_wme = None
@@ -505,7 +634,6 @@ def swe_adjoint(
             idx = np.where(obs_time_idxs == n)[0][0]
             u = trajectories[n + 1].copy()  # u:
             Hu = H @ u
-            # print(f"Hu shape: {Hu.shape}, obs_data shape: {obs_data.shape}")
 
             yobs = obs_data[idx].copy()
             q_zb = Qzb[idx].copy() if Q_zb is not None else None
@@ -542,24 +670,63 @@ def swe_adjoint(
     return λ  # This is λ_0 = ∇J(z_0)
 
 
-def grad_cost_function(u0, solver, adjoint_type, **kwargs):
+def grad_cost_function(
+    u0: np.ndarray, solver: Any, adjoint_type: str, **kwargs: Any
+) -> np.ndarray:
     """
     Gradient of the 4D-Var cost function using kwargs for flexibility.
 
-    Required kwargs:
-        - z_b
-        - y_obs
-        - obs_spatial_indices
-        - obs_time_indices
-        - H
-        - B_inv
-        - R_inv
-        - (optional) P_inv, Q_zb depending on adjoint_type
-    """
+    Parameters
+    ----------
+    u0 : np.ndarray
+        Initial state vector for the optimization.
+    solver : Any
+        Solver object containing the numerical model, saved states, and saved adjoints.
+    adjoint_type : str
+        Type of adjoint computation to perform (e.g., 'standard', 'dci', 'wme').
+    **kwargs : dict
+        Keyword arguments containing required parameters:
 
+        u_b : np.ndarray
+            Background state vector.
+        y_obs : np.ndarray
+            Observation vector.
+        obs_spatial_idxs : np.ndarray
+            Spatial indices where observations are available.
+        obs_time_idxs : np.ndarray
+            Time indices where observations are available.
+        H : np.ndarray
+            Observation operator matrix.
+        covs : dict
+            Dictionary containing covariance matrices with keys for B_inv, R_inv, L_inv.
+        Q_zb : np.ndarray
+            Background prediction vector (optional, depending on adjoint_type).
+        comm : MPI.Comm, optional
+            MPI communicator for parallel processing. Defaults to MPI.COMM_WORLD.
+
+    Returns
+    -------
+    np.ndarray
+        Gradient vector of the cost function with respect to the initial state u0.
+
+    Raises
+    ------
+    ValueError
+        If no saved adjoints or saved states are found in the solver object.
+
+    Notes
+    -----
+    The gradient computation follows the adjoint method for 4D-Var:
+    ∇J(u0) = B_inv * (u0 - u_b) + λ₀
+    where λ₀ is computed by solving the adjoint equations backward in time
+    using the saved forward states and observation misfits.
+
+    The function requires that the forward model has been run with saved_states=True
+    and adjoint_method=True to populate solver.saved_states and solver.saved_adjoints.
+    """
     # Get MPI communicator
-    comm = kwargs.get("comm", MPI.COMM_WORLD)
-    rank = comm.Get_rank()
+    comm: MPI.Comm = kwargs.get("comm", MPI.COMM_WORLD)
+    rank: int = comm.Get_rank()
 
     # Unpack required variables
     u_b = kwargs["u_b"]
@@ -570,23 +737,26 @@ def grad_cost_function(u0, solver, adjoint_type, **kwargs):
     B_inv, R_inv, L_inv = kwargs["covs"].values()
     Q_zb = kwargs["Q_zb"]
 
-    # print(f"Adjoint Time: {solver.problem.t}")  # Debugging line
-    # check if saved adjoints are available
+    try:
+        # Check if saved adjoints are available
+        if not solver.saved_adjoints:
+            if rank == 0:
+                raise ValueError(
+                    "No saved adjoints found. Ensure the model was run with adjoint_method=True."
+                )
 
-    # check of saved adjoints is empty
-    if not solver.saved_adjoints:
+        # Check if saved states are available
+        if not solver.saved_states:
+            if rank == 0:
+                raise ValueError(
+                    "No saved states found. Ensure the model was run with adjoint_method=True."
+                )
+    except AttributeError as e:
         if rank == 0:
-            raise ValueError(
-                "No saved adjoints found. Ensure the model was run with adjoint_method=True."
-            )
-    if not solver.saved_states:
-        if rank == 0:
-            raise ValueError(
-                "No saved states found. Ensure the model was run with adjoint_method=True."
-            )
-
-    # Sychronize before starting the adjoint solve
-    # comm.Barrier()
+            print(f"Error accessing solver attributes: {e}", flush=True)
+        raise ValueError(
+            "Solver object missing required attributes (saved_adjoints or saved_states)"
+        )
 
     try:
         # Compute adjoint λ₀
@@ -601,9 +771,13 @@ def grad_cost_function(u0, solver, adjoint_type, **kwargs):
             Q_zb,
             adjoint_type,
         )
-    except Exception as e:
+    except (ValueError, IndexError, AttributeError) as e:
         if rank == 0:
             print(f"Error in swe_adjoint: {e}", flush=True)
-        raise
+        return np.full_like(u0, 1e10)  # Return large gradient to indicate failure
+    except Exception as e:
+        if rank == 0:
+            print(f"Unexpected error in swe_adjoint: {e}", flush=True)
+        return np.full_like(u0, 1e10)
 
     return B_inv @ (u0 - u_b) + λ_0

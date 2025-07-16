@@ -139,7 +139,6 @@ def run_assimilation(
 
         # Extract observations for current window
         indices = np.arange(obs_per_window) + (idx * obs_per_window)
-        # print(f"[Window {idx + 1}] Processing indices: {indices}", flush=True)
         yobs_current_window = y_obs[indices]
 
         # Update initial time for model
@@ -148,7 +147,7 @@ def run_assimilation(
 
         # Create problem and solver
         _, solver = create_problem_solver(
-            problem_params, problem_type, true_signal=False
+            problem_params, problem_type, true_signal=False, verbose=False
         )
 
         solver.problem.t = initial_time  # reset time to initial time
@@ -175,19 +174,15 @@ def run_assimilation(
 
         # Process background state
         background = np.array(solver.saved_states)  # shape: (steps, num_stations)
-        # print(f"Background shape: {background.shape}")
-        # print(f"obs_times_current_window: {obs_times_current_window}")
         observed_background_states = background[
             obs_times_current_window
         ]  # shape: (n_obs, state_dim)
         Q_zb = H @ observed_background_states.T  # shape: (n_obs,obs_dim)
         solver.saved_states = []  # reset saved states for next window
-        # print(f"Q_zb shape: {Q_zb.shape}")
 
         # Get initial state vectors
         z0 = initial_u0.x.array[:]
         z_b = initial_u0.x.array[:]
-        # print(f"z0 shape: {z0.shape}")
 
         # Assimilation Step
         optimized_state, _ = optimize_4dvar(
@@ -231,10 +226,6 @@ def run_assimilation(
         # Collect results
         current_analysis = np.array(solver.saved_states)
         analysis.append(current_analysis)
-
-        print(
-            f"/////////////////////////////////////// Window {idx + 1} Completed ////////////////////////////////////////////////// \n\n"
-        )
 
     # Combine all windows
     return np.concatenate(analysis, axis=0)

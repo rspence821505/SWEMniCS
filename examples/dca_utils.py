@@ -27,6 +27,7 @@ def create_problem_solver(
             "nt": problem_params["num_steps"],
             "friction_law": problem_params["fric_law"],
             "solution_var": problem_params["sol_var"],
+            "verbose": verbose,
             "wd_alpha": 0.36,
             "wd": True,
             "mag": 2.0,
@@ -40,6 +41,7 @@ def create_problem_solver(
             "nt": problem_params["num_steps"],
             "friction_law": problem_params["fric_law"],
             "solution_var": problem_params["sol_var"],
+            "verbose": verbose,
             "wd_alpha": 0.36,
             "wd": True,
             "mag": 2.0,
@@ -52,125 +54,6 @@ def create_problem_solver(
     if "t" in problem_params:
         solver.problem.t = problem_params["t"]
     return prob, solver
-
-
-# def create_problem_solver(
-#     problem_params, problem_type="sloped_beach", true_signal=True
-# ):
-#     """
-#     Create a problem and solver based on the problem type and parameters.
-#     """
-#     common_solver_kwargs = {
-#         "theta": 1,
-#         "p_degree": [1, 1],
-#         "verbose": False,
-#         "adjoint_method": True,
-#     }
-#     optional_solver_kwargs = {
-#         "mag": 0.11,
-#         "alpha": 0.00010538918781,
-#         "h_b": 6.0,
-#     }
-#     if problem_type == "tidal":
-#         tidal_kwargs = {
-#             "nx": problem_params["nx"],
-#             "ny": problem_params["ny"],
-#             "dt": problem_params["dt"],
-#             "nt": problem_params["num_steps"],
-#             "solution_var": problem_params["sol_var"],
-#             "wd": False,
-#             "adjoint_method": True,
-#             "verbose": False,
-#         }
-#         if true_signal:
-#             tidal_kwargs["friction_law"] = "linear"
-#             prob = TidalProblem(**tidal_kwargs)
-#             solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
-#         else:
-#             tidal_kwargs["friction_law"] = problem_params["fric_law"]
-#             prob = TidalProblem(**tidal_kwargs)  # Inverse crime case
-#             # prob = TidalProblem(**tidal_kwargs, **optional_solver_kwargs)
-#             solver = Solvers.SUPGImplicit(prob, **common_solver_kwargs)
-#     else:
-#         sloped_kwargs = {
-#             "dt": problem_params["dt"],
-#             "nt": problem_params["num_steps"],
-#             "friction_law": problem_params["fric_law"],
-#             "solution_var": problem_params["sol_var"],
-#             "wd_alpha": 0.36,
-#             "wd": True,
-#         }
-#         prob = SlopedBeachProblem(**sloped_kwargs)
-#         solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
-#     if "t" in problem_params:
-#         solver.problem.t = problem_params["t"]
-#     return prob, solver
-
-
-# def get_true_signal(problem_params, problem_type, solver_params, obs_frequency=1):
-#     """
-#     Default values are sea level and 0 velocity
-#     """
-#     comm = MPI.COMM_WORLD
-#     rank = comm.Get_rank()
-
-#     prob, solver = create_problem_solver(problem_params, problem_type)
-#     u_0 = solver.u_n  # full initial condition
-
-#     # Doesn't work for DG Case
-#     V = solver.V  # create full function space
-#     V_coords = (
-#         V.sub(0).collapse()[0].tabulate_dof_coordinates()
-#     )  # collapse to height function space
-
-#     stations = V_coords[::obs_frequency, :]
-
-#     solver.time_loop(
-#         solver_parameters=solver_params,
-#         stations=stations,
-#         plot_every=60,
-#         plot_name="SUPG_Tide",
-#         u_0=u_0,
-#         save_states=True,
-#         adjoint_method=True,
-#     )
-
-#     return solver, prob, stations, V_coords
-
-
-# def setup_observation_indices(window_size, obs_frequency, total_steps):
-#     """Setup observation indices for windows"""
-#     obs_indices_per_window = np.arange(0, window_size, obs_frequency)
-#     obs_indices = np.arange(0, total_steps - 1, obs_frequency)
-#     return obs_indices_per_window, obs_indices
-
-
-# def generate_observations(true_signal, obs_indices, obs_std=0.1):
-#     """
-#     Generate water surface elevation observations with noise.
-#     """
-
-#     # Extract observations at specified indices: Hu
-#     station_data = true_signal.vals[:, :, 0].copy()
-#     y_obs = station_data[obs_indices]
-
-#     # Add Gaussian noise to observations Hu + noise
-#     y_obs += obs_std * np.random.randn(*y_obs.shape)
-
-#     return y_obs
-
-
-# def generate_observations(true_signal, obs_indices, obs_std=0.1):
-#     """
-#     Generate water surface elevation observations with noise.
-#     """
-#     # Extract observations at specified times
-#     y_obs = true_signal.vals[obs_indices, :, :]
-
-#     # Add Gaussian noise to observations Hu + noise
-#     y_obs += obs_std * np.random.randn(*y_obs.shape)
-
-#     return y_obs
 
 
 def find_obs_indices(array1, array2):
