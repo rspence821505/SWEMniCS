@@ -31,7 +31,7 @@ def create_problem_solver(
             "wd_alpha": 0.36,
             "wd": True,
             "mag": 2.0,
-            "h_b_val": 5.0,  # Uncomment if needed
+            "h_b_val": 5.3,  # Uncomment if needed
         }
         prob = SlopedBeachProblem(**sloped_kwargs)
         solver = Solvers.DGImplicit(prob, **common_solver_kwargs)

@@ -224,7 +224,10 @@ def run_assimilation(
         analysis_state = solver.u.x.array[:]
 
         # Collect results
-        current_analysis = np.array(solver.saved_states)
+        saved_states = np.array(solver.saved_states)
+        current_analysis = saved_states.copy()
+        if idx < num_windows - 1:
+            current_analysis = current_analysis[:-1, :]
         analysis.append(current_analysis)
 
     # Combine all windows
