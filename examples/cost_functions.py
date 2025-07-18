@@ -539,7 +539,6 @@ def swe_adjoint(
     solver,
     H: np.ndarray,
     obs_data: np.ndarray,
-    obs_spatial_idxs: np.ndarray,
     obs_time_idxs: np.ndarray,
     R_inv: np.ndarray,
     L_inv: Optional[np.ndarray] = None,
@@ -565,8 +564,6 @@ def swe_adjoint(
         Observation operator matrix of shape (m, n).
     obs_data : np.ndarray
         Observation data over the time window, shape (T_obs, m).
-    obs_spatial_idxs : np.ndarray
-        Indices of spatial locations where observations are taken.
     obs_time_idxs : np.ndarray
         Indices of time steps corresponding to observations.
     R_inv : np.ndarray
@@ -1134,7 +1131,6 @@ def grad_cost_function(
     # Unpack required variables
     u_b = kwargs["u_b"]
     y_obs = kwargs["y_obs"]
-    obs_spatial_indices = kwargs["obs_spatial_idxs"]
     obs_time_indices = kwargs["obs_time_idxs"]
     H = kwargs["H"]
     B_inv, R_inv, L_inv = kwargs["covs"].values()
@@ -1167,7 +1163,6 @@ def grad_cost_function(
             solver,
             H,
             y_obs,
-            obs_spatial_indices,
             obs_time_indices,
             R_inv,
             L_inv,

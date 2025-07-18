@@ -6,6 +6,48 @@ from swemnics import solvers as Solvers
 
 from mpi4py import MPI
 
+from enum import IntEnum
+
+
+class Time(IntEnum):
+    """
+    Enum for common time durations in seconds.
+
+    Using IntEnum allows these values to be used directly in arithmetic
+    operations and comparisons while providing better organization and
+    type safety compared to plain constants.
+    """
+
+    ONE_HOUR = 3600
+    TWO_HOURS = 7200
+    FOUR_HOURS = 14400
+    EIGHT_HOURS = 28800
+    TWELVE_HOURS = 43200
+    TWENTY_FOUR_HOURS = 86400
+
+    def __str__(self) -> str:
+        """Return human-readable string representation."""
+        hours = self.value // 3600
+        if hours == 1:
+            return "1 hour"
+        else:
+            return f"{int(hours)} hours"
+
+    @property
+    def hours(self) -> float:
+        """Return duration in hours."""
+        return self.value // 3600
+
+    @property
+    def minutes(self) -> float:
+        """Return duration in minutes."""
+        return self.value / 60
+
+    @property
+    def seconds(self) -> int:
+        """Return duration in seconds."""
+        return self.value
+
 
 def create_problem_solver(
     problem_params, problem_type="sloped_beach", true_signal=True, verbose=False
@@ -56,114 +98,54 @@ def create_problem_solver(
     return prob, solver
 
 
-def find_obs_indices(array1, array2):
-    # Reshape arrays to enable broadcasting
-    a1 = array1[:, np.newaxis, :]
-    a2 = array2[np.newaxis, :, :]
-
-    # Compare all rows of array1 with all rows of array2
-    # This creates a 3D array of shape (len(array1), len(array2), 3)
-    # where the last dimension is True/False for each element comparison
-    comparison = np.isclose(a1, a2, rtol=1e-10, atol=1e-10)
-
-    # Check if all elements in a row match (along the last dimension)
-    # This gives us a 2D array of shape (len(array1), len(array2))
-    # where True means the entire row matches
-    row_matches = np.all(comparison, axis=2)
-
-    # For each row in array1, get the indices where it appears in array2
-    match_indices = [np.where(matches)[0] for matches in row_matches]
-
-    return np.array(match_indices).flatten()
-
-
-def barycentric_interpolation(triangle, values, point):
+def get_true_signal(solver, problem_type, solver_params, obs_frequency=1):
     """
-    Perform linear interpolation inside a triangle using barycentric coordinates.
-
-    Parameters:
-    - triangle: List of three (x, y) vertices [(vert1[0], vert1[1]), (vert2[0], vert2[1]), (vert3[0], vert3[1])]
-    - values: List of function values at the vertices [val1, val2, val3]
-    - point: (x, y) coordinate inside the triangle
-
-    Returns:
-    - Interpolated value at the given point
+    Default values are sea level and 0 velocity
     """
-    # Extract triangle vertices
-    vert1, vert2, vert3 = triangle
 
-    val1, val2, val3 = values
-    xp, yp = point
+    u_0 = solver.u_n  # full initial condition
 
-    # Compute the area of the triangle using determinant
-    detT = (vert2[0] - vert1[0]) * (vert3[1] - vert1[1]) - (vert3[0] - vert1[0]) * (
-        vert2[1] - vert1[1]
+    # Doesn't work for DG Case
+    V = solver.V  # create full function space
+    V_coords = (
+        V.sub(0).collapse()[0].tabulate_dof_coordinates()
+    )  # collapse to height function space
+
+    stations = V_coords[::obs_frequency, :]
+
+    solver.time_loop(
+        solver_parameters=solver_params,
+        stations=stations,
+        plot_every=60,
+        plot_name="sloped_beach_true_signal",
+        u_0=u_0,
+        save_states=True,
+        adjoint_method=True,
     )
 
-    # Compute barycentric coordinates
-    lambda1 = (
-        (vert2[0] - xp) * (vert3[1] - yp) - (vert3[0] - xp) * (vert2[1] - yp)
-    ) / detT
-    lambda2 = (
-        (vert3[0] - xp) * (vert1[1] - yp) - (vert1[0] - xp) * (vert3[1] - yp)
-    ) / detT
-    lambda3 = 1 - lambda1 - lambda2  # Since they must sum to 1
-
-    # Interpolated value
-    interpolated_value = lambda1 * val1 + lambda2 * val2 + lambda3 * val3
-    weights = [lambda1, lambda2, lambda3]
-
-    return interpolated_value, weights
+    return solver
 
 
-# def build_observation_matrix(prob, true_signal, stations):
-#     """
-#     Build the observation matrix H that maps from FEM solution space to station observations.
+def generate_observations(true_states, H, obs_time_idx, obs_std=0.1):
+    # Extract only the states at the observation indices
 
-#     Parameters:
-#     -----------
-#     prob : Problem
-#         The problem object containing the mesh
-#     true_signal : Signal
-#         Signal object with station initialization capability
-#     stations : array-like
-#         List of station coordinates
+    if isinstance(true_states, list):
+        true_states = np.array(true_states)  # Ensure true_states is a numpy array
 
-#     Returns:
-#     --------
-#     H : numpy.ndarray
-#         Observation matrix mapping from FEM solution to station observations
-#     """
-#     # Create and get connectivity between cells and vertices
-#     prob.mesh.topology.create_connectivity(2, 0)
-#     connectivity = prob.mesh.topology.connectivity(2, 0)
-#     node_coordinates = prob.mesh.geometry.x
+    observed_states = true_states[obs_time_idx]  # shape: (n_obs, state_dim)
 
-#     # Initialize stations
-#     solver.init_stations(stations)
-#     station_cells = solver.cells
+    # Apply observation operator to all observed states at once
+    y_n = observed_states @ H.T  # shape: (n_obs, obs_dim)
 
-#     # Get collapsed function space information
-#     V_collapsed = solver.V.sub(0).collapse()[0]
-#     dofmap = V_collapsed.dofmap
+    # Add Gaussian noise
+    noise = obs_std * np.random.randn(*y_n.shape)
+    y_obs = y_n + noise
 
-#     # Create observation matrix
-#     H = np.zeros((len(stations), dofmap.index_map.size_local))
+    return y_obs
 
-#     for station_idx, station in enumerate(stations):
-#         # Get cell nodes for this station
-#         cell_id = station_cells[station_idx]
-#         node_indices = connectivity.links(cell_id)
 
-#         # Get triangle coordinates and station point
-#         triangle = node_coordinates[node_indices, :2]  # Drop z-coordinate
-#         point = station[:2]  # Drop z-coordinate
-
-#         # Calculate barycentric weights
-#         _, weights = barycentric_interpolation(triangle, node_indices, point)
-
-#         # Get equation numbers and populate H matrix
-#         cell_dofs = dofmap.cell_dofs(cell_id)
-#         H[station_idx, cell_dofs] = weights
-
-#     return H
+def setup_observation_indices(window_size, obs_frequency, total_steps):
+    """Setup observation indices for windows"""
+    obs_indices_per_window = np.arange(0, window_size, obs_frequency)
+    obs_indices = np.arange(0, total_steps, obs_frequency)
+    return obs_indices_per_window, obs_indices

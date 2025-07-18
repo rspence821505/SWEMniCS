@@ -25,15 +25,15 @@ def print_optimization_summary(result: OptimizeResult) -> None:
     result : OptimizeResult
         The result object returned by `scipy.optimize.minimize`.
     """
-    print("\nOptimization completed:")
-    print(f"  Success: {result.success}")
-    print(f"  Status: {result.status}")
-    print(f"  Message: {result.message}")
-    print(f"  Final cost: {result.fun:.6e}")
-    print(f"  Iterations: {result.nit}")
-    print(f"  Function evaluations: {result.nfev}")
-    print(f"  Gradient norm at solution: {np.linalg.norm(result.jac):.6e}")
-    print("\n" + "-" * 60 + "\n")
+    tqdm.write("\nOptimization completed:")
+    tqdm.write(f"  Success: {result.success}")
+    tqdm.write(f"  Status: {result.status}")
+    tqdm.write(f"  Message: {result.message}")
+    tqdm.write(f"  Final cost: {result.fun:.6e}")
+    tqdm.write(f"  Iterations: {result.nit}")
+    tqdm.write(f"  Function evaluations: {result.nfev}")
+    tqdm.write(f"  Gradient norm at solution: {np.linalg.norm(result.jac):.6e}")
+    tqdm.write("\n" + "-" * 60 + "\n")
 
 
 def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) -> None:
@@ -49,9 +49,9 @@ def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) 
     step : int, optional
         Step size for subsampling the state vector when printing. Default is 20.
     """
-    print("State comparison (subsampled):")
-    print(f"  Initial state (every {step}th entry):   {u0[::step]}\n")
-    print(f"  Optimized state (every {step}th entry): {result.x[::step]}\n")
+    tqdm.write("State comparison (subsampled):")
+    tqdm.write(f"  Initial state (every {step}th entry):   {u0[::step]}\n")
+    tqdm.write(f"  Optimized state (every {step}th entry): {result.x[::step]}\n")
 
 
 def optimize_4dvar(
@@ -89,7 +89,7 @@ def optimize_4dvar(
     def callback(x):
         cost = cost_fn(x)
         cost_function_values.append(cost)
-        print(f"Iteration {len(cost_function_values)}: Cost = {cost:.6f}")
+        tqdm.write(f"Iteration {len(cost_function_values)}: Cost = {cost:.6f}")
 
     # options = {"gtol": 1e-6, "ftol": 1e-12, "maxfun": 10, "maxiter": 1000, "disp": True}
 
@@ -98,12 +98,16 @@ def optimize_4dvar(
         x0=u0,
         method="L-BFGS-B",
         jac=grad_fn,
-        callback=callback,
-        # options=options,
+        # callback=callback,
     )
 
+    if not result.success:
+        tqdm.write(f"Optimization failed:\n")
+        print_optimization_summary(result)
+        sys.exit(1)
+
     # Print optimization results
-    print_optimization_summary(result)
+    # print_optimization_summary(result)
 
     # Print state comparison
     # print_state_summary(u0, result, step=100)
@@ -117,7 +121,6 @@ def run_assimilation(
     stations,
     y_obs,
     obs_per_window,
-    obs_spatial_indices,
     obs_time_indices,
     H,
     covs,
@@ -160,7 +163,7 @@ def run_assimilation(
         )
 
         # Generate background z_b
-        print(f"Solver Time 1: {solver.problem.t}")
+        # print(f"Solver Time 1: {solver.problem.t}")
         initial_u0 = u_0.copy()
         solver.time_loop(
             solver_parameters=solver_params,
@@ -192,7 +195,6 @@ def run_assimilation(
             init_time=initial_time,
             u_b=z_b,
             y_obs=yobs_current_window,
-            obs_spatial_idxs=obs_spatial_indices,
             obs_time_idxs=obs_times_current_window,
             H=H,
             covs=covs,
@@ -209,7 +211,7 @@ def run_assimilation(
         solver.problem.t = initial_time
         solver.saved_states = []  # reset saved states for analysis
         solver.saved_adjoints = []  # reset saved adjoints for analysis
-        print(f"Solver Time 2: {solver.problem.t}")  # Debugging line
+        # print(f"Solver Time 2: {solver.problem.t}")  # Debugging line
         solver.time_loop(
             solver_parameters=solver_params,
             stations=stations,
