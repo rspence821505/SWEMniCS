@@ -171,6 +171,7 @@ class BaseSolver:
         self.verbose = verbose
         self.saved_adjoints = []
         self.saved_states = []
+        self.dry_nodes = []
 
         if self.verbose:
             self.log("SWE TYPE", self.swe_type)
@@ -661,6 +662,24 @@ class CGImplicit(BaseSolver):
         h_values = u_sol.sub(0).eval(points_on_proc, self.cells)
         if self.problem.solution_var in ["h", "flux"]:
             h_values -= self.station_bathy
+
+        # if isinstance(self.station_bathy, list):
+        #     self.station_bathy = np.array(self.station_bathy, dtype=np.float64)
+        #     print(f"\n\n station bathy: {self.station_bathy.shape}\n\n")
+        # else:
+        #     print(f"\n\n station bathy: {self.station_bathy.shape}\n\n")
+
+        # if isinstance(points_on_proc, list):
+        #     points_on_proc = np.array(points_on_proc, dtype=np.float64)
+        #     print(f"points in proc: \n {type(points_on_proc)} \n\n")
+        # else:
+        #     print(f"points in proc: \n {points_on_proc.shape} \n\n")
+        # if isinstance(self.cells, list):
+        #     self.cells = np.array(self.cells, dtype=np.int32)
+        #     print(f"cells in proc: \n {self.cells.shape} \n\n")
+        # else:
+        #     print(f"cells in proc: \n {self.cells.shape} \n\n")
+
         # correct for w/d for nicer plotting
         # h_values = np.maximum(h_values,-self.station_bathy)
         u_values = u_sol.sub(1).eval(points_on_proc, self.cells)
@@ -810,6 +829,20 @@ class CGImplicit(BaseSolver):
             gathered_state = np.concatenate(gathered_states)
             self.saved_states.append(gathered_state.copy())
 
+    def check_wd(self, u_sol, points_on_proc):
+        """Check if the solution is wet or dry at the stations."""
+        # check if the solution is wet or dry at the stations
+        h_values = u_sol.sub(0).eval(points_on_proc, self.cells)  # (432, 1)
+        eta = h_values - self.station_bathy  # (432, 1)
+        # print(f"eta: {eta.shape}")
+        wd = eta < (-self.station_bathy)
+        # return indices where wetting and drying occurs
+        wd = np.where(wd)[0]
+        self.dry_nodes.append(wd)
+        # update u_sol (H) with wetting and drying
+        u_sol.sub(0).x.array[wd] = 0.0
+        return wd
+
     def time_loop(
         self,
         solver_parameters,
@@ -847,8 +880,13 @@ class CGImplicit(BaseSolver):
             self.initialize_video(plot_name)
             self.plot_frame()
 
-        if len(stations):
-            self.station_data[0, :, :] = self.record_stations(self.u, local_points)
+        # if len(stations):
+        #     self.station_data[0, :, :] = self.record_stations(self.u, local_points)
+
+        if self.save_states:
+            wd = self.check_wd(self.u, local_points)
+            # print(f"Dry nodes at t=0: {self.u.sub(0).x.array[wd]}")
+            self.save_states()
 
         # take first 2 steps with implicit Euler since we dont have enough steps for higher order
         self.theta1.value = 0
@@ -861,22 +899,21 @@ class CGImplicit(BaseSolver):
             self.solve_timestep(solver)
 
             # add data to station variable
-            if len(stations):
-                self.station_data[a + 1, :, :] = self.record_stations(
-                    self.u, local_points
-                )
+            # if len(stations):
+            #     self.station_data[a + 1, :, :] = self.record_stations(
+            #         self.u, local_points
+            #     )
 
             if a % plot_every == 0 and plot_every <= self.problem.nt:
                 self.plot_frame()
 
             if save_states:
+                wd = self.check_wd(self.u, local_points)
+                # print(f"Dry nodes at t={a+1}: {self.u.sub(0).x.array[wd]}")
                 self.save_states()
 
             if adjoint_method:
                 self.save_adjoints()
-
-                # self.save_height_adjoints()
-                # self.save_height_states()
 
         # switch to high order time stepping
 
@@ -889,14 +926,16 @@ class CGImplicit(BaseSolver):
             # working version
             self.solve_timestep(solver)
 
-            if len(stations):
-                self.station_data[a + 1, :, :] = self.record_stations(
-                    self.u, local_points
-                )
+            # if len(stations):
+            #     self.station_data[a + 1, :, :] = self.record_stations(
+            #         self.u, local_points
+            #     )
             if a % plot_every == 0:
                 self.plot_frame()
 
             if save_states:
+                wd = self.check_wd(self.u, local_points)
+                # print(f"Dry nodes at t={a+1}: {self.u.sub(0).x.array[wd]}")
                 self.save_states()
 
             if adjoint_method:
@@ -905,11 +944,11 @@ class CGImplicit(BaseSolver):
         if plot_every <= self.problem.nt:
             self.finalize_video()
 
-        if len(stations):
-            inds, vals = self.gather_station(0, local_points, self.station_data)
-        else:
-            inds, vals = None, None
-
+        # if len(stations):
+        #     inds, vals = self.gather_station(0, local_points, self.station_data)
+        # else:
+        #     inds, vals = None, None
+        inds, vals = None, None
         self.vals = vals
         self.inds = inds
 

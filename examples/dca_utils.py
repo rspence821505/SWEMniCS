@@ -147,5 +147,5 @@ def generate_observations(true_states, H, obs_time_idx, obs_std=0.1):
 def setup_observation_indices(window_size, obs_frequency, total_steps):
     """Setup observation indices for windows"""
     obs_indices_per_window = np.arange(0, window_size, obs_frequency)
-    obs_indices = np.arange(0, total_steps, obs_frequency)
+    obs_indices = np.arange(0, total_steps - 1, obs_frequency)
     return obs_indices_per_window, obs_indices

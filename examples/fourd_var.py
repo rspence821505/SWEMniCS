@@ -104,7 +104,7 @@ def optimize_4dvar(
     if not result.success:
         tqdm.write(f"Optimization failed:\n")
         print_optimization_summary(result)
-        sys.exit(1)
+        # sys.exit(1)
 
     # Print optimization results
     # print_optimization_summary(result)
