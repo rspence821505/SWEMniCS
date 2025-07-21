@@ -5,6 +5,7 @@ from scipy.optimize import minimize, OptimizeResult
 from tqdm import tqdm
 from typing import List, Dict, Tuple, Callable
 import sys
+from mpi4py import MPI
 import pickle
 import os
 from dca_utils import (
@@ -13,6 +14,7 @@ from dca_utils import (
     build_observation_matrix,
     setup_observation_indices,
     generate_observations,
+    Time,
 )
 
 from cost_functions import (
@@ -43,9 +45,27 @@ def print_optimization_summary(result: OptimizeResult) -> None:
     tqdm.write("\n" + "-" * 60 + "\n")
 
 
+# def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) -> None:
+#     """
+#     Print a summary of the initial and optimized state vectors.
+
+#     Parameters
+#     ----------
+#     u0 : np.ndarray
+#         Initial guess for the state vector.
+#     result : OptimizeResult
+#         Result object returned by `scipy.optimize.minimize`.
+#     step : int, optional
+#         Step size for subsampling the state vector when printing. Default is 20.
+#     """
+#     tqdm.write("State comparison (subsampled):")
+#     tqdm.write(f"  Initial state (every {step}th entry):   {u0[::step]}\n")
+#     tqdm.write(f"  Optimized state (every {step}th entry): {result.x[::step]}\n")
+
+
 def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) -> None:
     """
-    Print a summary of the initial and optimized state vectors.
+    Print a comprehensive summary comparing initial and optimized state vectors.
 
     Parameters
     ----------
@@ -54,11 +74,48 @@ def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) 
     result : OptimizeResult
         Result object returned by `scipy.optimize.minimize`.
     step : int, optional
-        Step size for subsampling the state vector when printing. Default is 20.
+        Step size for subsampling when showing individual values. Default is 40.
     """
-    tqdm.write("State comparison (subsampled):")
-    tqdm.write(f"  Initial state (every {step}th entry):   {u0[::step]}\n")
-    tqdm.write(f"  Optimized state (every {step}th entry): {result.x[::step]}\n")
+    u_opt = result.x
+
+    # Compute difference arrays
+    abs_diff = u_opt - u0
+    rel_diff = np.divide(abs_diff, u0, out=np.zeros_like(abs_diff), where=u0 != 0)
+
+    tqdm.write("=== STATE OPTIMIZATION SUMMARY ===")
+
+    # Overall statistics
+    # tqdm.write(f"Array length: {len(u0)}")
+
+    # Difference statistics
+    tqdm.write(f"\n--- DIFFERENCE STATISTICS ---")
+    tqdm.write(f"Max absolute change: {np.max(np.abs(abs_diff)):.6e}")
+    tqdm.write(f"Mean absolute change: {np.mean(np.abs(abs_diff)):.6e}")
+    tqdm.write(f"RMS change: {np.sqrt(np.mean(abs_diff**2)):.6e}")
+    tqdm.write(f"L2 norm of change: {np.linalg.norm(abs_diff):.6e}")
+
+    # Relative changes (where initial values are non-zero)
+    nonzero_mask = u0 != 0
+    if np.any(nonzero_mask):
+        rel_changes = np.abs(rel_diff[nonzero_mask])
+        tqdm.write(
+            f"Max relative change: {np.max(rel_changes):.6e} ({np.max(rel_changes)*100:.3f}%)"
+        )
+        tqdm.write(
+            f"Mean relative change: {np.mean(rel_changes):.6e} ({np.mean(rel_changes)*100:.3f}%)"
+        )
+
+    # Check if arrays are close
+    tqdm.write(f"\n--- CONVERGENCE CHECK ---")
+    rtol, atol = 1e-5, 1e-8
+    is_close = np.allclose(u0, u_opt, rtol=rtol, atol=atol)
+    tqdm.write(f"Arrays close (rtol={rtol}, atol={atol}): {is_close}")
+
+    # Count significant changes
+    sig_changes = np.sum(np.abs(rel_diff) > 0.01)  # Changes > 1%
+    tqdm.write(
+        f"Elements with >1% relative change: {sig_changes}/{len(u0)} ({100*sig_changes/len(u0):.1f}%)"
+    )
 
 
 def optimize_4dvar(
@@ -117,7 +174,7 @@ def optimize_4dvar(
     # print_optimization_summary(result)
 
     # Print state comparison
-    # print_state_summary(u0, result, step=100)
+    # print_state_summary(u0, result, step=200)
 
     return result.x, result
 
@@ -415,10 +472,10 @@ def setup_data_assimilation(
     R = np.eye(obs_dim) * (obs_std**2)
 
     # Background covariance
-    # B = inflation_factor * np.eye(state_dim)
-    B = get_background_covariance(true_signal, sample_freq=12, err2=0.1)
+    B = inflation_factor * np.eye(state_dim)
+    # B = get_background_covariance(true_signal, sample_freq=12, err2=0.1)
 
-    B, scaling_factor = rescale_background_covariance_to_observation(B, H, R)
+    # B, scaling_factor = rescale_background_covariance_to_observation(B, H, R)
 
     # Predicted covariance
     L = H @ B @ H.T
@@ -612,6 +669,10 @@ def run_data_assimilation(
         inflation_factor=inflation_factor,
         print_setup=True,
     )
+
+    # save the setup result to a pickle file
+    with open(os.path.join("da_output", "setup_result.pkl"), "wb") as f:
+        pickle.dump(result, f)
 
     # Extract common parameters from result
     stations = result["stations"]

@@ -131,6 +131,7 @@ def get_true_signal(solver, problem_type, solver_params, obs_frequency=1):
 def generate_observations(true_states, H, obs_time_idx, obs_std=0.1):
     # Extract only the states at the observation indices
 
+    np.random.seed(42)  # For reproducibility
     if isinstance(true_states, list):
         true_states = np.array(true_states)  # Ensure true_states is a numpy array
 
