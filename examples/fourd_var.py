@@ -243,6 +243,83 @@ def run_assimilation(
     return np.concatenate(analysis, axis=0)
 
 
+def get_background_covariance(eta_trajectory, sample_freq=1, err2=1.0):
+    """
+    Estimate background covariance matrix from a trajectory of water surface elevation (η).
+
+    Parameters
+    ----------
+    eta_trajectory : ndarray of shape (n_timesteps, n_space_points)
+        Time series of η values from a shallow water model.
+    sample_freq : int
+        Temporal sampling frequency to reduce autocorrelation (e.g., every 10 time steps).
+    err2 : float
+        Target maximum variance for scaling the background covariance.
+
+    Returns
+    -------
+    B : ndarray (n_space_points x n_space_points)
+        Scaled background error covariance matrix.
+    Bcorr : ndarray (n_space_points x n_space_points)
+        Corresponding correlation matrix.
+    """
+    # Subsample the time series to reduce temporal correlation
+    eta_sampled = eta_trajectory[::sample_freq, :]  # shape: (n_samples, n_space_points)
+
+    # Compute correlation matrix
+    Bcorr = np.corrcoef(
+        eta_sampled, rowvar=False
+    )  # shape: (n_space_points, n_space_points)
+
+    # Compute sample covariance matrix
+    B = np.cov(eta_sampled, rowvar=False)  # shape: (n_space_points, n_space_points)
+
+    # Scale covariance matrix so max variance equals err2
+    max_var = np.max(np.diag(B))
+    if max_var > 0:
+        alpha = err2 / max_var
+        B *= alpha
+
+    return B
+
+
+def rescale_background_covariance_to_observation(B_eta, H, R):
+    """
+    Rescales the background covariance matrix B_eta so that its projection
+    onto the observation space matches the scale of the observation error covariance R.
+
+    Parameters
+    ----------
+    B_eta : ndarray (n_state x n_state)
+        Background covariance matrix for η (e.g., from trajectory).
+    H : ndarray (n_obs x n_state)
+        Observation operator matrix (e.g., row selector from identity).
+    R : ndarray (n_obs x n_obs)
+        Observation error covariance matrix (usually diagonal).
+
+    Returns
+    -------
+    B_eta_rescaled : ndarray (n_state x n_state)
+        Rescaled background covariance matrix.
+    scaling_factor : float
+        Factor by which the original B_eta was scaled.
+    """
+    # Project B_eta into observation space
+    B_y = H @ B_eta @ H.T  # shape (n_obs x n_obs)
+
+    # Compute trace of B_y and R
+    trace_B_y = np.trace(B_y)
+    trace_R = np.trace(R)
+
+    # Compute scaling factor
+    scaling_factor = trace_R / trace_B_y if trace_B_y > 0 else 1.0
+
+    # Rescale B_eta
+    B_eta_rescaled = scaling_factor * B_eta
+
+    return B_eta_rescaled, scaling_factor
+
+
 def setup_data_assimilation(
     pickle_path,
     problem_params,
@@ -338,7 +415,10 @@ def setup_data_assimilation(
     R = np.eye(obs_dim) * (obs_std**2)
 
     # Background covariance
-    B = inflation_factor * np.eye(state_dim)
+    # B = inflation_factor * np.eye(state_dim)
+    B = get_background_covariance(true_signal, sample_freq=12, err2=0.1)
+
+    B, scaling_factor = rescale_background_covariance_to_observation(B, H, R)
 
     # Predicted covariance
     L = H @ B @ H.T
