@@ -759,22 +759,71 @@ def run_data_assimilation(
     return analyses
 
 
-# Example usage:
-# Run all three analyses with default parameters
-# results = run_data_assimilation('all')
+def calculate_analysis_metrics(
+    analysis_name,
+    analysis_data=None,
+    filename=None,
+    save_first=False,
+    display_name=None,
+):
+    """
+    Calculate RMSE and misfit metrics for analysis data.
 
-# Run only DCI
-# results = run_data_assimilation('dci')
+    Parameters:
+    -----------
+    analysis_name : str
+        Name of the analysis (used for filename if not provided)
+    analysis_data : numpy.ndarray, optional
+        The analysis data. If provided and save_first=True, will save to file first
+    filename : str, optional
+        Pickle filename. If not provided, uses '{analysis_name}_analysis.pkl'
+    save_first : bool, default=False
+        If True, saves analysis_data to file before loading (useful for DCI WME case)
+    display_name : str, optional
+        Name to display in print output. If not provided, uses analysis_name
 
-# Run DCI and Bayes
-# results = run_data_assimilation(['dci', 'bayes'])
+    Returns:
+    --------
+    tuple
+        (rmse, misfit) values
+    """
 
-# Run with custom time parameters
-# results = run_data_assimilation(['dci', 'bayes'], dt=300, window_size=7200)  # 5 min timestep, 2 hour windows
+    # Set default filename if not provided
+    if filename is None:
+        filename = f"{analysis_name}_analysis.pkl"
 
-# Run with custom observation and time parameters
-# results = run_data_assimilation(['dci_wme', 'bayes'],
-#                                dt=900,  # 15 minute timesteps
-#                                window_size=3600*4,  # 4 hour windows
-#                                obs_std=1.5,
-#                                inflation_factor=3.0)
+    # Set default display name if not provided
+    if display_name is None:
+        display_name = analysis_name.upper()
+
+    filepath = os.path.join("da_output", filename)
+
+    # Save analysis data first if requested (for DCI WME case)
+    if save_first and analysis_data is not None:
+        with open(filepath, "wb") as f:
+            pickle.dump(analysis_data, f)
+
+    # Load analysis data from pickle file
+    with open(filepath, "rb") as f:
+        analysis = pickle.load(f)
+
+    # Load result if not already provided
+    with open(os.path.join("da_output", "setup_result.pkl"), "rb") as f:
+        result = pickle.load(f)
+
+    # Load true signal
+    with open(os.path.join("da_output", "true_signal.pkl"), "rb") as f:
+        true_signal = pickle.load(f)
+
+    # Calculate predicted observations
+    true_obs = result["H"] @ true_signal[result["obs_time_indices"]].T
+    pred_obs = result["H"] @ analysis[result["obs_time_indices"]].T
+
+    # Calculate metrics
+    rmse = np.sqrt(np.mean((true_signal - analysis) ** 2))  # time averaged RMSE
+    misfit = np.linalg.norm(true_obs - pred_obs, ord=2)  # time averaged misfit
+
+    # Print results
+    print(f"{display_name} RMSE: {rmse:<.10f}, {display_name} Misfit: {misfit:<.4f}")
+
+    return rmse, misfit
