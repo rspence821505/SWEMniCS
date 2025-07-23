@@ -9,6 +9,20 @@ import os
 from mpi4py import MPI
 
 from enum import IntEnum
+from pathlib import Path
+
+
+def save_pickle(filename, data, directory="da_output"):
+    with open(Path(directory) / filename, "wb") as f:
+        pickle.dump(data, f)
+
+
+def load_pickle(filename, directory="da_output"):
+    filepath = Path(directory) / filename
+    if not filepath.exists():
+        raise FileNotFoundError(f"File {filepath} does not exist.")
+    with open(filepath, "rb") as f:
+        return pickle.load(f)
 
 
 class Time(IntEnum):
@@ -61,7 +75,7 @@ def create_problem_solver(
         "theta": 1,
         "p_degree": [1, 1],
         "verbose": verbose,
-        "adjoint_method": True,
+        "adjoint_method": False,
     }
 
     if true_signal:
@@ -75,7 +89,7 @@ def create_problem_solver(
             "wd_alpha": 0.36,
             "wd": True,
             "mag": 2.0,
-            "h_b_val": 5.3,  # Uncomment if needed
+            "h_b_val": 5.3,
         }
         prob = SlopedBeachProblem(**sloped_kwargs)
         solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
@@ -92,6 +106,8 @@ def create_problem_solver(
             "h_b_val": 5.0,  # Uncomment if needed
             # "alpha": 0.00024, # Uncomment if needed
         }
+        common_solver_kwargs["adjoint_method"] = True
+
         prob = SlopedBeachProblem(**sloped_kwargs)
         solver = Solvers.DGImplicit(prob, **common_solver_kwargs)
 
@@ -123,6 +139,8 @@ def get_true_signal(solver, problem_type, solver_params, obs_frequency=1):
         u_0=u_0,
         save_states=True,
         adjoint_method=True,
+        save_bathy=True,
+        make_wet=True,
     )
 
     return solver
@@ -142,7 +160,8 @@ def generate_observations(true_states, H, obs_time_idx, obs_std=0.1):
 
     # Add Gaussian noise
     noise = obs_std * np.random.randn(*y_n.shape)
-    y_obs = y_n + noise
+    # y_obs = y_n + noise
+    y_obs = np.maximum(0, y_n + noise)
 
     return y_obs
 
@@ -150,7 +169,7 @@ def generate_observations(true_states, H, obs_time_idx, obs_std=0.1):
 def setup_observation_indices(window_size, obs_frequency, total_steps):
     """Setup observation indices for windows"""
     obs_indices_per_window = np.arange(0, window_size, obs_frequency)
-    obs_indices = np.arange(0, total_steps - 1, obs_frequency)
+    obs_indices = np.arange(0, total_steps, obs_frequency)
     return obs_indices_per_window, obs_indices
 
 
@@ -192,6 +211,46 @@ def build_observation_matrix(prob, V, obs_space_freqs=2):
     # )
 
     return H, np.array(station_coords), obs_space_idx
+
+
+# def build_observation_matrix(prob, V, obs_space_freqs=2):
+#     num_cells = len(prob.mesh.geometry.dofmap)
+
+#     all_cells = np.arange(num_cells)
+#     obs_space_idx = np.arange(
+#         0, num_cells, obs_space_freqs
+#     )  # select every obs_space_freqs-th cell for observation
+#     station_cells = all_cells[obs_space_idx]  # select cells for observation
+
+#     # Create observation matrix
+#     H = np.zeros((len(station_cells), V.dofmap.index_map.size_local))
+
+#     # pick subset of cells for the stations
+#     station_coords = []
+
+#     # collapse the function space to get the coordinates of the dofs
+#     # in the cells that are selected for observation
+#     V_collapsed, indices_into_V = V.sub(0).collapse()
+#     collapsed_dof_coords = V_collapsed.tabulate_dof_coordinates()
+#     indices_into_V = np.array(indices_into_V)
+
+#     for station, i in enumerate(station_cells):
+#         coords_for_cell = collapsed_dof_coords[V_collapsed.dofmap.cell_dofs(i)]
+#         dofs_in_orig_V = indices_into_V[V_collapsed.dofmap.cell_dofs(i)]
+#         H[station, dofs_in_orig_V] = 1 / 3
+#         station_coord = 1 / 3 * (coords_for_cell.sum(axis=0))
+#         station_coords.append(station_coord)
+#         # print(f"Station {station} at {station_coord} corresponds to cell {i} with dofs {dofs_in_orig_V}")
+
+#     # print(
+#     #     f"Total cells in mesh: {num_cells}\n"
+#     #     f"obs_space_freqs: {obs_space_freqs}\n"
+#     #     f"obs_space_idx: {obs_space_idx}\n"
+#     #     f"station_cells: {station_cells}\n"
+#     #     f"Number of observation stations: {len(station_cells)}"
+#     # )
+
+#     return H, np.array(station_coords), obs_space_idx
 
 
 def analyze_parameter_crossval_results(results_dict):

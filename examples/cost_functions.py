@@ -28,27 +28,6 @@ def _prediction_loss(Qz, Q_zb, L_inv):
     return 0.5 * np.sum(pred_diff * (L_inv @ pred_diff))
 
 
-# \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Adjoint RHS Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
-def _adjoint_rhs_bayes(H, Hu, yobs, R_inv, **kwargs):
-    """Compute the adjoint right-hand side for the Bayesian cost function."""
-    obs_residual = Hu - yobs
-    return H.T @ R_inv @ obs_residual
-
-
-def _adjoint_rhs_dci(H, Hu, yobs, R_inv, L_inv, Q_zb, **kwargs):
-    """Compute the adjoint right-hand side for the DCI cost function."""
-    obs_residual = Hu - yobs
-    pred_residual = Hu - Q_zb
-    return H.T @ R_inv @ obs_residual - H.T @ L_inv @ pred_residual
-
-
-def _adjoint_rhs_dci_wme(H, Hu, yobs, R_inv, L_inv, Q_zb, Q_zb_wme, Q_z_wme, **kwargs):
-    """Compute the adjoint right-hand side for the DCI WME cost function."""
-    num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(yobs, R_inv, L_inv)
-    gamma = (1 / np.sqrt(num_obs)) * obs_sum
-    return gamma * H.T @ (Q_z_wme - L_inv_wme @ (Q_z_wme - Q_zb_wme))
-
-
 # \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ WME Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
 def wme_map(Qz, y_obs, var, num_obs):
     """Calculate Weighted Mean Error terms."""
@@ -151,6 +130,8 @@ def get_trajectory(
             u_0=u_0,
             save_states=True,
             adjoint_method=True,
+            save_bathy=False,
+            make_wet=True,
         )
     except AttributeError as e:
         print(f"Error: Solver missing time_loop method: {e}", flush=True)
@@ -453,6 +434,28 @@ def dci_wme_cost_function(
 
 
 # \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\ Adjoint Function Functions \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+
+def _adjoint_rhs_bayes(H, Hu, yobs, R_inv, **kwargs):
+    """Compute the adjoint right-hand side for the Bayesian cost function."""
+    obs_residual = Hu - yobs
+    return H.T @ R_inv @ obs_residual
+
+
+def _adjoint_rhs_dci(H, Hu, yobs, R_inv, L_inv, Q_zb, **kwargs):
+    """Compute the adjoint right-hand side for the DCI cost function."""
+    obs_residual = Hu - yobs
+    pred_residual = Hu - Q_zb
+    return H.T @ R_inv @ obs_residual - H.T @ L_inv @ pred_residual
+
+
+def _adjoint_rhs_dci_wme(H, Hu, yobs, R_inv, L_inv, Q_zb, Q_zb_wme, Q_z_wme, **kwargs):
+    """Compute the adjoint right-hand side for the DCI WME cost function."""
+    num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(yobs, R_inv, L_inv)
+    gamma = (1 / np.sqrt(num_obs)) * obs_sum
+    return gamma * H.T @ (Q_z_wme - L_inv_wme @ (Q_z_wme - Q_zb_wme))
+
+
 def adjoint_rhs(
     H: np.ndarray,
     Hu: np.ndarray,
@@ -486,53 +489,6 @@ def adjoint_rhs(
         Q_zb_wme=Q_zb_wme,
         Q_z_wme=Q_z_wme,
     )
-
-
-def print_observation_debug_info(
-    Hu: np.ndarray,
-    yobs: np.ndarray,
-    n: int,
-    rank: int = 0,
-):
-    """
-    Print debug information for a single observation time step during the adjoint solve.
-    """
-    if rank == 0:
-        print(f"\n--- Observation Debug Info at Time Step {n} ---")
-        print(f"Hu shape: {Hu.shape}", f"Hu: {Hu[::10]}")
-        print(f"yobs shape: {yobs.shape}, yobs: {yobs[::10]}")
-        print("----------------------------------------------\n")
-
-
-def print_adjoint_debug_info(
-    nt: int,
-    trajectories: list,
-    adjoints: list,
-    obs_spatial_idxs: np.ndarray,
-    obs_time_idxs: np.ndarray,
-    λ_shape: tuple,
-    obs_data: np.ndarray,
-    R_inv: np.ndarray,
-    rank: int = 0,
-):
-    """
-    Print detailed debug information about adjoint setup.
-    """
-    if rank == 0:
-        print("\n\n" + "=" * 40 + " Adjoint Debug Info " + "=" * 40)
-        print(f"Number of Time Steps: {nt + 1}")
-        print(f"Trajectories Length: {len(trajectories)}")
-        print(f"Adjoints Length: {len(adjoints)}")
-        print(f"Observation Spatial Indices Length: {len(obs_spatial_idxs)}")
-        print(f"Observation Time Indices Length: {len(obs_time_idxs)}")
-        print(f"Single Trajectory Shape: {trajectories[0].shape}")
-        print(f"Single Adjoint Shape: {adjoints[0].shape}")
-        print(f"Lambda Shape: {λ_shape}")
-        print(f"Observation Spatial Indices: {obs_spatial_idxs}")
-        print(f"Observation Time Indices: {obs_time_idxs}")
-        print(f"Observation Data Shape: {obs_data.shape}")
-        print(f"R_inv Shape: {R_inv.shape}")
-        print("=" * 100 + "\n\n")
 
 
 def swe_adjoint(
@@ -656,420 +612,6 @@ def swe_adjoint(
     return λ  # This is λ_0 = ∇J(z_0)
 
 
-# def swe_adjoint(
-#     solver,
-#     H: np.ndarray,
-#     obs_data: np.ndarray,
-#     obs_spatial_idxs: np.ndarray,
-#     obs_time_idxs: np.ndarray,
-#     R_inv: np.ndarray,
-#     L_inv: Optional[np.ndarray] = None,
-#     Q_zb: Optional[np.ndarray] = None,
-#     adjoint_type: Literal["bayes", "dci", "dci_wme"] = "bayes",
-#     comm: Optional[MPI.Comm] = None,
-# ) -> np.ndarray:
-#     """
-#     Compute the initial adjoint vector λ₀ for a 4D-Var cost functional.
-
-#     This function performs a backward-in-time solve of the adjoint equations
-#     using precomputed adjoint matrices and state trajectories.
-
-#     Parameters
-#     ----------
-#     solver : Solver
-#         A solver object with attributes:
-#             - `saved_adjoints`: List of adjoint matrices (numpy arrays)
-#             - `saved_states`: List of state vectors at each time step
-#             - `vals`: Full state array for all time steps
-#             - `V`: Dolfinx function space
-#     H : np.ndarray
-#         Observation operator matrix of shape (m, n).
-#     obs_data : np.ndarray
-#         Observation data over the time window, shape (T_obs, m).
-#     obs_spatial_idxs : np.ndarray
-#         Indices of spatial locations where observations are taken.
-#     obs_time_idxs : np.ndarray
-#         Indices of time steps corresponding to observations.
-#     R_inv : np.ndarray
-#         Inverse of observation error covariance matrix, shape (m, m).
-#     L_inv : Optional[np.ndarray], optional
-#         Inverse of prior/predictability covariance (used in DCI variants), shape (m, m).
-#     Q_zb : Optional[np.ndarray], optional
-#         Prior prediction at observation points (used in DCI variants), shape (m,).
-#     adjoint_type : {'bayes', 'dci', 'dci_wme'}, default='bayes'
-#         Type of adjoint calculation to perform.
-
-#     Returns
-#     -------
-#     np.ndarray
-#         The initial adjoint vector λ₀, shape (n,).
-
-#     Raises
-#     ------
-#     ValueError
-#         If the adjoint matrix at a time step is singular and cannot be pseudo-inverted.
-#     """
-#     try:
-#         # ===== INPUT VALIDATION =====
-#         if comm is None:
-#             comm = MPI.COMM_WORLD
-
-#         rank = comm.Get_rank()
-#         print(f"[Rank {rank}] Starting swe_adjoint function", flush=True)
-
-#         # Validate solver object
-#         if not hasattr(solver, "saved_adjoints"):
-#             raise AttributeError("Solver object missing 'saved_adjoints' attribute")
-#         if not hasattr(solver, "saved_states"):
-#             raise AttributeError("Solver object missing 'saved_states' attribute")
-
-#         adjoints = solver.saved_adjoints  # List of adjoint matrices (NumPy arrays)
-#         trajectories = solver.saved_states  # List of forward states
-
-#         print(f"[Rank {rank}] Found {len(adjoints)} adjoint matrices", flush=True)
-#         print(f"[Rank {rank}] Found {len(trajectories)} state trajectories", flush=True)
-
-#         # print(
-#         #     f"[Rank {rank}] Found Type{type(adjoints[0])} adjoint matrix \\", flush=True
-#         # )
-
-#         # Validate basic dimensions
-#         if len(adjoints) == 0:
-#             raise ValueError("No adjoint matrices found in solver.saved_adjoints")
-#         if len(trajectories) == 0:
-#             raise ValueError("No state trajectories found in solver.saved_states")
-
-#         nt = len(adjoints)
-#         print(f"[Rank {rank}] Number of time steps: {nt}", flush=True)
-
-#         # Validate adjoint matrices
-#         # for i, adj in enumerate(adjoints):
-#         #     if not isinstance(adj, np.ndarray):
-#         #         raise TypeError(f"Adjoint matrix at index {i} is not a numpy array")
-#         #     if adj.ndim != 2:
-#         #         raise ValueError(
-#         #             f"Adjoint matrix at index {i} is not 2D: shape={adj.shape}"
-#         #         )
-#         #     if adj.shape[0] != adj.shape[1]:
-#         #         raise ValueError(
-#         #             f"Adjoint matrix at index {i} is not square: shape={adj.shape}"
-#         #         )
-
-#         N_dof = adjoints[0].shape[0]  # Number of spatial points
-#         print(f"[Rank {rank}] Degrees of freedom: {N_dof}", flush=True)
-
-#         # Validate observation operator H
-#         if not isinstance(H, np.ndarray):
-#             raise TypeError("Observation operator H must be a numpy array")
-#         if H.ndim != 2:
-#             raise ValueError(f"Observation operator H must be 2D: shape={H.shape}")
-
-#         m, n = H.shape
-#         print(f"[Rank {rank}] Observation operator H shape: {H.shape}", flush=True)
-
-#         if n != N_dof:
-#             raise ValueError(f"H column dimension ({n}) doesn't match N_dof ({N_dof})")
-
-#         # Validate observation data
-#         if not isinstance(obs_data, np.ndarray):
-#             raise TypeError("obs_data must be a numpy array")
-#         print(f"[Rank {rank}] Observation data shape: {obs_data.shape}", flush=True)
-
-#         # Validate observation indices
-#         if not isinstance(obs_time_idxs, np.ndarray):
-#             raise TypeError("obs_time_idxs must be a numpy array")
-#         if not isinstance(obs_spatial_idxs, np.ndarray):
-#             raise TypeError("obs_spatial_idxs must be a numpy array")
-
-#         # Check time indices are within bounds
-#         if len(obs_time_idxs) > 0:
-#             if np.min(obs_time_idxs) < 0:
-#                 raise ValueError(f"Negative time index found: {np.min(obs_time_idxs)}")
-#             if np.max(obs_time_idxs) >= nt:
-#                 raise ValueError(
-#                     f"Time index {np.max(obs_time_idxs)} exceeds number of time steps {nt}"
-#                 )
-
-#         # Validate R_inv
-#         if not isinstance(R_inv, np.ndarray):
-#             raise TypeError("R_inv must be a numpy array")
-#         if R_inv.shape != (m, m):
-#             raise ValueError(
-#                 f"R_inv shape {R_inv.shape} doesn't match expected ({m}, {m})"
-#             )
-
-#         # Validate optional parameters
-#         if L_inv is not None:
-#             if not isinstance(L_inv, np.ndarray):
-#                 raise TypeError("L_inv must be a numpy array if provided")
-#             if L_inv.shape != (m, m):
-#                 raise ValueError(
-#                     f"L_inv shape {L_inv.shape} doesn't match expected ({m}, {m})"
-#                 )
-
-#         if Q_zb is not None:
-#             if not isinstance(Q_zb, np.ndarray):
-#                 raise TypeError("Q_zb must be a numpy array if provided")
-#             print(f"[Rank {rank}] Q_zb shape: {Q_zb.shape}", flush=True)
-
-#         # Validate adjoint_type
-#         valid_types = ["bayes", "dci", "dci_wme"]
-#         if adjoint_type not in valid_types:
-#             raise ValueError(
-#                 f"Invalid adjoint_type '{adjoint_type}'. Must be one of {valid_types}"
-#             )
-
-#         print(f"[Rank {rank}] Input validation completed successfully", flush=True)
-
-#         # ===== INITIALIZATION =====
-#         λ = np.zeros(N_dof)
-#         num_obs = len(obs_data)
-
-#         # Handle Q_zb transpose safely
-#         Qzb = None
-#         if Q_zb is not None:
-#             try:
-#                 Qzb = Q_zb.T
-#                 print(
-#                     f"[Rank {rank}] Qzb shape after transpose: {Qzb.shape}", flush=True
-#                 )
-#             except Exception as e:
-#                 raise ValueError(f"Failed to transpose Q_zb: {e}")
-
-#         # ===== ADJOINT TYPE SPECIFIC INITIALIZATION =====
-#         if adjoint_type == "dci_wme":
-#             print(f"[Rank {rank}] Initializing DCI_WME specific terms", flush=True)
-#             try:
-#                 states = np.array(trajectories)  # shape: (steps, num_stations)
-#                 print(f"[Rank {rank}] States array shape: {states.shape}", flush=True)
-
-#                 # Validate obs_time_idxs for indexing
-#                 if len(obs_time_idxs) > 0 and np.max(obs_time_idxs) >= len(states):
-#                     raise IndexError(
-#                         f"obs_time_idxs max ({np.max(obs_time_idxs)}) >= states length ({len(states)})"
-#                     )
-
-#                 observed_states = states[obs_time_idxs]  # shape: (n_obs, state_dim)
-#                 print(
-#                     f"[Rank {rank}] Observed states shape: {observed_states.shape}",
-#                     flush=True,
-#                 )
-
-#                 Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
-#                 print(f"[Rank {rank}] Qz shape: {Qz.shape}", flush=True)
-
-#                 num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(
-#                     obs_data, R_inv, L_inv
-#                 )
-#                 Qz_wme = wme_map(Qz, obs_data, obs_var, num_obs)
-#                 Qzb_wme = wme_map(Q_zb, obs_data, obs_var, num_obs)
-#                 print(f"[Rank {rank}] WME terms initialized successfully", flush=True)
-#             except Exception as e:
-#                 raise RuntimeError(f"Failed to initialize DCI_WME terms: {e}")
-#         else:
-#             Qz = None
-#             Qz_wme = None
-#             Qzb_wme = None
-
-#         print(f"[Rank {rank}] Starting backward time loop", flush=True)
-
-#         # ===== MAIN BACKWARD TIME LOOP =====
-#         for n in reversed(range(nt)):
-#             try:
-#                 print(f"[Rank {rank}] Processing time step {n}/{nt-1}", flush=True)
-
-#                 # Check if this time step has observations
-#                 if n in obs_time_idxs:
-#                     print(f"[Rank {rank}] Time step {n} has observations", flush=True)
-
-#                     # Find observation index safely
-#                     obs_indices = np.where(obs_time_idxs == n)[0]
-#                     if len(obs_indices) == 0:
-#                         raise RuntimeError(
-#                             f"No observation index found for time step {n}"
-#                         )
-
-#                     idx = obs_indices[0]
-#                     print(f"[Rank {rank}] Observation index: {idx}", flush=True)
-
-#                     # Get trajectory state safely
-#                     if n + 1 >= len(trajectories):
-#                         raise IndexError(
-#                             f"Trajectory index {n+1} out of bounds (length: {len(trajectories)})"
-#                         )
-
-#                     u = trajectories[n + 1].copy()
-#                     print(f"[Rank {rank}] State vector u shape: {u.shape}", flush=True)
-
-#                     # Compute H @ u safely
-#                     if u.shape[0] != H.shape[1]:
-#                         raise ValueError(
-#                             f"State vector shape {u.shape} incompatible with H shape {H.shape}"
-#                         )
-
-#                     Hu = H @ u
-#                     print(f"[Rank {rank}] Hu shape: {Hu.shape}", flush=True)
-
-#                     # Get observation data safely
-#                     if idx >= len(obs_data):
-#                         raise IndexError(
-#                             f"Observation index {idx} out of bounds (obs_data length: {len(obs_data)})"
-#                         )
-
-#                     yobs = obs_data[idx].copy()
-#                     print(f"[Rank {rank}] yobs shape: {yobs.shape}", flush=True)
-
-#                     # Get q_zb safely if available
-#                     q_zb = None
-#                     if Q_zb is not None and Qzb is not None:
-#                         if idx >= Qzb.shape[0]:
-#                             raise IndexError(
-#                                 f"Q_zb index {idx} out of bounds (Qzb shape: {Qzb.shape})"
-#                             )
-#                         q_zb = Qzb[idx].copy()
-#                         print(f"[Rank {rank}] q_zb shape: {q_zb.shape}", flush=True)
-
-#                     # Compute right-hand side
-#                     try:
-#                         rhs = adjoint_rhs(
-#                             H,
-#                             Hu,
-#                             yobs,
-#                             R_inv,
-#                             L_inv,
-#                             q_zb,
-#                             Q_zb_wme=Qzb_wme,
-#                             Q_z_wme=Qz_wme,
-#                             adjoint_type=adjoint_type,
-#                         )
-#                         print(
-#                             f"[Rank {rank}] RHS computed, shape: {rhs.shape}",
-#                             flush=True,
-#                         )
-#                     except Exception as e:
-#                         raise RuntimeError(
-#                             f"Failed to compute adjoint RHS at time step {n}: {e}"
-#                         )
-
-#                     # Update λ
-#                     if rhs.shape != λ.shape:
-#                         raise ValueError(
-#                             f"RHS shape {rhs.shape} doesn't match λ shape {λ.shape}"
-#                         )
-
-#                     λ += rhs
-#                     print(
-#                         f"[Rank {rank}] Updated λ, norm: {np.linalg.norm(λ)}",
-#                         flush=True,
-#                     )
-
-#                 # Solve adjoint system A_n^T λ_n = λ
-#                 A_T = adjoints[n]  # Adjoint matrix at time step n
-#                 print(
-#                     f"[Rank {rank}] Adjoint matrix A_T shape: {A_T.shape}", flush=True
-#                 )
-
-#                 # Validate matrix dimensions
-#                 if A_T.shape[0] != λ.shape[0]:
-#                     raise ValueError(
-#                         f"Adjoint matrix rows ({A_T.shape[0]}) don't match λ size ({λ.shape[0]})"
-#                     )
-#                 if A_T.shape[1] != λ.shape[0]:
-#                     raise ValueError(
-#                         f"Adjoint matrix cols ({A_T.shape[1]}) don't match λ size ({λ.shape[0]})"
-#                     )
-
-#                 # # Check matrix properties
-#                 # if np.any(np.isnan(A_T)):
-#                 #     raise ValueError(
-#                 #         f"Adjoint matrix at time step {n} contains NaN values"
-#                 #     )
-#                 # if np.any(np.isinf(A_T)):
-#                 #     raise ValueError(
-#                 #         f"Adjoint matrix at time step {n} contains infinite values"
-#                 #     )
-
-#                 # Solve the linear system: A_T @ λ_new = λ
-#                 try:
-#                     λ_prev_norm = np.linalg.norm(λ)
-#                     λ = spsolve(A_T, λ)
-#                     λ_new_norm = np.linalg.norm(λ)
-
-#                     print(
-#                         f"[Rank {rank}] Linear solve successful, λ norm: {λ_prev_norm} -> {λ_new_norm}",
-#                         flush=True,
-#                     )
-
-#                     # Check for problematic solutions
-#                     if np.any(np.isnan(λ)):
-#                         raise RuntimeError(
-#                             f"Linear solve at time step {n} produced NaN values"
-#                         )
-#                     if np.any(np.isinf(λ)):
-#                         raise RuntimeError(
-#                             f"Linear solve at time step {n} produced infinite values"
-#                         )
-#                     if λ_new_norm > 1e12:
-#                         print(
-#                             f"[Rank {rank}] WARNING: Very large λ norm ({λ_new_norm}) at time step {n}",
-#                             flush=True,
-#                         )
-
-#                 except np.linalg.LinAlgError as e:
-#                     # Try to provide more detailed information about the matrix
-#                     cond_num = np.linalg.cond(
-#                         A_T.toarray() if hasattr(A_T, "toarray") else A_T
-#                     )
-#                     det = np.linalg.det(
-#                         A_T.toarray() if hasattr(A_T, "toarray") else A_T
-#                     )
-
-#                     error_msg = (
-#                         f"Linear algebra error at time step {n}: {e}\n"
-#                         f"Matrix condition number: {cond_num}\n"
-#                         f"Matrix determinant: {det}\n"
-#                         f"Matrix shape: {A_T.shape}"
-#                     )
-#                     if rank == 0:
-#                         print(f"[Rank {rank}] {error_msg}", flush=True)
-#                     raise ValueError(
-#                         f"Adjoint matrix at time step {n} is singular or ill-conditioned: {e}"
-#                     )
-
-#                 except Exception as e:
-#                     if rank == 0:
-#                         print(
-#                             f"[Rank {rank}] Error solving adjoint system at time step {n}: {e}",
-#                             flush=True,
-#                         )
-#                     raise RuntimeError(
-#                         f"Failed to solve adjoint system at time step {n}: {e}"
-#                     )
-
-#             except Exception as e:
-#                 # Re-raise with additional context about which time step failed
-#                 raise RuntimeError(f"Error processing time step {n}: {e}") from e
-
-#         print(f"[Rank {rank}] Backward time loop completed successfully", flush=True)
-#         print(f"[Rank {rank}] Final λ norm: {np.linalg.norm(λ)}", flush=True)
-
-#         # Final validation
-#         if np.any(np.isnan(λ)):
-#             raise RuntimeError("Final adjoint vector contains NaN values")
-#         if np.any(np.isinf(λ)):
-#             raise RuntimeError("Final adjoint vector contains infinite values")
-
-#         return λ  # This is λ_0 = ∇J(z_0)
-
-#     except Exception as e:
-#         # Log the error with rank information
-#         if "rank" in locals():
-#             print(f"[Rank {rank}] FATAL ERROR in swe_adjoint: {e}", flush=True)
-#         else:
-#             print(f"FATAL ERROR in swe_adjoint: {e}", flush=True)
-#         raise
-
-
 def grad_cost_function(
     u0: np.ndarray, solver: Any, adjoint_type: str, **kwargs: Any
 ) -> np.ndarray:
@@ -1178,4 +720,56 @@ def grad_cost_function(
             print(f"Unexpected error in swe_adjoint: {e}", flush=True)
         return np.full_like(u0, 1e10)
 
-    return B_inv @ (u0 - u_b) + λ_0
+    if adjoint_type in {"bayes", "dci"}:
+        return B_inv @ (u0 - u_b) + λ_0
+    elif adjoint_type == "dci_wme":
+        return B_inv @ (u0 - u_b) + λ_0
+    else:
+        raise ValueError(f"Unknown adjoint_type: {adjoint_type}")
+
+
+def print_observation_debug_info(
+    Hu: np.ndarray,
+    yobs: np.ndarray,
+    n: int,
+    rank: int = 0,
+):
+    """
+    Print debug information for a single observation time step during the adjoint solve.
+    """
+    if rank == 0:
+        print(f"\n--- Observation Debug Info at Time Step {n} ---")
+        print(f"Hu shape: {Hu.shape}", f"Hu: {Hu[::10]}")
+        print(f"yobs shape: {yobs.shape}, yobs: {yobs[::10]}")
+        print("----------------------------------------------\n")
+
+
+def print_adjoint_debug_info(
+    nt: int,
+    trajectories: list,
+    adjoints: list,
+    obs_spatial_idxs: np.ndarray,
+    obs_time_idxs: np.ndarray,
+    λ_shape: tuple,
+    obs_data: np.ndarray,
+    R_inv: np.ndarray,
+    rank: int = 0,
+):
+    """
+    Print detailed debug information about adjoint setup.
+    """
+    if rank == 0:
+        print("\n\n" + "=" * 40 + " Adjoint Debug Info " + "=" * 40)
+        print(f"Number of Time Steps: {nt + 1}")
+        print(f"Trajectories Length: {len(trajectories)}")
+        print(f"Adjoints Length: {len(adjoints)}")
+        print(f"Observation Spatial Indices Length: {len(obs_spatial_idxs)}")
+        print(f"Observation Time Indices Length: {len(obs_time_idxs)}")
+        print(f"Single Trajectory Shape: {trajectories[0].shape}")
+        print(f"Single Adjoint Shape: {adjoints[0].shape}")
+        print(f"Lambda Shape: {λ_shape}")
+        print(f"Observation Spatial Indices: {obs_spatial_idxs}")
+        print(f"Observation Time Indices: {obs_time_idxs}")
+        print(f"Observation Data Shape: {obs_data.shape}")
+        print(f"R_inv Shape: {R_inv.shape}")
+        print("=" * 100 + "\n\n")

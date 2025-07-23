@@ -14,6 +14,8 @@ from dca_utils import (
     build_observation_matrix,
     setup_observation_indices,
     generate_observations,
+    save_pickle,
+    load_pickle,
     Time,
 )
 
@@ -237,6 +239,8 @@ def run_assimilation(
             u_0=initial_u0,
             save_states=True,
             adjoint_method=False,
+            save_bathy=False,
+            make_wet=True,
         )
 
         # Process background state
@@ -284,6 +288,8 @@ def run_assimilation(
             u_0=u_0,
             save_states=True,
             adjoint_method=False,
+            save_bathy=False,
+            make_wet=True,
         )
 
         # Save analysis state for next window
@@ -420,7 +426,7 @@ def setup_data_assimilation(
         - 'y_obs': Generated observations
         - 'covs': Dictionary with inverse covariance matrices
         - 'H': Observation matrix
-        - 'stations': Station locations
+        - 'obs_stations': Station locations
         - 'obs_spatial_indices': Spatial observation indices
         - 'obs_indices_per_window': Observation indices per window
         - 'obs_time_indices': Time observation indices
@@ -434,8 +440,10 @@ def setup_data_assimilation(
     - generate_observations(true_signal, H, obs_time_indices, obs_std)
     """
     # Load true signal from pickle
-    with open(pickle_path, "rb") as f:
-        true_signal = pickle.load(f)
+
+    true_signal = load_pickle(pickle_path)
+
+    saved_bathy = load_pickle("saved_bathy.pkl")
 
     # Update problem parameters
     problem_params.update({"fric_law": "mannings", "dt": 600})
@@ -452,7 +460,7 @@ def setup_data_assimilation(
     obs_per_window = problem_params["num_steps"] // obs_time_freq
 
     # Build observation matrix
-    H, stations, obs_spatial_indices = build_observation_matrix(
+    H, obs_stations, obs_spatial_indices = build_observation_matrix(
         prob, prob.V, obs_space_freq
     )
 
@@ -466,7 +474,7 @@ def setup_data_assimilation(
 
     # Generate covariance matrices
     state_dim = true_signal.shape[1]
-    obs_dim = stations.shape[0]
+    obs_dim = obs_stations.shape[0]
 
     # Observation covariance
     R = np.eye(obs_dim) * (obs_std**2)
@@ -487,7 +495,12 @@ def setup_data_assimilation(
     covs = {"B_inv": B_inv, "R_inv": R_inv, "L_inv": L_inv}
 
     # Calculate hb
-    hb = 5.0 / 13800 * (13800 - stations[:, 0])
+    hb = 5.0 / 13800 * (13800 - obs_stations[:, 0])
+
+    V = prob.V  # create full function space
+    stations = (
+        V.sub(0).collapse()[0].tabulate_dof_coordinates()
+    )  # stations used in model for points
 
     # Print setup information if requested
     if print_setup:
@@ -511,7 +524,7 @@ def setup_data_assimilation(
         print(f"  Observation dimension: {obs_dim}")
         print(f"  Total time steps: {total_steps}")
         print(f"  Observations per window: {obs_per_window}")
-        print(f"  Number of observation stations: {len(stations)}")
+        print(f"  Number of observation obs_stations: {len(obs_stations)}")
 
         print("\nMatrix Information:")
         print(f"  Observation matrix H shape: {H.shape}")
@@ -527,7 +540,7 @@ def setup_data_assimilation(
             else f"  Observation spatial indices: {obs_spatial_indices}"
         )
         print(
-            f"  Station locations (first 5): {stations[:5] if len(stations) > 5 else stations}"
+            f"  Station locations (first 5): {obs_stations[:5] if len(obs_stations) > 5 else obs_stations}"
         )
 
         print("\nGenerated Data:")
@@ -542,6 +555,7 @@ def setup_data_assimilation(
         "y_obs": y_obs,
         "covs": covs,
         "H": H,
+        "obs_stations": obs_stations,
         "stations": stations,
         "obs_spatial_indices": obs_spatial_indices,
         "obs_per_window": obs_per_window,
@@ -624,7 +638,7 @@ def run_data_assimilation(
         "t_final": final_time,
         "num_steps": int(np.ceil(final_time / dt)),
         "num_windows": final_time // window_size,  # divide by window_size in seconds
-        "fric_law": "linear",  # friction law either quadratic or linear
+        "fric_law": "mannings",  # friction law either quadratic or linear
         "sol_var": "h",  # solution variable either h or hu
     }
 
@@ -650,16 +664,17 @@ def run_data_assimilation(
         )
         true_solver = get_true_signal(solver, "sloped_beach", solver_params, 1)
         true_signal = np.array(true_solver.saved_states)
+        saved_bathy = np.array(true_solver.saved_bathy)
 
         # Ensure output directory exists
         os.makedirs("da_output", exist_ok=True)
 
-        with open(os.path.join("da_output", "true_signal.pkl"), "wb") as f:
-            pickle.dump(true_signal, f)
+        save_pickle("true_signal.pkl", true_signal)
+        save_pickle("saved_bathy.pkl", saved_bathy)
 
     # Setup data assimilation
     result = setup_data_assimilation(
-        pickle_path=os.path.join("da_output", "true_signal.pkl"),
+        pickle_path="true_signal.pkl",
         problem_params=problem_params,
         prob=prob,
         obs_std=obs_std,
@@ -671,14 +686,14 @@ def run_data_assimilation(
     )
 
     # save the setup result to a pickle file
-    with open(os.path.join("da_output", "setup_result.pkl"), "wb") as f:
-        pickle.dump(result, f)
+    save_pickle("setup_result.pkl", result)
 
     # Extract common parameters from result
     stations = result["stations"]
     y_obs = result["y_obs"]
     obs_per_window = result["obs_per_window"]
     obs_time_indices = result["obs_time_indices"]
+    obs_spatial_indices = result["obs_spatial_indices"]
     H = result["H"]
     covs = result["covs"]
     hb = result["hb"]
@@ -704,8 +719,7 @@ def run_data_assimilation(
         )
 
         # Save to pickle file
-        with open(os.path.join("da_output", "dci_analysis.pkl"), "wb") as f:
-            pickle.dump(dci_analysis, f)
+        save_pickle("dci_analysis.pkl", dci_analysis)
 
         analyses["dci"] = dci_analysis
         print("DCI analysis completed and saved.")
@@ -727,8 +741,7 @@ def run_data_assimilation(
         )
 
         # Save to pickle file
-        with open(os.path.join("da_output", "dci_wme_analysis.pkl"), "wb") as f:
-            pickle.dump(dci_wme_analysis, f)
+        save_pickle("dci_wme_analysis.pkl", dci_wme_analysis)
 
         analyses["dci_wme"] = dci_wme_analysis
         print("DCI-WME analysis completed and saved.")
@@ -750,8 +763,7 @@ def run_data_assimilation(
         )
 
         # Save to pickle file
-        with open(os.path.join("da_output", "bayes_analysis.pkl"), "wb") as f:
-            pickle.dump(bayes_analysis, f)
+        save_pickle("bayes_analysis.pkl", bayes_analysis)
 
         analyses["bayes"] = bayes_analysis
         print("Bayes analysis completed and saved.")
@@ -796,24 +808,26 @@ def calculate_analysis_metrics(
     if display_name is None:
         display_name = analysis_name.upper()
 
-    filepath = os.path.join("da_output", filename)
+    # filepath = os.path.join("da_output", filename)
 
     # Save analysis data first if requested (for DCI WME case)
     if save_first and analysis_data is not None:
-        with open(filepath, "wb") as f:
-            pickle.dump(analysis_data, f)
+        save_pickle(filename, analysis_data)
 
     # Load analysis data from pickle file
-    with open(filepath, "rb") as f:
-        analysis = pickle.load(f)
+    # with open(filepath, "rb") as f:
+    #     analysis = pickle.load(f)
+    analysis = load_pickle(filename)
 
     # Load result if not already provided
-    with open(os.path.join("da_output", "setup_result.pkl"), "rb") as f:
-        result = pickle.load(f)
+    # with open(os.path.join("da_output", "setup_result.pkl"), "rb") as f:
+    #     result = pickle.load(f)
+    result = load_pickle("setup_result.pkl")
 
     # Load true signal
-    with open(os.path.join("da_output", "true_signal.pkl"), "rb") as f:
-        true_signal = pickle.load(f)
+    # with open(os.path.join("da_output", "true_signal.pkl"), "rb") as f:
+    #     true_signal = pickle.load(f)
+    true_signal = load_pickle("true_signal.pkl")
 
     # Calculate predicted observations
     true_obs = result["H"] @ true_signal[result["obs_time_indices"]].T

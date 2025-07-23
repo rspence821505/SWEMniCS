@@ -1432,6 +1432,7 @@ class SlopedBeachProblem(TidalProblem):
         shoreline_x = self.x1
         self.log(f"Location of shoreline: {shoreline_x}")
         h_b.interpolate(lambda x: self.h_b_val / self.x1 * (shoreline_x - x[0]))
+        print("Bathymetry created with h_b_val: \n\n", hb)
         return h_b
 
     def evaluate_tidal_boundary(self, t):

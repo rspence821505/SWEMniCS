@@ -172,6 +172,7 @@ class BaseSolver:
         self.saved_adjoints = []
         self.saved_states = []
         self.dry_nodes = []
+        self.saved_bathy = []
 
         if self.verbose:
             self.log("SWE TYPE", self.swe_type)
@@ -658,27 +659,9 @@ class CGImplicit(BaseSolver):
 
     def record_stations(self, u_sol, points_on_proc):
         """saves time series at stations into a numpy array"""
-        # print(f"Points on proc: {points_on_proc.shape}, \n\n cells: {self.cells}")
         h_values = u_sol.sub(0).eval(points_on_proc, self.cells)
         if self.problem.solution_var in ["h", "flux"]:
             h_values -= self.station_bathy
-
-        # if isinstance(self.station_bathy, list):
-        #     self.station_bathy = np.array(self.station_bathy, dtype=np.float64)
-        #     print(f"\n\n station bathy: {self.station_bathy.shape}\n\n")
-        # else:
-        #     print(f"\n\n station bathy: {self.station_bathy.shape}\n\n")
-
-        # if isinstance(points_on_proc, list):
-        #     points_on_proc = np.array(points_on_proc, dtype=np.float64)
-        #     print(f"points in proc: \n {type(points_on_proc)} \n\n")
-        # else:
-        #     print(f"points in proc: \n {points_on_proc.shape} \n\n")
-        # if isinstance(self.cells, list):
-        #     self.cells = np.array(self.cells, dtype=np.int32)
-        #     print(f"cells in proc: \n {self.cells.shape} \n\n")
-        # else:
-        #     print(f"cells in proc: \n {self.cells.shape} \n\n")
 
         # correct for w/d for nicer plotting
         # h_values = np.maximum(h_values,-self.station_bathy)
@@ -812,36 +795,59 @@ class CGImplicit(BaseSolver):
 
         if self.mpi_rank == 0:
             self.saved_adjoints.append(A_csr.copy())
-            # print(f"[Rank 0] Saved full A_adjoint with shape {A_csr.shape}", flush=True)
 
-    def save_states(self):
+    def save_states(self, make_wet=False, local_points=None, save_bathy=False):
         """Gather and save global state vector"""
-        comm = self.problem.mesh.comm
-        rank = comm.rank
-        size = comm.size
 
-        # Safely slice only local (non-ghost) values
-        size_local = self.V.dofmap.index_map.size_local
-        u_local = self.u.x.array[:size_local]
-        gathered_states = comm.gather(u_local, root=0)
+        # Default: copy the current solution
+        u_sol = self.u.x.array.copy().flatten()
+        if make_wet:
+            water_height, dry_node_indices = self.check_dry_nodes(
+                self.u, local_points, save_bathy=save_bathy
+            )
+            if len(dry_node_indices) > 0:
+                V_sub = self.problem.V.sub(0)
+                _, sub_map = V_sub.collapse()
+                water_height[dry_node_indices] = (
+                    0.0  # Set water depth to zero at dry nodes
+                )
+                u_sol[sub_map] = (
+                    water_height.copy().flatten()
+                )  # Update solution with modified water depth
 
-        if rank == 0:
-            gathered_state = np.concatenate(gathered_states)
-            self.saved_states.append(gathered_state.copy())
+        self.saved_states.append(u_sol)
 
-    def check_wd(self, u_sol, points_on_proc):
-        """Check if the solution is wet or dry at the stations."""
-        # check if the solution is wet or dry at the stations
-        h_values = u_sol.sub(0).eval(points_on_proc, self.cells)  # (432, 1)
-        eta = h_values - self.station_bathy  # (432, 1)
-        # print(f"eta: {eta.shape}")
-        wd = eta < (-self.station_bathy)
-        # return indices where wetting and drying occurs
-        wd = np.where(wd)[0]
-        self.dry_nodes.append(wd)
-        # update u_sol (H) with wetting and drying
-        u_sol.sub(0).x.array[wd] = 0.0
-        return wd
+    def check_dry_nodes(self, solution, evaluation_points, save_bathy=False):
+        """
+        Identify and apply wetting/drying conditions at monitoring stations.
+
+        Args:
+            solution: FEniCS solution object containing water depth (H) and velocity components
+            evaluation_points: Coordinates where solution should be evaluated
+
+        Returns:
+            numpy.ndarray: Indices of dry nodes where H was set to zero
+        """
+        # Extract water depth values at evaluation points
+        water_height = solution.sub(0).eval(evaluation_points, self.cells)
+        bathy = self.problem.h_b.eval(evaluation_points, self.cells)
+
+        # Calculate water surface elevation relative to bathymetry
+        water_surface_elevation = water_height - bathy  # 432 x 1
+        # Identify dry nodes: where water surface is below the bottom
+        # (i.e., where elevation is negative relative to bathymetry)
+        is_dry = water_surface_elevation < -bathy  # 432 x 1
+        dry_node_indices = np.where(is_dry)[0]
+
+        if save_bathy:
+            self.saved_bathy.append(bathy.copy().flatten())
+            # Store dry nodes for tracking/analysis
+            self.dry_nodes.append(dry_node_indices.copy())
+
+        # # Apply da friendly wetting/drying by setting water depth to zero at dry nodes
+        # if len(dry_node_indices) > 0 and self.adjoint_method:
+        #     solution.sub(0).x.array[dry_node_indices] = -bathy[dry_node_indices].flatten()
+        return water_height, dry_node_indices
 
     def time_loop(
         self,
@@ -852,6 +858,8 @@ class CGImplicit(BaseSolver):
         u_0=None,
         save_states=False,
         adjoint_method=False,
+        save_bathy=False,
+        make_wet=False,
     ):
         h_jacobian = None
         if self.verbose:
@@ -884,9 +892,9 @@ class CGImplicit(BaseSolver):
         #     self.station_data[0, :, :] = self.record_stations(self.u, local_points)
 
         if self.save_states:
-            wd = self.check_wd(self.u, local_points)
-            # print(f"Dry nodes at t=0: {self.u.sub(0).x.array[wd]}")
-            self.save_states()
+            self.save_states(
+                make_wet=make_wet, local_points=local_points, save_bathy=save_bathy
+            )
 
         # take first 2 steps with implicit Euler since we dont have enough steps for higher order
         self.theta1.value = 0
@@ -908,9 +916,9 @@ class CGImplicit(BaseSolver):
                 self.plot_frame()
 
             if save_states:
-                wd = self.check_wd(self.u, local_points)
-                # print(f"Dry nodes at t={a+1}: {self.u.sub(0).x.array[wd]}")
-                self.save_states()
+                self.save_states(
+                    make_wet=make_wet, local_points=local_points, save_bathy=save_bathy
+                )
 
             if adjoint_method:
                 self.save_adjoints()
@@ -934,9 +942,9 @@ class CGImplicit(BaseSolver):
                 self.plot_frame()
 
             if save_states:
-                wd = self.check_wd(self.u, local_points)
-                # print(f"Dry nodes at t={a+1}: {self.u.sub(0).x.array[wd]}")
-                self.save_states()
+                self.save_states(
+                    make_wet=make_wet, local_points=local_points, save_bathy=save_bathy
+                )
 
             if adjoint_method:
                 self.save_adjoints()
