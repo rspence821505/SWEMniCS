@@ -119,6 +119,10 @@ def get_trajectory(
             solver.saved_states.clear()
         if hasattr(solver, "saved_adjoints"):
             solver.saved_adjoints.clear()
+        if hasattr(solver, "saved_bathy"):
+            solver.saved_bathy.clear()
+        if hasattr(solver, "saved_true_bathy"):
+            solver.saved_true_bathy.clear()
     except AttributeError as e:
         print(f"Warning: Could not clear solver state arrays: {e}", flush=True)
 
@@ -128,9 +132,10 @@ def get_trajectory(
             solver_parameters=solver_params,
             stations=stations,
             u_0=u_0,
-            save_states=True,
+            save_state=True,
             adjoint_method=True,
             save_bathy=False,
+            save_true_bathy=False,
             make_wet=True,
         )
     except AttributeError as e:
@@ -204,6 +209,7 @@ def bayes_cost_function(
     B_inv, R_inv, _ = kwargs["covs"].values()
     solver_params = kwargs["solver_params"]
     stations = kwargs["stations"]
+    hb = kwargs["hb"]
 
     # Reset solver time to initial time
     solver.problem.t = init_time
@@ -214,6 +220,7 @@ def bayes_cost_function(
         states = np.array(solver.saved_states)  # shape: (steps, num_stations)
         observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
         Qz = H @ observed_states.T  # shape: (n_obs, obs_dim)
+        Qz = Qz - hb[:, np.newaxis]  # convert to wse eta = H - hb
     except (ValueError, IndexError, AttributeError) as e:
         print(f"Error in bayes_cost_function get_trajectory: {e}", flush=True)
         return 1e10  # Return a large value to indicate failure
@@ -305,6 +312,8 @@ def dci_cost_function(
         states = np.array(solver.saved_states)  # shape: (steps, num_stations)
         observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
         Qz = H @ observed_states.T  # shape: (n_obs, obs_dim)
+        Qz = Qz - hb[:, np.newaxis]  # convert to wse eta = H - hb
+        Q_zb = Q_zb - hb[:, np.newaxis]  # convert to wse eta = H - hb
     except (ValueError, IndexError, AttributeError) as e:
         print(f"Error in dci_cost_function get_trajectory: {e}", flush=True)
         return 1e10  # Return a large value to indicate failure
@@ -396,6 +405,8 @@ def dci_wme_cost_function(
         states = np.array(solver.saved_states)  # shape: (steps, num_stations)
         observed_states = states[obs_time_indices]  # shape: (n_obs, state_dim)
         Qz = H @ observed_states.T  # shape: (n_obs, obs_dim)
+        Qz = Qz - hb[:, np.newaxis]  # convert to wse eta = H - hb
+        Q_zb = Q_zb - hb[:, np.newaxis]  # convert to wse eta = H - hb
     except (ValueError, IndexError, AttributeError) as e:
         print(f"Error in dci_wme_cost_function get_trajectory: {e}", flush=True)
         return 1e10  # Return a large value to indicate failure
@@ -499,6 +510,7 @@ def swe_adjoint(
     R_inv: np.ndarray,
     L_inv: Optional[np.ndarray] = None,
     Q_zb: Optional[np.ndarray] = None,
+    hb: Optional[np.ndarray] = None,
     adjoint_type: Literal["bayes", "dci", "dci_wme"] = "bayes",
     comm: Optional[MPI.Comm] = None,
 ) -> np.ndarray:
@@ -555,12 +567,16 @@ def swe_adjoint(
     λ = np.zeros(N_dof)
 
     num_obs = len(obs_data)
+    # print(f"Q_zb shape: {Q_zb.shape}, hb shape: {hb.shape}", flush=True)
+    Qzb = (Q_zb - hb[:, np.newaxis]) if Q_zb is not None else None
     Qzb = Q_zb.T if Q_zb is not None else None
 
     if adjoint_type == "dci_wme":
         states = np.array(trajectories)  # shape: (steps, num_stations)
         observed_states = states[obs_time_idxs]  # shape: (n_obs, state_dim)
         Qz = H @ observed_states.T  # shape: (n_obs,obs_dim)
+        # print(f"Qz shape: {Qz.shape}, hb shape: {hb.shape}", flush=True)
+        Qz = Qz - hb[:, np.newaxis]  # convert to wse eta = H - hb
         num_obs, obs_var, obs_sum, L_inv_wme = initialize_wme_terms(
             obs_data, R_inv, L_inv
         )
@@ -578,8 +594,7 @@ def swe_adjoint(
             Hu = H @ u
 
             yobs = obs_data[idx].copy()
-            q_zb = Qzb[idx].copy() if Q_zb is not None else None
-
+            q_zb = Qzb[idx].copy() if Qzb is not None else None
             # print_observation_debug_info(Hu, yobs, n)
             rhs = adjoint_rhs(
                 H,
@@ -677,6 +692,7 @@ def grad_cost_function(
     H = kwargs["H"]
     B_inv, R_inv, L_inv = kwargs["covs"].values()
     Q_zb = kwargs["Q_zb"]
+    hb = kwargs["hb"]
 
     try:
         # Check if saved adjoints are available
@@ -709,6 +725,7 @@ def grad_cost_function(
             R_inv,
             L_inv,
             Q_zb,
+            hb,
             adjoint_type,
         )
     except (ValueError, IndexError, AttributeError) as e:

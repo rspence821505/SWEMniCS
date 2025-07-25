@@ -4,11 +4,21 @@ import seaborn as sns
 import numpy as np
 from matplotlib.tri import Triangulation
 from dolfinx.fem import Function
+
+# from dolfinx import fem as fe
 from matplotlib import gridspec
 import matplotlib.patheffects as path_effects
 import seaborn as sns
 
 sns.set_palette("bright")
+
+
+def create_bathymetry(h_b_val, V):
+    """Create bathymetry over a given FunctionSpace"""
+    h_b = Function(V.sub(0).collapse()[0])
+    # make shore line at 13800
+    h_b.interpolate(lambda x: h_b_val / 13800 * (13800 - x[0]))
+    return h_b
 
 
 def plot_mixed_function(
@@ -167,6 +177,7 @@ def plot_mixed_function(
     # Full-height colorbar - automatically sized to match plot
     cbar = fig.colorbar(tpc, ax=ax, aspect=14, pad=0.04, shrink=0.48)
     cbar.set_label("Height (m)", fontsize=20, labelpad=10)
+
     plt.tight_layout()
 
     # Save plot if path provided
@@ -269,7 +280,8 @@ def plot_comparison1(
             V_sub = V.sub(component)
             V_sub_c, sub_map = V_sub.collapse()
             u_sub = Function(V_sub_c)
-            u_sub.x.array[:] = u_array[sub_map]
+            # u_sub.x.array[:] = u_array[sub_map]
+            u_sub.x.array[:] = u_array
             dof_coords = V_sub_c.tabulate_dof_coordinates()[:, :2]
             dof_to_vertex_map = np.array(
                 [np.argmin(np.linalg.norm(dof_coords - x, axis=1)) for x in coords]
@@ -419,7 +431,9 @@ def plot_comparison2(
             V_sub = V.sub(component)
             V_sub_c, sub_map = V_sub.collapse()
             u_sub = Function(V_sub_c)
-            u_sub.x.array[:] = u_array[sub_map]
+
+            # u_sub.x.array[:] = u_array[sub_map]
+            u_sub.x.array[:] = u_array
             dof_coords = V_sub_c.tabulate_dof_coordinates()[:, :2]
             dof_to_vertex_map = np.array(
                 [np.argmin(np.linalg.norm(dof_coords - x, axis=1)) for x in coords]

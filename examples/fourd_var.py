@@ -199,6 +199,7 @@ def run_assimilation(
     """
     name = "Hotstart"
     analysis = []
+    bathy = []
     analysis_state = None
     num_windows = problem_params["num_windows"]
     steps_per_window = problem_params["num_steps"]
@@ -237,9 +238,10 @@ def run_assimilation(
             plot_every=60,
             plot_name=name,
             u_0=initial_u0,
-            save_states=True,
-            adjoint_method=False,
+            save_state=True,
+            adjoint_method=True,
             save_bathy=False,
+            save_true_bathy=False,
             make_wet=True,
         )
 
@@ -286,9 +288,10 @@ def run_assimilation(
             plot_every=60,
             plot_name=name,
             u_0=u_0,
-            save_states=True,
+            save_state=True,
             adjoint_method=False,
-            save_bathy=False,
+            save_bathy=True,
+            save_true_bathy=False,
             make_wet=True,
         )
 
@@ -296,14 +299,20 @@ def run_assimilation(
         analysis_state = solver.u.x.array[:]
 
         # Collect results
+        saved_bathy = np.array(solver.saved_bathy)
         saved_states = np.array(solver.saved_states)
+        current_bath = saved_bathy.copy()
         current_analysis = saved_states.copy()
         if idx < num_windows - 1:
             current_analysis = current_analysis[:-1, :]
+            current_bath = current_bath[:-1, :]
+
         analysis.append(current_analysis)
 
+        bathy.append(current_bath)
+
     # Combine all windows
-    return np.concatenate(analysis, axis=0)
+    return np.concatenate(analysis, axis=0), np.concatenate(bathy, axis=0)
 
 
 def get_background_covariance(eta_trajectory, sample_freq=1, err2=1.0):
@@ -443,10 +452,14 @@ def setup_data_assimilation(
 
     true_signal = load_pickle(pickle_path)
 
-    saved_bathy = load_pickle("saved_bathy.pkl")
-
     # Update problem parameters
-    problem_params.update({"fric_law": "mannings", "dt": 600})
+    problem_params.update(
+        {
+            "fric_law": "mannings",
+            "alpha": 2.0 * np.pi / Time.TWELVE_HOURS.seconds,
+            "dt": 600,
+        }
+    )
 
     # Use final_time parameter or get from problem_params
     if final_time is None:
@@ -468,9 +481,14 @@ def setup_data_assimilation(
     obs_indices_per_window, obs_time_indices = setup_observation_indices(
         problem_params["num_steps"], obs_time_freq, total_steps
     )
+    # Calculate hb based off of true bathymetry
+    hb = 5.3 / 13800 * (13800 - obs_stations[:, 0])
 
     # Create synthetic observations
-    y_obs = generate_observations(true_signal, H, obs_time_indices, obs_std)
+    y_obs = generate_observations(true_signal, H, obs_time_indices, hb, obs_std)
+
+    # Set bathynemtry for assimilation expirement
+    hb = 5.0 / 13800 * (13800 - obs_stations[:, 0])
 
     # Generate covariance matrices
     state_dim = true_signal.shape[1]
@@ -493,9 +511,6 @@ def setup_data_assimilation(
     B_inv = np.linalg.inv(B)
     L_inv = np.linalg.inv(L)
     covs = {"B_inv": B_inv, "R_inv": R_inv, "L_inv": L_inv}
-
-    # Calculate hb
-    hb = 5.0 / 13800 * (13800 - obs_stations[:, 0])
 
     V = prob.V  # create full function space
     stations = (
@@ -568,11 +583,13 @@ def run_data_assimilation(
     analysis_types=["dci", "dci_wme", "bayes"],
     run_true_signal=True,
     window_size=None,
+    final_time=None,
     dt=600,
     obs_std=1.1,
     obs_space_freq=2,
     obs_time_freq=1,
     inflation_factor=4.0,
+    friction_type="mannings",
 ):
     """
     Run data assimilation with specified analysis types.
@@ -625,8 +642,12 @@ def run_data_assimilation(
     rank = comm.Get_rank()
     size = comm.Get_size()
 
+    print(f"\n\n friction_type: {friction_type} \n\n")
+
     # Problem parameters
-    final_time = 7 * Time.TWENTY_FOUR_HOURS.seconds  # 7 days in seconds
+    if final_time is None:
+        # Default final time is 3 days in seconds
+        final_time = 7 * Time.TWENTY_FOUR_HOURS.seconds  # 7 days in seconds
 
     # Set default window_size to 1 hour if not provided
     if window_size is None:
@@ -638,7 +659,8 @@ def run_data_assimilation(
         "t_final": final_time,
         "num_steps": int(np.ceil(final_time / dt)),
         "num_windows": final_time // window_size,  # divide by window_size in seconds
-        "fric_law": "mannings",  # friction law either quadratic or linear
+        "fric_law": friction_type,  # friction law either quadratic or linear
+        "alpha": 2 * np.pi / Time.TWELVE_HOURS.seconds,  # 2 cycles per 12 hours
         "sol_var": "h",  # solution variable either h or hu
     }
 
@@ -668,7 +690,6 @@ def run_data_assimilation(
 
         # Ensure output directory exists
         os.makedirs("da_output", exist_ok=True)
-
         save_pickle("true_signal.pkl", true_signal)
         save_pickle("saved_bathy.pkl", saved_bathy)
 
@@ -689,6 +710,7 @@ def run_data_assimilation(
     save_pickle("setup_result.pkl", result)
 
     # Extract common parameters from result
+    problem_params = result["problem_params"]
     stations = result["stations"]
     y_obs = result["y_obs"]
     obs_per_window = result["obs_per_window"]
@@ -697,6 +719,7 @@ def run_data_assimilation(
     H = result["H"]
     covs = result["covs"]
     hb = result["hb"]
+    run_bathy = None
 
     # Dictionary to store analysis results
     analyses = {}
@@ -704,7 +727,7 @@ def run_data_assimilation(
     # Run requested analysis types
     if "dci" in analysis_types:
         print("Running DCI analysis...")
-        dci_analysis = run_assimilation(
+        dci_analysis, run_bathy = run_assimilation(
             problem_params,
             solver_params,
             stations,
@@ -726,7 +749,7 @@ def run_data_assimilation(
 
     if "dci_wme" in analysis_types:
         print("Running DCI-WME analysis...")
-        dci_wme_analysis = run_assimilation(
+        dci_wme_analysis, run_bathy = run_assimilation(
             problem_params,
             solver_params,
             stations,
@@ -748,7 +771,7 @@ def run_data_assimilation(
 
     if "bayes" in analysis_types:
         print("Running Bayes analysis...")
-        bayes_analysis = run_assimilation(
+        bayes_analysis, run_bathy = run_assimilation(
             problem_params,
             solver_params,
             stations,
@@ -768,6 +791,7 @@ def run_data_assimilation(
         analyses["bayes"] = bayes_analysis
         print("Bayes analysis completed and saved.")
 
+    save_pickle("da_bathy.pkl", run_bathy)
     return analyses
 
 
@@ -836,8 +860,13 @@ def calculate_analysis_metrics(
     # Calculate metrics
     rmse = np.sqrt(np.mean((true_signal - analysis) ** 2))  # time averaged RMSE
     misfit = np.linalg.norm(true_obs - pred_obs, ord=2)  # time averaged misfit
+    relative_misfit = np.linalg.norm(true_obs - pred_obs, ord=2) / np.linalg.norm(
+        true_obs, ord=2
+    )  # relative misfit
 
     # Print results
-    print(f"{display_name} RMSE: {rmse:<.10f}, {display_name} Misfit: {misfit:<.4f}")
+    print(
+        f"{display_name} RMSE: {rmse:<.10f}, {display_name} Misfit: {misfit:<.4f}, {display_name} Relative Misfit: {relative_misfit:<.4f}"
+    )
 
     return rmse, misfit
