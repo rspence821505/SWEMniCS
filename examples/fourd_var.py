@@ -457,6 +457,7 @@ def setup_data_assimilation(
         {
             "fric_law": "mannings",
             "alpha": 2.0 * np.pi / Time.TWELVE_HOURS.seconds,
+            # "alpha": 2.0 * np.pi / (10 * Time.ONE_HOUR.seconds),
             "dt": 600,
         }
     )
@@ -590,6 +591,7 @@ def run_data_assimilation(
     obs_time_freq=1,
     inflation_factor=4.0,
     friction_type="mannings",
+    filename=None,
 ):
     """
     Run data assimilation with specified analysis types.
@@ -661,6 +663,7 @@ def run_data_assimilation(
         "num_windows": final_time // window_size,  # divide by window_size in seconds
         "fric_law": friction_type,  # friction law either quadratic or linear
         "alpha": 2 * np.pi / Time.TWELVE_HOURS.seconds,  # 2 cycles per 12 hours
+        # "alpha": 2.0 * np.pi / (10 * Time.ONE_HOUR.seconds),
         "sol_var": "h",  # solution variable either h or hu
     }
 
@@ -740,9 +743,11 @@ def run_data_assimilation(
             "sloped_beach",
             cost_function_type="dci",
         )
+        if filename is None:
+            filename = "dci_analysis.pkl"
 
         # Save to pickle file
-        save_pickle("dci_analysis.pkl", dci_analysis)
+        save_pickle(filename, dci_analysis)
 
         analyses["dci"] = dci_analysis
         print("DCI analysis completed and saved.")
@@ -762,9 +767,10 @@ def run_data_assimilation(
             "sloped_beach",
             cost_function_type="dci_wme",
         )
-
+        if filename is None:
+            filename = "dci_wme_analysis.pkl"
         # Save to pickle file
-        save_pickle("dci_wme_analysis.pkl", dci_wme_analysis)
+        save_pickle(filename, dci_wme_analysis)
 
         analyses["dci_wme"] = dci_wme_analysis
         print("DCI-WME analysis completed and saved.")
@@ -784,9 +790,10 @@ def run_data_assimilation(
             "sloped_beach",
             cost_function_type="bayes",
         )
-
+        if filename is None:
+            filename = "bayes_analysis.pkl"
         # Save to pickle file
-        save_pickle("bayes_analysis.pkl", bayes_analysis)
+        save_pickle(filename, bayes_analysis)
 
         analyses["bayes"] = bayes_analysis
         print("Bayes analysis completed and saved.")

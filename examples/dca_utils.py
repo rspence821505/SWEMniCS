@@ -93,6 +93,7 @@ def create_problem_solver(
             "wd_alpha": 0.36,
             "wd": True,
             "alpha": 2.0 * np.pi / Time.TWELVE_HOURS.seconds,  # 2 cycles per 12 hours
+            # "alpha": 2.0 * np.pi / (10 * Time.ONE_HOUR.seconds),
             "h_b_val": 5.3,
         }
         prob = SlopedBeachProblem(**sloped_kwargs)
@@ -107,6 +108,7 @@ def create_problem_solver(
             "wd_alpha": 0.36,
             "wd": True,
             "alpha": 2.0 * np.pi / Time.TWELVE_HOURS.seconds,  # 2 cycles per 12 hours
+            # "alpha": 2.0 * np.pi / (10 * Time.ONE_HOUR.seconds),
             "h_b_val": 5.0,  # Uncomment if needed
             # "alpha": 0.00024, # Uncomment if needed
         }
@@ -427,7 +429,6 @@ def analyze_error_statistics(
             filename = (
                 f"{analysis_type}_analysis_obs_std_{obs_std}_inflation_{inflation}.pkl"
             )
-            filepath = os.path.join(output_dir, filename)
 
             try:
                 # Load analysis results
