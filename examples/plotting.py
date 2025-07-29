@@ -13,14 +13,6 @@ import seaborn as sns
 sns.set_palette("bright")
 
 
-def create_bathymetry(h_b_val, V):
-    """Create bathymetry over a given FunctionSpace"""
-    h_b = Function(V.sub(0).collapse()[0])
-    # make shore line at 13800
-    h_b.interpolate(lambda x: h_b_val / 13800 * (13800 - x[0]))
-    return h_b
-
-
 def plot_mixed_function(
     msh,
     V,
@@ -514,7 +506,7 @@ def plot_comparison2(
     # Main colorbar (Truth/Estimate)
     main_cbar_ax = fig.add_axes([0.18, 0.01, main_width, 0.02])
     fig.colorbar(tpc_main, cax=main_cbar_ax, orientation="horizontal").set_label(
-        "Height (m)", fontsize=16
+        "$\eta$ (m)", fontsize=16
     )
 
     # Difference colorbar
