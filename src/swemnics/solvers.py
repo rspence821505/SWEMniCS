@@ -141,7 +141,6 @@ class BaseSolver:
         p_degree=[1, 1],
         p_type: Literal["CG", "DG"] = "CG",
         swe_type="full",
-        adjoint_method=False,
         verbose=True,
     ):
         r"""Iniitalize the solver.
@@ -166,12 +165,12 @@ class BaseSolver:
         self.names = ["eta", "u", "v"]
         # extra optional parameter added for linearized
         self.swe_type = swe_type
-        self.adjoint_method = adjoint_method
         self.F_no_dt = None
         self.verbose = verbose
         self.saved_adjoints = []
         self.saved_states = []
         self.dry_nodes = []
+        self.saved_true_bathy = []
         self.saved_bathy = []
 
         if self.verbose:
@@ -796,28 +795,31 @@ class CGImplicit(BaseSolver):
         if self.mpi_rank == 0:
             self.saved_adjoints.append(A_csr.copy())
 
-    def save_states(self, make_wet=False, local_points=None, save_bathy=False):
+    def save_states(
+        self,
+        make_wet=False,
+        local_points=None,
+        water_height=None,
+        dry_node_indices=None,
+    ):
         """Gather and save global state vector"""
 
         # Default: copy the current solution
         u_sol = self.u.x.array.copy().flatten()
-        if make_wet:
-            water_height, dry_node_indices = self.check_dry_nodes(
-                self.u, local_points, save_bathy=save_bathy
-            )
-            if len(dry_node_indices) > 0:
-                V_sub = self.problem.V.sub(0)
-                _, sub_map = V_sub.collapse()
-                water_height[dry_node_indices] = (
-                    0.0  # Set water depth to zero at dry nodes
-                )
-                u_sol[sub_map] = (
-                    water_height.copy().flatten()
-                )  # Update solution with modified water depth
+        if dry_node_indices is not None:
+            V_sub = self.problem.V.sub(0)
+            _, sub_map = V_sub.collapse()
+            water_height[dry_node_indices] = 0.0  # Set water depth to zero at dry nodes
+            # water_height[dry_node_indices] = -bathy[dry_node_indices]  # Set water depth to zero at dry nodes
+            u_sol[sub_map] = (
+                water_height.copy().flatten()
+            )  # Update solution with modified water depth
 
         self.saved_states.append(u_sol)
 
-    def check_dry_nodes(self, solution, evaluation_points, save_bathy=False):
+    def check_dry_nodes(
+        self, solution, evaluation_points, save_bathy=False, save_true_bathy=False
+    ):
         """
         Identify and apply wetting/drying conditions at monitoring stations.
 
@@ -839,11 +841,12 @@ class CGImplicit(BaseSolver):
         is_dry = water_surface_elevation < -bathy  # 432 x 1
         dry_node_indices = np.where(is_dry)[0]
 
-        if save_bathy:
-            self.saved_bathy.append(bathy.copy().flatten())
+        if save_true_bathy:
+            self.saved_true_bathy.append(bathy.copy().flatten())
             # Store dry nodes for tracking/analysis
             self.dry_nodes.append(dry_node_indices.copy())
-
+        if save_bathy:
+            self.saved_bathy.append(bathy.copy().flatten())
         # # Apply da friendly wetting/drying by setting water depth to zero at dry nodes
         # if len(dry_node_indices) > 0 and self.adjoint_method:
         #     solution.sub(0).x.array[dry_node_indices] = -bathy[dry_node_indices].flatten()
@@ -856,12 +859,19 @@ class CGImplicit(BaseSolver):
         plot_every=999999,
         plot_name="debug_tide",
         u_0=None,
-        save_states=False,
+        save_state=False,
         adjoint_method=False,
         save_bathy=False,
+        save_true_bathy=False,
         make_wet=False,
     ):
-        h_jacobian = None
+
+        # self.saved_states = []
+        # self.saved_adjoints = []
+        # self.dry_nodes = []
+        # self.saved_bathy = []
+        # self.saved_true_bathy = []
+
         if self.verbose:
             self.log("calling time loop")
         self.points_on_proc = local_points = self.init_stations(stations)
@@ -891,10 +901,22 @@ class CGImplicit(BaseSolver):
         # if len(stations):
         #     self.station_data[0, :, :] = self.record_stations(self.u, local_points)
 
-        if self.save_states:
-            self.save_states(
-                make_wet=make_wet, local_points=local_points, save_bathy=save_bathy
-            )
+        if save_state:
+            if make_wet:
+                water_height, dry_node_indices = self.check_dry_nodes(
+                    self.u,
+                    local_points,
+                    save_bathy=save_bathy,
+                    save_true_bathy=save_true_bathy,
+                )
+                self.save_states(
+                    make_wet=make_wet,
+                    local_points=local_points,
+                    water_height=water_height,
+                    dry_node_indices=dry_node_indices,
+                )
+            else:
+                self.save_states(make_wet=make_wet, local_points=local_points)
 
         # take first 2 steps with implicit Euler since we dont have enough steps for higher order
         self.theta1.value = 0
@@ -915,10 +937,22 @@ class CGImplicit(BaseSolver):
             if a % plot_every == 0 and plot_every <= self.problem.nt:
                 self.plot_frame()
 
-            if save_states:
-                self.save_states(
-                    make_wet=make_wet, local_points=local_points, save_bathy=save_bathy
-                )
+            if save_state:
+                if make_wet:
+                    water_height, dry_node_indices = self.check_dry_nodes(
+                        self.u,
+                        local_points,
+                        save_bathy=save_bathy,
+                        save_true_bathy=save_true_bathy,
+                    )
+                    self.save_states(
+                        make_wet=make_wet,
+                        local_points=local_points,
+                        water_height=water_height,
+                        dry_node_indices=dry_node_indices,
+                    )
+                else:
+                    self.save_states(make_wet=make_wet, local_points=local_points)
 
             if adjoint_method:
                 self.save_adjoints()
@@ -941,10 +975,22 @@ class CGImplicit(BaseSolver):
             if a % plot_every == 0:
                 self.plot_frame()
 
-            if save_states:
-                self.save_states(
-                    make_wet=make_wet, local_points=local_points, save_bathy=save_bathy
-                )
+            if save_state:
+                if make_wet:
+                    water_height, dry_node_indices = self.check_dry_nodes(
+                        self.u,
+                        local_points,
+                        save_bathy=save_bathy,
+                        save_true_bathy=save_true_bathy,
+                    )
+                    self.save_states(
+                        make_wet=make_wet,
+                        local_points=local_points,
+                        water_height=water_height,
+                        dry_node_indices=dry_node_indices,
+                    )
+                else:
+                    self.save_states(make_wet=make_wet, local_points=local_points)
 
             if adjoint_method:
                 self.save_adjoints()

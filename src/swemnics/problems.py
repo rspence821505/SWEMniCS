@@ -32,6 +32,7 @@ from swemnics.constants import g, R, omega, p_water, p_air
 from swemnics.forcing import GriddedForcing
 import scipy
 from enum import Enum
+import sys
 
 
 class FrictionLaw(str, Enum):
@@ -74,7 +75,7 @@ class BaseProblem(abc.ABC):
     # wetting-and-drying parameter
     wd_alpha: float = 0.05
     adjoint_method: bool = False
-    verbose: bool = True
+    verbose: bool = False
 
     def __post_init__(self):
         """Initialize the mesh and other variables needed for BC's"""
@@ -1432,7 +1433,6 @@ class SlopedBeachProblem(TidalProblem):
         shoreline_x = self.x1
         self.log(f"Location of shoreline: {shoreline_x}")
         h_b.interpolate(lambda x: self.h_b_val / self.x1 * (shoreline_x - x[0]))
-        print("Bathymetry created with h_b_val: \n\n", hb)
         return h_b
 
     def evaluate_tidal_boundary(self, t):

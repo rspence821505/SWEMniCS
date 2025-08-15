@@ -12,6 +12,7 @@ from petsc4py import PETSc
 import numpy as np
 from scipy.sparse import csr_matrix
 import numpy.linalg as la
+import sys
 import time
 
 
@@ -158,7 +159,9 @@ class CustomNewtonProblem:
                     + f", iterations {solver.getIterationNumber()}, resid norm {solver.getResidualNorm()}"
                 )
             if solver.getConvergedReason() == -9:
-                raise RuntimeError("Linear Solver failed due to nans or infs!!!!")
+                # raise RuntimeError("Linear Solver failed due to nans or infs!!!!")
+                sys.exit(1)
+
             # Update u_{i+1} = u_i + delta x_i
             # not working in parallel?
             u.x.array[:] += relaxation_parameter * dx.x.array[:]
