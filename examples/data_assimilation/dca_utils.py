@@ -333,8 +333,7 @@ def compute_daily_metrics(
         DCI analysis results, same shape as true_signal
     dci_wme_analysis : np.ndarray
         DCI WME analysis results, same shape as true_signal
-    result : dict
-        Dictionary containing 'H' (observation operator) and 'obs_time_indices'
+
     num_days : int, default=7
         Number of days to analyze
 

@@ -589,6 +589,7 @@ def run_data_assimilation(
     obs_std=1.1,
     obs_space_freq=2,
     obs_time_freq=1,
+    station_ids=None,
     inflation_factor=4.0,
     friction_type="mannings",
     filename=None,
@@ -705,6 +706,7 @@ def run_data_assimilation(
         obs_space_freq=obs_space_freq,
         obs_time_freq=obs_time_freq,
         final_time=final_time,
+        station_ids=station_ids,
         inflation_factor=inflation_factor,
         print_setup=True,
     )
