@@ -231,7 +231,6 @@ def bayes_cost_function(
         return 1e10
 
     # Compute loss function terms
-    # Includes background and observation components
 
     # Compute Background loss term 0.5 * (u0 - u_b).T @ B_inv @ (u0 - u_b)
     J_b = _background_loss(u0, u_b, B_inv)
@@ -579,7 +578,6 @@ def swe_adjoint(
         comm = MPI.COMM_WORLD
 
     rank = comm.Get_rank()
-    # print(f"[Rank {rank}] Reached checkpoint F", flush=True)
 
     adjoints = solver.saved_adjoints  # List of adjoint matrices (NumPy arrays)
     trajectories = solver.saved_states  # List of forward states

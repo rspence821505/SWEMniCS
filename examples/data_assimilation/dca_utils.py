@@ -98,6 +98,7 @@ def create_problem_solver(
         "verbose": verbose,
         "wd_alpha": 0.36,
         "wd": True,
+        "mag": 0.75,
         "alpha": 2.0 * np.pi / Time.TWELVE_HOURS.seconds,  # 2 cycles per 12 hours
         "h_b_val": 5.3,
     }
@@ -315,95 +316,6 @@ def analyze_error_statistics(
         print("-" * 60)
 
     return results_dict
-
-
-def compute_daily_metrics(
-    true_signal, bayes_analysis, dci_analysis, dci_wme_analysis, result, num_days=7
-):
-    """
-    Compute daily and total RMSE and misfit metrics for multiple analysis methods.
-
-    Parameters
-    ----------
-    true_signal : np.ndarray
-        True signal data, shape (time_steps, spatial_points)
-    bayes_analysis : np.ndarray
-        Bayesian analysis results, same shape as true_signal
-    dci_analysis : np.ndarray
-        DCI analysis results, same shape as true_signal
-    dci_wme_analysis : np.ndarray
-        DCI WME analysis results, same shape as true_signal
-
-    num_days : int, default=7
-        Number of days to analyze
-
-    Returns
-    -------
-    dict
-        Dictionary containing:
-            - 'daily_rmses': Dict with keys 'bayes', 'dci', 'dci_wme' containing daily RMSE lists
-            - 'daily_misfits': Dict with keys 'bayes', 'dci', 'dci_wme' containing daily misfit lists
-            - 'total_rmses': Dict with keys 'bayes', 'dci', 'dci_wme' containing total RMSE values
-            - 'total_misfits': Dict with keys 'bayes', 'dci', 'dci_wme' containing total misfit values
-    """
-    # Calculate time step indices for each day
-    one_day = int(true_signal.shape[0] / num_days)
-
-    # Get day indices (days 1 through num_days-1, plus final day)
-    day_indices = [day * one_day for day in range(1, num_days)]
-    day_indices.append((num_days * one_day) - 1)  # Add final day
-
-    # Initialize metric storage
-    analyses = {
-        "bayes": bayes_analysis,
-        "dci": dci_analysis,
-        "dci_wme": dci_wme_analysis,
-    }
-
-    daily_metrics = {method: {"rmses": [], "misfits": []} for method in analyses.keys()}
-
-    # Compute daily metrics
-    for day_idx in day_indices:
-        true_day = true_signal[day_idx, :]
-
-        for method, analysis in analyses.items():
-            estimate = analysis[day_idx, :]
-
-            # Compute metrics
-            daily_metrics[method]["rmses"].append(rmse(true_day, estimate))
-            daily_metrics[method]["misfits"].append(
-                relative_misfit(true_day, estimate, H=result["H"])
-            )
-
-    # Compute total metrics for entire time series
-    total_metrics = {}
-    for method, analysis in analyses.items():
-        total_metrics[method] = {
-            "rmse": rmse(true_signal, analysis),
-            "misfit": relative_misfit(
-                true_signal, analysis, result["H"], result["obs_time_indices"]
-            ),
-        }
-
-    # Organize results as dictionaries for consistent access
-    return {
-        "daily_rmses": {
-            "bayes": daily_metrics["bayes"]["rmses"],
-            "dci": daily_metrics["dci"]["rmses"],
-            "dci_wme": daily_metrics["dci_wme"]["rmses"],
-        },
-        "daily_misfits": {
-            "bayes": daily_metrics["bayes"]["misfits"],
-            "dci": daily_metrics["dci"]["misfits"],
-            "dci_wme": daily_metrics["dci_wme"]["misfits"],
-        },
-        "total_rmses": {
-            method: metrics["rmse"] for method, metrics in total_metrics.items()
-        },
-        "total_misfits": {
-            method: metrics["misfit"] for method, metrics in total_metrics.items()
-        },
-    }
 
 
 def create_analysis_table(
@@ -644,3 +556,172 @@ def create_plot_triplets(true_signal, analysis_signal, num_days=7):
     plot_triplets.append((true, estimate, diff))
 
     return plot_triplets
+
+
+def compute_daily_metrics(
+    true_signal, bayes_analysis, dci_analysis, dci_wme_analysis, result, num_days=7
+):
+    """
+    Compute daily and total RMSE and misfit metrics for multiple analysis methods.
+
+    Parameters
+    ----------
+    true_signal : np.ndarray
+        True signal data, shape (time_steps, spatial_points)
+    bayes_analysis : np.ndarray
+        Bayesian analysis results, same shape as true_signal
+    dci_analysis : np.ndarray
+        DCI analysis results, same shape as true_signal
+    dci_wme_analysis : np.ndarray
+        DCI WME analysis results, same shape as true_signal
+
+    num_days : int, default=7
+        Number of days to analyze
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+            - 'daily_rmses': Dict with keys 'bayes', 'dci', 'dci_wme' containing daily RMSE lists
+            - 'daily_misfits': Dict with keys 'bayes', 'dci', 'dci_wme' containing daily misfit lists
+            - 'total_rmses': Dict with keys 'bayes', 'dci', 'dci_wme' containing total RMSE values
+            - 'total_misfits': Dict with keys 'bayes', 'dci', 'dci_wme' containing total misfit values
+    """
+    # Calculate time step indices for each day
+    one_day = int(true_signal.shape[0] / num_days)
+
+    # Get day indices (days 1 through num_days-1, plus final day)
+    day_indices = [day * one_day for day in range(1, num_days)]
+    day_indices.append((num_days * one_day) - 1)  # Add final day
+
+    # Initialize metric storage
+    analyses = {
+        "bayes": bayes_analysis,
+        "dci": dci_analysis,
+        "dci_wme": dci_wme_analysis,
+    }
+
+    daily_metrics = {method: {"rmses": [], "misfits": []} for method in analyses.keys()}
+
+    # Compute daily metrics
+    for day_idx in day_indices:
+        true_day = true_signal[day_idx, :]
+
+        for method, analysis in analyses.items():
+            estimate = analysis[day_idx, :]
+
+            # Compute metrics
+            print(
+                f"true_signal.shape: {true_signal.shape}, analysis.shape: {estimate.shape}"
+            )
+            daily_metrics[method]["rmses"].append(rmse(true_day, estimate))
+            daily_metrics[method]["misfits"].append(
+                relative_misfit(true_day, estimate, H=result["H"])
+            )
+
+    # Compute total metrics for entire time series
+    total_metrics = {}
+    for method, analysis in analyses.items():
+        total_metrics[method] = {
+            "rmse": rmse(true_signal, analysis),
+            "misfit": relative_misfit(
+                true_signal, analysis, result["H"], result["obs_time_indices"]
+            ),
+        }
+
+    # Organize results as dictionaries for consistent access
+    return {
+        "daily_rmses": {
+            "bayes": daily_metrics["bayes"]["rmses"],
+            "dci": daily_metrics["dci"]["rmses"],
+            "dci_wme": daily_metrics["dci_wme"]["rmses"],
+        },
+        "daily_misfits": {
+            "bayes": daily_metrics["bayes"]["misfits"],
+            "dci": daily_metrics["dci"]["misfits"],
+            "dci_wme": daily_metrics["dci_wme"]["misfits"],
+        },
+        "total_rmses": {
+            method: metrics["rmse"] for method, metrics in total_metrics.items()
+        },
+        "total_misfits": {
+            method: metrics["misfit"] for method, metrics in total_metrics.items()
+        },
+    }
+
+
+def rescale_background_covariance_to_observation(B_eta, H, R):
+    """
+    Rescales the background covariance matrix B_eta so that its projection
+    onto the observation space matches the scale of the observation error covariance R.
+
+    Parameters
+    ----------
+    B_eta : ndarray (n_state x n_state)
+        Background covariance matrix for η (e.g., from trajectory).
+    H : ndarray (n_obs x n_state)
+        Observation operator matrix (e.g., row selector from identity).
+    R : ndarray (n_obs x n_obs)
+        Observation error covariance matrix (usually diagonal).
+
+    Returns
+    -------
+    B_eta_rescaled : ndarray (n_state x n_state)
+        Rescaled background covariance matrix.
+    scaling_factor : float
+        Factor by which the original B_eta was scaled.
+    """
+    # Project B_eta into observation space
+    B_y = H @ B_eta @ H.T  # shape (n_obs x n_obs)
+
+    # Compute trace of B_y and R
+    trace_B_y = np.trace(B_y)
+    trace_R = np.trace(R)
+
+    # Compute scaling factor
+    scaling_factor = trace_R / trace_B_y if trace_B_y > 0 else 1.0
+
+    # Rescale B_eta
+    B_eta_rescaled = scaling_factor * B_eta
+
+    return B_eta_rescaled, scaling_factor
+
+
+def get_background_covariance(eta_trajectory, sample_freq=1, err2=1.0):
+    """
+    Estimate background covariance matrix from a trajectory of water surface elevation (η).
+
+    Parameters
+    ----------
+    eta_trajectory : ndarray of shape (n_timesteps, n_space_points)
+        Time series of η values from a shallow water model.
+    sample_freq : int
+        Temporal sampling frequency to reduce autocorrelation (e.g., every 10 time steps).
+    err2 : float
+        Target maximum variance for scaling the background covariance.
+
+    Returns
+    -------
+    B : ndarray (n_space_points x n_space_points)
+        Scaled background error covariance matrix.
+    Bcorr : ndarray (n_space_points x n_space_points)
+        Corresponding correlation matrix.
+    """
+    # Subsample the time series to reduce temporal correlation
+    eta_sampled = eta_trajectory[::sample_freq, :]  # shape: (n_samples, n_space_points)
+
+    # Compute correlation matrix
+    Bcorr = np.corrcoef(
+        eta_sampled, rowvar=False
+    )  # shape: (n_space_points, n_space_points)
+
+    # Compute sample covariance matrix
+    B = np.cov(eta_sampled, rowvar=False)  # shape: (n_space_points, n_space_points)
+
+    # Scale covariance matrix so max variance equals err2
+    max_var = np.max(np.diag(B))
+    if max_var > 0:
+        alpha = err2 / max_var
+        B *= alpha
+
+    return B

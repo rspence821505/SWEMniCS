@@ -809,7 +809,7 @@ class CGImplicit(BaseSolver):
         if dry_node_indices is not None:
             V_sub = self.problem.V.sub(0)
             _, sub_map = V_sub.collapse()
-            water_height[dry_node_indices] = 0.0  # Set water depth to zero at dry nodes
+            water_height[dry_node_indices] = 0.0  # Set water depth to zero at dry nodes i.e. eta = -hb
             # water_height[dry_node_indices] = -bathy[dry_node_indices]  # Set water depth to zero at dry nodes
             u_sol[sub_map] = (
                 water_height.copy().flatten()

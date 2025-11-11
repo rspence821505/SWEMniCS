@@ -18,6 +18,235 @@ import seaborn as sns
 sns.set_palette("bright")
 
 
+def plot_mixed_function_dual(
+    msh,
+    V,
+    u_array,
+    component=0,
+    title="Mixed function component",
+    stations_1=None,
+    stations_2=None,
+    station_ids_1=None,
+    station_ids_2=None,
+    cmap="cividis",
+    show_mesh=True,
+    station_style="halo",
+    show_station_labels=False,
+    save_path=None,
+):
+    """
+    Matplotlib-based 2D visualization of a mixed function component from raw array of coefficients,
+    with two side-by-side plots showing different station configurations.
+
+    Parameters:
+    - stations_1: array-like or None, station coordinates for left plot
+    - stations_2: array-like or None, station coordinates for right plot
+    - station_ids_1: array-like or None, station IDs for left plot
+    - station_ids_2: array-like or None, station IDs for right plot
+    - station_style: str, options: 'halo', 'concentric'
+    - show_station_labels: bool, whether to show station labels
+    - save_path: str or None, file path to save the plot (e.g., 'output.png', 'figure.pdf')
+    """
+    coords = msh.geometry.x[:, :2]
+
+    # Collapse mixed space and extract subcomponent
+    V_sub = V.sub(component)
+    V_sub_c, sub_map = V_sub.collapse()
+    u_sub = Function(V_sub_c)
+    u_sub.x.array[:] = u_array[sub_map]
+
+    # Triangle mesh connectivity
+    tdim = msh.topology.dim
+    msh.topology.create_connectivity(tdim, 0)
+    cells = msh.topology.connectivity(tdim, 0).array.reshape(-1, 3)
+
+    # Interpolate function to mesh vertices
+    dof_coords = V_sub_c.tabulate_dof_coordinates()[:, :2]
+    dof_to_vertex_map = np.array(
+        [np.argmin(np.linalg.norm(dof_coords - x, axis=1)) for x in coords]
+    )
+    values_at_vertices = u_sub.x.array[dof_to_vertex_map]
+    triang = Triangulation(coords[:, 0], coords[:, 1], cells)
+
+    # Set up figure with two side-by-side subplots sharing y-axis
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8), sharey=True)
+
+    def plot_on_axis(ax, stations, station_ids, subplot_title, show_ylabel=True):
+        """Helper function to create plot on given axis"""
+        # Main plot
+        tpc = ax.tripcolor(triang, values_at_vertices, shading="gouraud", cmap=cmap)
+        if show_mesh:
+            ax.triplot(triang, color="white", linewidth=0.7, alpha=1.0)
+
+        # Set tick mark label sizes
+        ax.tick_params(axis="both", which="major", labelsize=20)
+        ax.set_xlabel("x", fontsize=22)
+        if show_ylabel:
+            ax.set_ylabel("y", fontsize=22)
+        ax.set_aspect("equal")
+        ax.set_title(subplot_title, fontsize=24, pad=20)
+
+        # Make the mesh fill the entire plot area
+        ax.margins(0)
+        ax.set_xlim(coords[:, 0].min(), coords[:, 0].max())
+        ax.set_ylim(coords[:, 1].min(), coords[:, 1].max())
+
+        # Enhanced Station Visualization
+        if stations is not None:
+            stations = np.asarray(stations)
+            if stations.shape[1] == 3:
+                stations = stations[:, :2]
+
+            # If station_ids is provided, use numbered markers
+            if station_ids is not None:
+                station_ids = np.asarray(station_ids)
+
+                # Plot background circles for the numbers
+                ax.scatter(
+                    stations[:, 0],
+                    stations[:, 1],
+                    s=280,
+                    c="white",
+                    edgecolors="black",
+                    linewidths=1,
+                    alpha=0.9,
+                    zorder=10,
+                )
+
+                # Add the station ID numbers as text
+                for i, (x, y) in enumerate(stations):
+                    ax.text(
+                        x,
+                        y,
+                        str(station_ids[i]),
+                        ha="center",
+                        va="center",
+                        fontsize=12,
+                        fontweight="bold",
+                        color="black",
+                        zorder=11,
+                    )
+
+            elif station_style == "halo":
+                # Halo/Glow Effect (multiple layers)
+                ax.scatter(
+                    stations[:, 0],
+                    stations[:, 1],
+                    s=120,
+                    c="darkgrey",
+                    alpha=0.6,
+                    marker="o",
+                    zorder=10,
+                )  # Outer glow
+                ax.scatter(
+                    stations[:, 0],
+                    stations[:, 1],
+                    s=60,
+                    c="red",
+                    alpha=0.8,
+                    marker="o",
+                    edgecolors="black",
+                    linewidths=1.5,
+                    zorder=11,
+                )  # Main marker
+
+            elif station_style == "concentric":
+                # Multi-ring Concentric Circles
+                ax.scatter(
+                    stations[:, 0],
+                    stations[:, 1],
+                    s=100,
+                    c="none",
+                    edgecolors="red",
+                    linewidths=2.5,
+                    alpha=0.7,
+                    zorder=10,
+                )
+                ax.scatter(
+                    stations[:, 0],
+                    stations[:, 1],
+                    s=55,
+                    c="red",
+                    edgecolors="white",
+                    linewidths=1.5,
+                    zorder=11,
+                )
+                ax.scatter(
+                    stations[:, 0],
+                    stations[:, 1],
+                    s=20,
+                    c="white",
+                    edgecolors="black",
+                    linewidths=1,
+                    zorder=12,
+                )
+
+            else:
+                # Default: simple red circles
+                ax.scatter(
+                    stations[:, 0],
+                    stations[:, 1],
+                    s=80,
+                    c="red",
+                    marker="o",
+                    edgecolors="black",
+                    linewidths=2,
+                    zorder=10,
+                )
+
+            # Text Labels with Halos (if requested and not using station_ids)
+            if show_station_labels and station_ids is None:
+                for i, (x, y) in enumerate(stations):
+                    ax.text(
+                        x,
+                        y + 0.05,
+                        f"S{i+1}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=10,
+                        fontweight="bold",
+                        color="white",
+                        path_effects=[
+                            path_effects.withStroke(linewidth=3, foreground="black")
+                        ],
+                        zorder=12,
+                    )
+
+        return tpc
+
+    # Create both plots
+    tpc1 = plot_on_axis(ax1, stations_1, station_ids_1, "(A)", show_ylabel=True)
+    tpc2 = plot_on_axis(ax2, stations_2, station_ids_2, "(B)", show_ylabel=False)
+
+    # Add colorbar matching mesh height
+    # Calculate mesh extent in figure coordinates
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+    mesh_height = y_max - y_min
+
+    # Get the plot area position to align colorbar with mesh
+    pos1 = ax1.get_position()
+    pos2 = ax2.get_position()
+
+    # Calculate colorbar position to match mesh height
+    plot_bottom = pos1.y0
+    plot_height = pos1.height
+
+    # Position colorbar to match mesh within the plot area
+    cbar_ax = fig.add_axes([0.92, plot_bottom - 0.035, 0.02, plot_height + 0.06])
+    cbar = fig.colorbar(tpc1, cax=cbar_ax)
+    cbar.set_label("Height (m)", fontsize=20, labelpad=10)
+
+    # Adjust spacing between subplots
+    plt.subplots_adjust(left=0.05, right=0.9, wspace=0.1)
+
+    # Save plot if path provided
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Plot saved to: {save_path}")
+
+    plt.show()
+
+
 def plot_mixed_function(
     msh,
     V,

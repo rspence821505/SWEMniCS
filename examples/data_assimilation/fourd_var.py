@@ -45,24 +45,6 @@ def print_optimization_summary(result: OptimizeResult) -> None:
     tqdm.write("\n" + "-" * 60 + "\n")
 
 
-# def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) -> None:
-#     """
-#     Print a summary of the initial and optimized state vectors.
-
-#     Parameters
-#     ----------
-#     u0 : np.ndarray
-#         Initial guess for the state vector.
-#     result : OptimizeResult
-#         Result object returned by `scipy.optimize.minimize`.
-#     step : int, optional
-#         Step size for subsampling the state vector when printing. Default is 20.
-#     """
-#     tqdm.write("State comparison (subsampled):")
-#     tqdm.write(f"  Initial state (every {step}th entry):   {u0[::step]}\n")
-#     tqdm.write(f"  Optimized state (every {step}th entry): {result.x[::step]}\n")
-
-
 def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) -> None:
     """
     Print a comprehensive summary comparing initial and optimized state vectors.
@@ -85,8 +67,6 @@ def print_state_summary(u0: np.ndarray, result: OptimizeResult, step: int = 40) 
     tqdm.write("=== STATE OPTIMIZATION SUMMARY ===")
 
     # Overall statistics
-    # tqdm.write(f"Array length: {len(u0)}")
-
     # Difference statistics
     tqdm.write(f"\n--- DIFFERENCE STATISTICS ---")
     tqdm.write(f"Max absolute change: {np.max(np.abs(abs_diff)):.6e}")
@@ -311,83 +291,6 @@ def run_assimilation(
 
     # Combine all windows
     return np.concatenate(analysis, axis=0), np.concatenate(bathy, axis=0)
-
-
-def get_background_covariance(eta_trajectory, sample_freq=1, err2=1.0):
-    """
-    Estimate background covariance matrix from a trajectory of water surface elevation (η).
-
-    Parameters
-    ----------
-    eta_trajectory : ndarray of shape (n_timesteps, n_space_points)
-        Time series of η values from a shallow water model.
-    sample_freq : int
-        Temporal sampling frequency to reduce autocorrelation (e.g., every 10 time steps).
-    err2 : float
-        Target maximum variance for scaling the background covariance.
-
-    Returns
-    -------
-    B : ndarray (n_space_points x n_space_points)
-        Scaled background error covariance matrix.
-    Bcorr : ndarray (n_space_points x n_space_points)
-        Corresponding correlation matrix.
-    """
-    # Subsample the time series to reduce temporal correlation
-    eta_sampled = eta_trajectory[::sample_freq, :]  # shape: (n_samples, n_space_points)
-
-    # Compute correlation matrix
-    Bcorr = np.corrcoef(
-        eta_sampled, rowvar=False
-    )  # shape: (n_space_points, n_space_points)
-
-    # Compute sample covariance matrix
-    B = np.cov(eta_sampled, rowvar=False)  # shape: (n_space_points, n_space_points)
-
-    # Scale covariance matrix so max variance equals err2
-    max_var = np.max(np.diag(B))
-    if max_var > 0:
-        alpha = err2 / max_var
-        B *= alpha
-
-    return B
-
-
-def rescale_background_covariance_to_observation(B_eta, H, R):
-    """
-    Rescales the background covariance matrix B_eta so that its projection
-    onto the observation space matches the scale of the observation error covariance R.
-
-    Parameters
-    ----------
-    B_eta : ndarray (n_state x n_state)
-        Background covariance matrix for η (e.g., from trajectory).
-    H : ndarray (n_obs x n_state)
-        Observation operator matrix (e.g., row selector from identity).
-    R : ndarray (n_obs x n_obs)
-        Observation error covariance matrix (usually diagonal).
-
-    Returns
-    -------
-    B_eta_rescaled : ndarray (n_state x n_state)
-        Rescaled background covariance matrix.
-    scaling_factor : float
-        Factor by which the original B_eta was scaled.
-    """
-    # Project B_eta into observation space
-    B_y = H @ B_eta @ H.T  # shape (n_obs x n_obs)
-
-    # Compute trace of B_y and R
-    trace_B_y = np.trace(B_y)
-    trace_R = np.trace(R)
-
-    # Compute scaling factor
-    scaling_factor = trace_R / trace_B_y if trace_B_y > 0 else 1.0
-
-    # Rescale B_eta
-    B_eta_rescaled = scaling_factor * B_eta
-
-    return B_eta_rescaled, scaling_factor
 
 
 def setup_data_assimilation(
@@ -750,6 +653,7 @@ def run_data_assimilation(
 
         # Save to pickle file
         save_pickle(filename, dci_analysis)
+        filename = None
 
         analyses["dci"] = dci_analysis
         print("DCI analysis completed and saved.")
@@ -773,6 +677,7 @@ def run_data_assimilation(
             filename = "dci_wme_analysis.pkl"
         # Save to pickle file
         save_pickle(filename, dci_wme_analysis)
+        filename = None
 
         analyses["dci_wme"] = dci_wme_analysis
         print("DCI-WME analysis completed and saved.")
@@ -796,6 +701,7 @@ def run_data_assimilation(
             filename = "bayes_analysis.pkl"
         # Save to pickle file
         save_pickle(filename, bayes_analysis)
+        filename = None
 
         analyses["bayes"] = bayes_analysis
         print("Bayes analysis completed and saved.")
