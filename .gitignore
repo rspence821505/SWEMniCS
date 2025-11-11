@@ -56,3 +56,9 @@ MANIFEST
 *.bp
 *.png
 *.csv
+ 
+*.pkl
+*.h5
+*hdf5
+
+refactoring_docs/
