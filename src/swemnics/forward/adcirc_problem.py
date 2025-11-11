@@ -4,7 +4,7 @@ Classes for testcases arising from ADCIRC input files.
 Specifically, these classes enable tidal potential forcing, reading boundary conditions from a file, and reading the binary files produced by ADCIRC_2_FENICS.py.
 """
 
-from swemnics import problems as Problems
+from swemnics.forward import problems as Problems
 from mpi4py import MPI
 from dataclasses import dataclass
 import adios4dolfinx
@@ -13,10 +13,10 @@ import dolfinx.plot
 import numpy as np
 import ufl
 from petsc4py.PETSc import ScalarType
-from swemnics.boundarycondition import BoundaryCondition
+from swemnics.physics.boundarycondition import BoundaryCondition
 import json
 from scipy.spatial import KDTree
-from swemnics.constants import R, earth_elasticity, g
+from swemnics.physics.constants import R, earth_elasticity, g
 import os
 
 
@@ -345,7 +345,9 @@ class ADCIRCProblem(Problems.TidalProblem):
         self.dof_open = self._boundary_conditions[0].dofs
         self.ux_dofs_closed = np.array([])
         self.uy_dofs_closed = np.array([])
-        self._dirichlet_bcs = []  # [bc._bc for bc in self.boundary_conditions if bc.type == "Open"]
+        self._dirichlet_bcs = (
+            []
+        )  # [bc._bc for bc in self.boundary_conditions if bc.type == "Open"]
 
     def evaluate_tidal_boundary(self, t):
         return self.boundaries.evaluate_tidal_boundary(t) + self.sea_surface_height

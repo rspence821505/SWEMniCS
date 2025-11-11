@@ -4,7 +4,7 @@ Currently only OceanWeather-esque (gridded) forcing is supported, and must be pr
 """
 
 from dolfinx import fem as fe
-from swemnics.constants import R
+from swemnics.physics.constants import R
 import numpy as np
 
 

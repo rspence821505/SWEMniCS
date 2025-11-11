@@ -150,6 +150,26 @@ class CovarianceMatrix(ABC):
         C_inv_v.destroy()
         return result
 
+    def inner_product(
+        self, v1: PETSc.Vec, v2: PETSc.Vec, inverse: bool = False
+    ) -> float:
+        """
+        Compute C-weighted inner product: ⟨v1, C·v2⟩ or ⟨v1, C⁻¹·v2⟩.
+
+        Args:
+            v1: First vector
+            v2: Second vector
+            inverse: If True, use C⁻¹ instead of C
+
+        Returns:
+            Weighted inner product
+        """
+        if inverse:
+            Cv2 = self.apply_inverse(v2)
+        else:
+            Cv2 = self.apply(v2)
+        return v1.dot(Cv2)
+
     def create_vec(self) -> PETSc.Vec:
         """Create a compatible PETSc vector.
 
@@ -573,6 +593,484 @@ class ImplicitCovariance(CovarianceMatrix):
             self.precision_mat.destroy()
 
 
+"""
+Covariance matrix representations for 4D-Var.
+
+Implements various covariance structures (diagonal, full, implicit)
+with efficient inverse operations needed for cost function computation.
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional
+import numpy as np
+from petsc4py import PETSc
+from mpi4py import MPI
+
+
+class CovarianceMatrix(ABC):
+    """
+    Abstract base class for covariance matrices.
+
+    Provides interface for covariance operations:
+    - C·v: Apply covariance
+    - C⁻¹·v: Apply inverse covariance
+    - sqrt(C)·v: Apply square root (for sampling)
+    """
+
+    def __init__(self, size: int, comm: MPI.Comm = None):
+        """
+        Initialize covariance matrix.
+
+        Args:
+            size: Dimension of covariance matrix
+            comm: MPI communicator
+        """
+        self.size = size
+        self.comm = comm or MPI.COMM_WORLD
+
+    @abstractmethod
+    def apply(self, v: PETSc.Vec) -> PETSc.Vec:
+        """
+        Apply covariance: w = C·v.
+
+        Args:
+            v: Input vector
+
+        Returns:
+            C·v
+        """
+        pass
+
+    @abstractmethod
+    def apply_inverse(self, v: PETSc.Vec) -> PETSc.Vec:
+        """
+        Apply inverse covariance: w = C⁻¹·v.
+
+        Args:
+            v: Input vector
+
+        Returns:
+            C⁻¹·v
+        """
+        pass
+
+    def apply_sqrt(self, v: PETSc.Vec) -> PETSc.Vec:
+        """
+        Apply square root: w = sqrt(C)·v.
+
+        Args:
+            v: Input vector
+
+        Returns:
+            sqrt(C)·v
+        """
+        raise NotImplementedError("Square root not implemented")
+
+    def inner_product(
+        self, v1: PETSc.Vec, v2: PETSc.Vec, inverse: bool = False
+    ) -> float:
+        """
+        Compute C-weighted inner product: ⟨v1, C·v2⟩ or ⟨v1, C⁻¹·v2⟩.
+
+        Args:
+            v1: First vector
+            v2: Second vector
+            inverse: If True, use C⁻¹ instead of C
+
+        Returns:
+            Weighted inner product
+        """
+        if inverse:
+            Cv2 = self.apply_inverse(v2)
+        else:
+            Cv2 = self.apply(v2)
+        return v1.dot(Cv2)
+
+
+class DiagonalCovariance(CovarianceMatrix):
+    """
+    Diagonal covariance matrix.
+
+    C = diag(σ₁², σ₂², ..., σₙ²)
+
+    Most efficient representation for uncorrelated errors.
+    """
+
+    def __init__(self, variances: PETSc.Vec, comm: MPI.Comm = None):
+        """
+        Initialize diagonal covariance.
+
+        Args:
+            variances: Vector of variances σᵢ²
+            comm: MPI communicator
+        """
+        super().__init__(variances.size, comm)
+        self.variances = variances.copy()
+
+        # Precompute inverse
+        self.inv_variances = variances.copy()
+        self.inv_variances.reciprocal()
+
+    def apply(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Multiply by diagonal: w = diag(σ²)·v."""
+        w = v.copy()
+        w.pointwiseMult(v, self.variances)
+        return w
+
+    def apply_inverse(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Multiply by inverse diagonal: w = diag(1/σ²)·v."""
+        w = v.copy()
+        w.pointwiseMult(v, self.inv_variances)
+        return w
+
+    def apply_sqrt(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Multiply by sqrt(diag): w = diag(σ)·v."""
+        sqrt_var = self.variances.copy()
+        sqrt_var.sqrtabs()
+        w = v.copy()
+        w.pointwiseMult(v, sqrt_var)
+        return w
+
+
+class FullCovariance(CovarianceMatrix):
+    """
+    Full covariance matrix with explicit storage.
+
+    Stores C as PETSc.Mat and uses KSP for inverse operations.
+    """
+
+    def __init__(self, matrix: PETSc.Mat, comm: MPI.Comm = None):
+        """
+        Initialize full covariance.
+
+        Args:
+            matrix: Covariance matrix (must be SPD)
+            comm: MPI communicator
+        """
+        super().__init__(matrix.size[0], comm)
+        self.matrix = matrix
+
+        # KSP solver for inverse operations
+        self.ksp = PETSc.KSP().create(comm=self.comm)
+        self.ksp.setOperators(self.matrix)
+        self.ksp.setType(PETSc.KSP.Type.CG)
+        self.ksp.getPC().setType(PETSc.PC.Type.JACOBI)
+
+    def apply(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Matrix-vector product: w = C·v."""
+        w = v.duplicate()
+        self.matrix.mult(v, w)
+        return w
+
+    def apply_inverse(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Solve linear system: w = C⁻¹·v."""
+        w = v.duplicate()
+        self.ksp.solve(v, w)
+        return w
+
+
+class ImplicitCovariance(CovarianceMatrix):
+    """
+    Implicit covariance via operator.
+
+    Defines C through an operator (e.g., differential operator)
+    without explicit matrix storage.
+
+    Example: C = (I - α∇²)⁻¹ (Matérn covariance)
+    """
+
+    def __init__(self, operator, inverse_operator, size: int, comm: MPI.Comm = None):
+        """
+        Initialize implicit covariance.
+
+        Args:
+            operator: Callable that applies C
+            inverse_operator: Callable that applies C⁻¹
+            size: Dimension
+            comm: MPI communicator
+        """
+        super().__init__(size, comm)
+        self._operator = operator
+        self._inverse_operator = inverse_operator
+
+    def apply(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Apply operator."""
+        return self._operator(v)
+
+    def apply_inverse(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Apply inverse operator."""
+        return self._inverse_operator(v)
+
+
+class MaternCovariance(ImplicitCovariance):
+    """
+    Matérn covariance via SPDE approach.
+
+    C = (κ² - ∇²)⁻ᵛ
+
+    Implements efficient sampling and inverse via FEM.
+    """
+
+    def __init__(
+        self,
+        function_space,
+        correlation_length: float,
+        variance: float = 1.0,
+        nu: float = 1.5,
+        comm: MPI.Comm = None,
+    ):
+        """
+        Initialize Matérn covariance.
+
+        Args:
+            function_space: FEniCSx function space
+            correlation_length: Correlation length ℓ
+            variance: Marginal variance σ²
+            nu: Smoothness parameter
+            comm: MPI communicator
+        """
+        self.V = function_space
+        self.ell = correlation_length
+        self.sigma2 = variance
+        self.nu = nu
+
+        # Build differential operator (κ² - ∇²)
+        self._build_spde_operator()
+
+        # Initialize base class with operators
+        super().__init__(
+            operator=self._apply_covariance,
+            inverse_operator=self._apply_precision,
+            size=function_space.dofmap.index_map.size_global,
+            comm=comm,
+        )
+
+    def _build_spde_operator(self):
+        """
+        Build SPDE operator matrices.
+
+        Assembles M (mass) and K (stiffness) matrices for
+        (κ²M + K)u = f  ⟺  u = C·f
+        """
+        from dolfinx import fem
+        from dolfinx.fem.petsc import assemble_matrix
+        import ufl
+
+        # κ = sqrt(8*nu) / ell for Matérn covariance
+        kappa = np.sqrt(8.0 * self.nu) / self.ell
+
+        # Define trial and test functions
+        u = ufl.TrialFunction(self.V)
+        v = ufl.TestFunction(self.V)
+
+        # Assemble mass matrix M: ∫ u·v dx
+        mass_form = fem.form(ufl.inner(u, v) * ufl.dx)
+        self.M = assemble_matrix(mass_form)
+        self.M.assemble()
+
+        # Assemble stiffness matrix K: ∫ ∇u·∇v dx
+        stiffness_form = fem.form(ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx)
+        self.K = assemble_matrix(stiffness_form)
+        self.K.assemble()
+
+        # Build operator matrix: L = κ²M + K
+        self.L = self.M.copy()
+        self.L.scale(kappa**2)
+        self.L.axpy(1.0, self.K)  # L = κ²M + K
+        self.L.assemble()
+
+        # Create KSP solver for applying covariance (solving L·u = M·v)
+        self.ksp_cov = PETSc.KSP().create(comm=self.comm)
+        self.ksp_cov.setOperators(self.L)
+        self.ksp_cov.setType(PETSc.KSP.Type.CG)
+        pc = self.ksp_cov.getPC()
+        pc.setType(PETSc.PC.Type.HYPRE)
+        self.ksp_cov.setUp()
+
+    def _apply_covariance(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Solve (κ²M + K)u = M·v to apply C."""
+        # Create RHS: b = M·v
+        b = v.duplicate()
+        self.M.mult(v, b)
+
+        # Solve L·u = b where L = κ²M + K
+        u = v.duplicate()
+        self.ksp_cov.solve(b, u)
+
+        if self.ksp_cov.getConvergedReason() < 0:
+            raise RuntimeError(
+                f"Matérn covariance solve failed: {self.ksp_cov.getConvergedReason()}"
+            )
+
+        b.destroy()
+        return u
+
+    def _apply_precision(self, v: PETSc.Vec) -> PETSc.Vec:
+        """Apply precision Q = C⁻¹ via (κ²M + K)·M⁻¹."""
+        # For Matérn: Q = C⁻¹ = (κ²M + K)·M⁻¹
+        # So Q·v = (κ²M + K)·(M⁻¹·v)
+        # We approximate M⁻¹ by solving M·w = v
+
+        # Step 1: Solve M·w = v for w
+        w = v.duplicate()
+        ksp_mass = PETSc.KSP().create(comm=self.comm)
+        ksp_mass.setOperators(self.M)
+        ksp_mass.setType(PETSc.KSP.Type.CG)
+        ksp_mass.getPC().setType(PETSc.PC.Type.JACOBI)
+        ksp_mass.solve(v, w)
+
+        if ksp_mass.getConvergedReason() < 0:
+            raise RuntimeError(
+                f"Mass matrix solve failed: {ksp_mass.getConvergedReason()}"
+            )
+
+        # Step 2: Apply L·w = (κ²M + K)·w
+        result = v.duplicate()
+        self.L.mult(w, result)
+
+        # Clean up
+        w.destroy()
+        ksp_mass.destroy()
+
+        return result
+
+    def apply_sqrt(self, v: PETSc.Vec) -> PETSc.Vec:
+        """
+        Sample from Matérn field: u = sqrt(C)·ξ where ξ ~ N(0,I).
+
+        Solves (κ²M + K)u = M^{1/2}·ξ
+        """
+        # For Matérn covariance: C = (κ²M + K)⁻¹
+        # We need C^{1/2}·v
+        # Using the rational approximation or by solving:
+        # (κ²M + K)·u = M^{1/2}·v
+
+        # First, approximate M^{1/2}·v by lumped mass matrix approach
+        # For simplicity, we use diagonal scaling based on mass matrix diagonal
+        mass_diag = self.M.getDiagonal()
+        mass_sqrt = mass_diag.duplicate()
+        mass_diag.copy(mass_sqrt)
+        mass_sqrt.sqrtabs()  # Element-wise sqrt
+
+        # Compute b = M^{1/2}·v (approximate)
+        b = v.duplicate()
+        b.pointwiseMult(mass_sqrt, v)
+
+        # Solve (κ²M + K)·u = b
+        u = v.duplicate()
+        self.ksp_cov.solve(b, u)
+
+        if self.ksp_cov.getConvergedReason() < 0:
+            raise RuntimeError(
+                f"Matérn sqrt sampling failed: {self.ksp_cov.getConvergedReason()}"
+            )
+
+        # Clean up
+        mass_diag.destroy()
+        mass_sqrt.destroy()
+        b.destroy()
+
+        return u
+
+
+class BlockDiagonalCovariance(CovarianceMatrix):
+    """
+    Block diagonal covariance for mixed function spaces.
+
+    C = diag(C₁, C₂, ..., Cₙ)
+
+    Useful for (H, u, v) systems where each component
+    has independent covariance structure.
+    """
+
+    def __init__(self, blocks: list[CovarianceMatrix], comm: MPI.Comm = None):
+        """
+        Initialize block diagonal covariance.
+
+        Args:
+            blocks: List of covariance matrices for each block
+            comm: MPI communicator
+        """
+        total_size = sum(block.size for block in blocks)
+        super().__init__(total_size, comm)
+        self.blocks = blocks
+
+        # Block offsets
+        self.offsets = [0]
+        for block in blocks:
+            self.offsets.append(self.offsets[-1] + block.size)
+
+    def apply(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """Apply each block independently."""
+        if out is None:
+            out = self.create_vec()
+
+        # Get arrays for input and output
+        v_array = v.getArray()
+        out_array = out.getArray()
+
+        # Apply each block covariance to its corresponding sub-vector
+        for i, block in enumerate(self.blocks):
+            start = self.offsets[i]
+            end = self.offsets[i + 1]
+
+            # Extract sub-vector for this block
+            v_sub = block.create_vec()
+            v_sub.setArray(v_array[start:end])
+
+            # Apply block covariance
+            out_sub = block.apply(v_sub)
+
+            # Copy result back to output
+            out_array[start:end] = out_sub.getArray()
+
+            # Clean up
+            v_sub.destroy()
+            out_sub.destroy()
+
+        # Restore arrays
+        v.restoreArray(v_array)
+        out.restoreArray(out_array)
+        out.assemble()
+
+        return out
+
+    def apply_inverse(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """Apply inverse of each block independently."""
+        if out is None:
+            out = self.create_vec()
+
+        # Get arrays for input and output
+        v_array = v.getArray()
+        out_array = out.getArray()
+
+        # Apply inverse of each block covariance to its corresponding sub-vector
+        for i, block in enumerate(self.blocks):
+            start = self.offsets[i]
+            end = self.offsets[i + 1]
+
+            # Extract sub-vector for this block
+            v_sub = block.create_vec()
+            v_sub.setArray(v_array[start:end])
+
+            # Apply block inverse covariance
+            out_sub = block.apply_inverse(v_sub)
+
+            # Copy result back to output
+            out_array[start:end] = out_sub.getArray()
+
+            # Clean up
+            v_sub.destroy()
+            out_sub.destroy()
+
+        # Restore arrays
+        v.restoreArray(v_array)
+        out.restoreArray(out_array)
+        out.assemble()
+
+        return out
+
+
 # Utility functions for constructing common covariance types
 
 
@@ -741,7 +1239,11 @@ def check_inverse_consistency(C: CovarianceMatrix, tol: float = 1e-8) -> bool:
     v.destroy()
 
     return error / v_norm < tol
-def _gather_vec_to_root(vec: PETSc.Vec, comm: MPI.Comm, root: int = 0) -> Optional[np.ndarray]:
+
+
+def _gather_vec_to_root(
+    vec: PETSc.Vec, comm: MPI.Comm, root: int = 0
+) -> Optional[np.ndarray]:
     """Gather a distributed PETSc Vec onto the root rank as a flat numpy array."""
 
     start, end = vec.getOwnershipRange()

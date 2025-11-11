@@ -26,10 +26,10 @@ except ImportError:
     import basix
 
 from petsc4py.PETSc import ScalarType
-from swemnics.boundarycondition import BoundaryCondition, MarkBoundary
+from swemnics.physics.boundarycondition import BoundaryCondition, MarkBoundary
 from dataclasses import dataclass
-from swemnics.constants import g, R, omega, p_water, p_air
-from swemnics.forcing import GriddedForcing
+from swemnics.physics.constants import g, R, omega, p_water, p_air
+from swemnics.physics.forcing import GriddedForcing
 import scipy
 from enum import Enum
 import sys

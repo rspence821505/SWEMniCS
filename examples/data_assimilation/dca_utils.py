@@ -2,8 +2,8 @@ import os
 import numpy as np
 import pandas as pd
 from mpi4py import MPI
-from swemnics.problems import SlopedBeachProblem
-from swemnics import solvers as Solvers
+from swemnics.forward.problems import SlopedBeachProblem
+from swemnics.forward import solvers as Solvers
 from data_io import save_pickle, load_pickle
 from metrics import rmse, relative_misfit
 from collections import defaultdict

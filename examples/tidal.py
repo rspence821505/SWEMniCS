@@ -5,9 +5,9 @@
 
 
 import argparse
-from swemnics.problems import TidalProblem
-from swemnics.solvers import get_solver
-from swemnics import solvers as Solvers
+from swemnics.forward.problems import TidalProblem
+from swemnics.forward.solvers import get_solver
+from swemnics.forward import solvers as Solvers
 
 # from swemnics import FrictionLaw
 import numpy as np

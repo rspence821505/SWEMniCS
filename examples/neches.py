@@ -1,8 +1,8 @@
-from swemnics import solvers as Solvers
-from swemnics.adcirc_problem import ADCIRCProblem
+from swemnics.forward import solvers as Solvers
+from swemnics.forward.adcirc_problem import ADCIRCProblem
 from mpi4py import MPI
 import numpy as np
-from swemnics.constants import R
+from swemnics.physics.constants import R
 import time
 import argparse as ap
 

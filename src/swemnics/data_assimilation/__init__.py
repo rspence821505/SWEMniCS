@@ -41,3 +41,77 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
+"""Data assimilation utilities for SWEMniCS.
+
+This package contains covariance models, cost functions, observation
+operators, QoI maps, and diagnostic metrics used by the 4D-Var and
+Data-Consistent assimilation workflows.  The most commonly used symbols
+are re-exported here for easy access via ``swemnics.data_assimilation``.
+"""
+
+from __future__ import annotations
+
+from .covariance import (
+    CovarianceMatrix,
+    DiagonalCovariance,
+    DenseCovariance,
+    ImplicitCovariance,
+    create_observation_covariance,
+    create_background_covariance_from_ensemble,
+    check_covariance_symmetry,
+    check_inverse_consistency,
+)
+from .cost_functions import (
+    CostFunction,
+    FourDVarCost,
+    DCFourDVarCost,
+)
+from .observation_operator import (
+    ObservationOperator,
+    PointObservationOperator,
+    IntegralObservationOperator,
+    CompositeObservationOperator,
+)
+from .qoi_maps import (
+    QoIMap,
+    LinearizedQoI,
+    StandardQoI,
+    LinearizedStandardQoI,
+    WeightedMeanErrorQoI,
+    LinearizedWMEQoI,
+)
+from .metrics import (
+    DAMetrics,
+    CostFunctionHistory,
+)
+
+__all__ = [
+    # Covariance utilities
+    "CovarianceMatrix",
+    "DiagonalCovariance",
+    "DenseCovariance",
+    "ImplicitCovariance",
+    "create_observation_covariance",
+    "create_background_covariance_from_ensemble",
+    "check_covariance_symmetry",
+    "check_inverse_consistency",
+    # Cost functions
+    "CostFunction",
+    "FourDVarCost",
+    "DCFourDVarCost",
+    # Observation operators
+    "ObservationOperator",
+    "PointObservationOperator",
+    "IntegralObservationOperator",
+    "CompositeObservationOperator",
+    # QoI maps
+    "QoIMap",
+    "LinearizedQoI",
+    "StandardQoI",
+    "LinearizedStandardQoI",
+    "WeightedMeanErrorQoI",
+    "LinearizedWMEQoI",
+    # Metrics
+    "DAMetrics",
+    "CostFunctionHistory",
+]
