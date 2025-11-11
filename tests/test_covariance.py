@@ -19,9 +19,8 @@ from mpi4py import MPI
 import sys
 from typing import Optional
 
-sys.path.insert(0, "/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src")
 
-from covariance import (
+from swemnics.data_assimilation.covariance import (
     DiagonalCovariance,
     DenseCovariance,
     ImplicitCovariance,

@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 from petsc4py import PETSc
 from mpi4py import MPI
-from typing import Optional, Union
+from typing import Optional, Union, List
 import scipy.sparse as sp
 
 
@@ -635,15 +635,21 @@ def create_background_covariance_from_ensemble(
     size = ensemble[0].getSize()
 
     # Gather ensemble to rank 0
-    ensemble_array = np.zeros((n_ensemble, size))
-    for i, member in enumerate(ensemble):
-        ensemble_array[i, :] = member.getArray()
+    ensemble_array = None
+    cov = None
+    if comm.rank == 0:
+        ensemble_array = np.zeros((n_ensemble, size))
 
-    # Compute sample covariance (on all ranks to avoid broadcast)
-    mean = np.mean(ensemble_array, axis=0)
-    centered = ensemble_array - mean[np.newaxis, :]
-    cov = (centered.T @ centered) / (n_ensemble - 1)
-    cov *= inflation_factor
+    for i, member in enumerate(ensemble):
+        full_vec = _gather_vec_to_root(member, comm)
+        if comm.rank == 0 and full_vec is not None:
+            ensemble_array[i, :] = full_vec
+
+    if comm.rank == 0:
+        mean = np.mean(ensemble_array, axis=0)
+        centered = ensemble_array - mean[np.newaxis, :]
+        cov = (centered.T @ centered) / (n_ensemble - 1)
+        cov *= inflation_factor
 
     # Create PETSc Mat
     mat = PETSc.Mat().create(comm=comm)
@@ -651,7 +657,7 @@ def create_background_covariance_from_ensemble(
     mat.setType(PETSc.Mat.Type.AIJ)
     mat.setUp()
 
-    if comm.rank == 0:
+    if comm.rank == 0 and cov is not None:
         for i in range(size):
             mat.setValues(i, list(range(size)), cov[i, :])
 
@@ -735,3 +741,22 @@ def check_inverse_consistency(C: CovarianceMatrix, tol: float = 1e-8) -> bool:
     v.destroy()
 
     return error / v_norm < tol
+def _gather_vec_to_root(vec: PETSc.Vec, comm: MPI.Comm, root: int = 0) -> Optional[np.ndarray]:
+    """Gather a distributed PETSc Vec onto the root rank as a flat numpy array."""
+
+    start, end = vec.getOwnershipRange()
+    local = vec.getArray().copy()
+    local_sizes = comm.gather(end - start, root=root)
+    local_arrays = comm.gather(local, root=root)
+
+    if comm.rank != root:
+        return None
+
+    total = sum(local_sizes)
+    dtype = local.dtype if local.size else float
+    full = np.empty(total, dtype=dtype)
+    offset = 0
+    for chunk, size in zip(local_arrays, local_sizes):
+        full[offset : offset + size] = chunk
+        offset += size
+    return full

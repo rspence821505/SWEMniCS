@@ -8,10 +8,10 @@ import numpy as np
 from petsc4py import PETSc
 from mpi4py import MPI
 import sys
+from typing import Optional
 
-sys.path.insert(0, "/home/claude")
 
-from covariance import (
+from swemnics.data_assimilation.covariance import (
     DiagonalCovariance,
     DenseCovariance,
     ImplicitCovariance,
@@ -20,6 +20,22 @@ from covariance import (
     check_covariance_symmetry,
     check_inverse_consistency,
 )
+
+
+def _set_vec_from_global(vec: PETSc.Vec, global_values: np.ndarray) -> None:
+    """Fill a distributed PETSc Vec with the global numpy array."""
+    start, end = vec.getOwnershipRange()
+    vec.setArray(np.array(global_values[start:end], dtype=float, copy=True))
+    vec.assemble()
+
+
+def _gather_vec(vec: PETSc.Vec, comm: MPI.Comm) -> Optional[np.ndarray]:
+    """Gather a distributed PETSc Vec onto rank 0."""
+    local = vec.getArray()
+    gathered = comm.gather(local.copy(), root=0)
+    if comm.rank == 0:
+        return np.concatenate(gathered)
+    return None
 
 
 def example_observation_covariance():
@@ -117,26 +133,21 @@ def example_background_covariance_correlated():
     print(f"Correlation length scale: {length_scale}")
 
     # Check correlation structure
-    v1 = B.create_vec()
-    v2 = B.create_vec()
-
     # Set v1 as impulse at center
-    if comm.rank == 0:
-        impulse = np.zeros(n_dofs)
-        impulse[n_dofs // 2] = 1.0
-        v1.setArray(impulse)
-    v1.assemble()
+    impulse = np.zeros(n_dofs)
+    impulse[n_dofs // 2] = 1.0
+    v1 = B.create_vec()
+    _set_vec_from_global(v1, impulse)
 
     # Apply covariance to see correlation structure
     Bv1 = B.apply(v1)
 
-    if comm.rank == 0:
-        correlation_structure = Bv1.getArray()
+    correlation_structure = _gather_vec(Bv1, comm)
+    if comm.rank == 0 and correlation_structure is not None:
         print(f"Correlation at center: {correlation_structure[n_dofs//2]:.3f}")
         print(f"Correlation 2 points away: {correlation_structure[n_dofs//2 + 2]:.3f}")
 
     v1.destroy()
-    v2.destroy()
     Bv1.destroy()
 
 
@@ -275,8 +286,11 @@ def example_ensemble_covariance():
         if comm.rank == 0:
             mean = np.sin(np.linspace(0, 2 * np.pi, n_state))
             perturbation = np.random.randn(n_state) * 0.3
-            member.setArray(mean + perturbation)
-        member.assemble()
+            values = mean + perturbation
+        else:
+            values = None
+        values = comm.bcast(values, root=0)
+        _set_vec_from_global(member, values)
 
         ensemble.append(member)
 
