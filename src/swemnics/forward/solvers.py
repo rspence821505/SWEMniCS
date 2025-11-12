@@ -12,7 +12,7 @@ try:
     from dolfinx.fem import functionspace
 except ImportError:
     from dolfinx.fem import FunctionSpace as functionspace
-from ufl.finiteelement import AbstractFiniteElement
+
 from ufl import (
     TestFunction,
     TrialFunction,
@@ -34,212 +34,21 @@ from ufl import (
     TestFunctions,
 )
 
-
 from mpi4py import MPI
 from petsc4py import PETSc
 import numpy as np
 from swemnics.forward.newton import CustomNewtonProblem
 from swemnics.physics.constants import g, R
 
-try:
-    import pyvista
-    import dolfinx.plot
-
-    have_pyvista = True
-except ImportError:
-    have_pyvista = False
+# Import refactored modules
+from swemnics.utils.fem_utilities import create_element, create_mixed_element
+from swemnics.utils.solver_storage import SolverStateStorage
+from swemnics.utils.timestep_manager import TimeStepDataManager
+from swemnics.utils.observation_stations import StationManager
+from swemnics.utils.visualization import SolverVisualizer
 
 from petsc4py.PETSc import ScalarType
 from typing import Literal, Optional, Sequence
-
-
-# NOTE: Jacobians/adjoints remain as distributed PETSc matrices for parallel solves.
-def create_element(mesh: mesh.Mesh, family: str, degree: int, shape: tuple[int] = ()):
-    """Compatible element creation for UFL and Basix.
-
-    Args:
-        mesh: _description_
-        family: _description_
-        degree: _description_
-        shape: _description_. Defaults to ().
-
-    Returns:
-        _description_
-    """
-    try:
-        from ufl import FiniteElement, VectorElement
-
-        if shape == ():
-            return FiniteElement(family, mesh.ufl_cell(), degree)
-        else:
-            assert len(shape) == 1
-            return VectorElement(family, mesh.ufl_cell(), degree, dim=shape[0])
-    except ImportError:
-        from basix.ufl import element
-
-        return element(family, mesh.basix_cell(), degree, shape=shape)
-
-
-def create_mixed_element(elements: list[AbstractFiniteElement]):
-    """Compatibility function for creating a mixed element"""
-    try:
-        from ufl import MixedElement
-
-        return MixedElement(elements)
-    except ImportError:
-        from basix.ufl import mixed_element
-
-        return mixed_element(elements)
-
-
-class TimeStepDataManager:
-    """Centralized manager for saving timestep data during time loops."""
-
-    def __init__(
-        self,
-        solver,
-        save_state: bool = False,
-        make_wet: bool = False,
-        save_bathy: bool = False,
-        save_true_bathy: bool = False,
-        store_jacobians: bool = False,
-        save_adjoints: bool = False,
-        observation_times: Optional[Sequence[int]] = None,
-        verbose: bool = False,
-    ):
-        self.solver = solver
-        self.save_state = save_state
-        self.make_wet = make_wet
-        self.save_bathy = save_bathy
-        self.save_true_bathy = save_true_bathy
-        self.store_jacobians = store_jacobians
-        self.save_adjoints = save_adjoints
-        self.verbose = verbose
-
-        if observation_times is not None:
-            self.observation_times = set(observation_times)
-            self.obs_mode = True
-        else:
-            self.observation_times = None
-            self.obs_mode = False
-
-        self._saved_count = 0
-        self._skipped_count = 0
-        self._start_time = None
-
-        if self.verbose and self.solver.mpi_rank == 0:
-            if self.obs_mode:
-                self.solver.log(
-                    f"DataManager: Observation mode - saving at {len(self.observation_times)} timesteps"
-                )
-            else:
-                self.solver.log("DataManager: Saving at all timesteps")
-
-    def should_save_at(self, timestep: int) -> bool:
-        """Return True if data should be saved at the given timestep."""
-        if self.observation_times is None:
-            return self.save_state or self.store_jacobians or self.save_adjoints
-        return timestep in self.observation_times
-
-    def save_timestep(
-        self, timestep: int, J: Optional[PETSc.Mat] = None, local_points=None
-    ):
-        """Save configured data for the current timestep.
-
-        Args:
-            timestep: Current timestep index (0-based).
-            J: Optional Jacobian (distributed PETSc.Mat, never gathered).
-            local_points: Observation coordinates for wetting/drying logic.
-        """
-        if self._start_time is None:
-            import time
-
-            self._start_time = time.time()
-
-        if not self.should_save_at(timestep):
-            self._skipped_count += 1
-            return
-
-        if J is not None and self.store_jacobians:
-            self.solver.save_jacobians(J)
-
-        if self.save_adjoints and timestep > 0:
-            self.solver.save_adjoints()
-
-        if self.save_state:
-            self._save_state_with_wd(local_points)
-
-        self._saved_count += 1
-
-        if self.verbose and self.solver.mpi_rank == 0 and self._saved_count % 10 == 0:
-            import time
-
-            elapsed = time.time() - self._start_time
-            rate = self._saved_count / elapsed if elapsed > 0 else 0.0
-            self.solver.log(
-                f"DataManager: Saved {self._saved_count} timesteps ({rate:.1f} saves/sec)"
-            )
-
-    def _save_state_with_wd(self, local_points):
-        """Internal helper to save state with optional wetting/drying handling."""
-        if self.make_wet and local_points is not None and len(local_points) > 0:
-            water_height, dry_node_indices = self.solver.check_dry_nodes(
-                self.solver.u,
-                local_points,
-                save_bathy=self.save_bathy,
-                save_true_bathy=self.save_true_bathy,
-            )
-            self.solver.save_states(
-                water_height=water_height,
-                dry_node_indices=dry_node_indices,
-            )
-        else:
-            self.solver.save_states()
-
-    def estimate_memory_usage(self, n_dofs: int, nnz_per_row: int = 10) -> dict:
-        """Estimate memory usage for stored data (in MB)."""
-        bytes_per_float = 8
-        n_saves = (
-            len(self.observation_times) if self.obs_mode else self.solver.problem.nt
-        )
-        estimates: dict[str, float] = {}
-
-        if self.save_state:
-            state_mb = (n_saves * n_dofs * bytes_per_float) / (1024**2)
-            estimates["states"] = state_mb
-
-        if self.store_jacobians:
-            jac_mb = (n_saves * n_dofs * nnz_per_row * bytes_per_float) / (1024**2)
-            estimates["jacobians"] = jac_mb
-
-        if self.save_adjoints:
-            adj_mb = (n_saves * n_dofs * nnz_per_row * bytes_per_float) / (1024**2)
-            estimates["adjoints"] = adj_mb
-
-        estimates["total"] = sum(estimates.values())
-        return estimates
-
-    def get_summary(self) -> dict:
-        """Return summary statistics for saved data."""
-        return {
-            "saved": self._saved_count,
-            "skipped": self._skipped_count,
-            "mode": "observation" if self.obs_mode else "all_timesteps",
-            "observation_times": (
-                list(self.observation_times) if self.obs_mode else None
-            ),
-            "n_states": len(self.solver.saved_states),
-            "n_jacobians": len(self.solver.saved_jacobians),
-            "n_adjoints": len(self.solver.saved_adjoints),
-            "n_dry_nodes": len(self.solver.dry_nodes),
-        }
-
-    def __repr__(self) -> str:
-        summary = self.get_summary()
-        return (
-            f"TimeStepDataManager(mode={summary['mode']}, "
-            f"saved={summary['saved']}, skipped={summary['skipped']})"
-        )
 
 
 class BaseSolver:
@@ -254,7 +63,7 @@ class BaseSolver:
         swe_type="full",
         verbose=True,
     ):
-        r"""Iniitalize the solver.
+        r"""Initialize the solver.
 
         Args:
           problem: Problem class defining the mesh and boundary conditions.
@@ -274,17 +83,21 @@ class BaseSolver:
         self.p_degree = p_degree
         self.p_type = p_type
         self.names = ["eta", "u", "v"]
-        # extra optional parameter added for linearized
         self.swe_type = swe_type
         self.F_no_dt = None
         self.verbose = verbose
-        # Storage for parallel 4D-Var computations (distributed PETSc matrices)
-        self.saved_adjoints = []  # List[PETSc.Mat] – adjoint Jacobians per timestep
-        self.saved_states = []
-        self.dry_nodes = []
-        self.saved_true_bathy = []
-        self.saved_bathy = []
-        self.saved_jacobians = []  # List[PETSc.Mat] – forward Jacobians per timestep
+
+        # Use refactored storage
+        self.storage = SolverStateStorage()
+
+        # Backward compatibility: provide direct access to storage arrays
+        # This allows existing code to continue using self.saved_states, etc.
+        self.saved_adjoints = self.storage.saved_adjoints
+        self.saved_states = self.storage.saved_states
+        self.dry_nodes = self.storage.dry_nodes
+        self.saved_true_bathy = self.storage.saved_true_bathy
+        self.saved_bathy = self.storage.saved_bathy
+        self.saved_jacobians = self.storage.saved_jacobians
 
         if self.verbose:
             self.log("SWE TYPE", self.swe_type)
@@ -314,7 +127,7 @@ class BaseSolver:
     def init_fields(self):
         """Initialize the relevant elements, functions, and function spaces."""
 
-        # We generalize the code by now including mixed elements
+        # Use refactored element creation
         el_h = create_element(self.domain, self.p_type, self.p_degree[0])
         el_vel = create_element(self.domain, self.p_type, self.p_degree[1], shape=(2,))
         me = create_mixed_element([el_h, el_vel])
@@ -323,10 +136,8 @@ class BaseSolver:
         # for plotting
         self.V_vel = self.V.sub(1).collapse()[0]
         self.V_scalar = self.V.sub(0).collapse()[0]
-        # print("V scalar", self.V_scalar)
 
         # split these up
-
         self.u = fe.Function(self.V)
         self.hel, self.vel_sol = self.u.split()
 
@@ -334,39 +145,6 @@ class BaseSolver:
 
         # try this to minimize rewrite but may want to change in future
         self.p = as_vector((self.p1, self.p2[0], self.p2[1]))
-
-    def plot_func(self, func, name="eta"):
-        """Plot a function using pyvista."""
-        if not have_pyvista:
-            raise ValueError("pyvista not installed!")
-        num_cells = self.domain.topology.index_map(self.domain.topology.dim).size_local
-        cell_entities = np.arange(num_cells, dtype=np.int32)
-        args = dolfinx.plot.create_vtk_mesh(
-            self.domain, self.domain.topology.dim, cell_entities
-        )
-        grid = pyvista.UnstructuredGrid(*args)
-        # Mark change for conda
-        cell_geom_entities = cpp.mesh.entities_to_geometry(
-            self.domain, 2, cell_entities, False
-        )
-        point_cells = np.full(len(args[-1]), 0)
-        for i, p in enumerate(cell_geom_entities):
-            point_cells[p] = i
-        data = func.eval(self.domain.geometry.x, point_cells)
-        print(
-            data.min(),
-            np.argmin(data),
-        )
-        grid.point_data[name] = data
-        grid.set_active_scalars(name)
-        bad_point = self.domain.geometry.x[np.argmin(data)]
-        plotter = pyvista.Plotter()
-        plotter.add_mesh(grid, show_scalar_bar=True, show_edges=True)
-        plotter.add_points(bad_point[None, :], point_size=10.0)
-        plotter.view_xy()
-        plotter.set_focus(bad_point)
-        self.log(bad_point)
-        plotter.show()
 
     @property
     def V(self):
@@ -429,7 +207,8 @@ class DGSolver(BaseSolver):
         self.p_type = "DG"
         if self.p_degree[0] != self.p_degree[1]:
             raise RuntimeError("DG solver requires equal polynomial degrees")
-        # We generalize the code by now including mixed elements
+
+        # Use refactored element creation
         el_h = create_element(self.domain, self.p_type, self.p_degree[0])
         el_vel = create_element(self.domain, self.p_type, self.p_degree[1], shape=(2,))
         me = create_mixed_element([el_h, el_vel])
@@ -445,8 +224,6 @@ class DGSolver(BaseSolver):
         super().init_weak_form()
 
         # add DG upwinding
-        # lagrange_mult shouldn't be constant but hardcoded for this case
-
         C = fe.Constant(self.domain, PETSc.ScalarType(1.0))
         n = FacetNormal(self.domain)
         flux = dot(avg(self.Fu), n("+")) - 0.5 * C * jump(self.u)
@@ -455,6 +232,16 @@ class DGSolver(BaseSolver):
 
 class CGImplicit(BaseSolver):
     """Base class for all time stepping solvers."""
+
+    def __init__(self, *args, **kwargs):
+        """Initialize CGImplicit solver with station manager and visualizer."""
+        super().__init__(*args, **kwargs)
+
+        # Initialize station manager (will be configured in init_stations)
+        self.station_manager = None
+
+        # Initialize visualizer (will be configured in initialize_video)
+        self.visualizer = None
 
     def init_fields(self):
         super().init_fields()
@@ -472,12 +259,11 @@ class CGImplicit(BaseSolver):
         boundary_conditions = self.problem.boundary_conditions
         ds_exterior = self.problem.ds
         n = FacetNormal(self.domain)
-        # slightly different weak enforcement for DG than CG
-        # work in progress, maybe missing Nitsche terms
+
         if self.p_type == "CG":
             if self.verbose:
                 self.log("Adding CG boundary conditions weakly")
-            # loop throught boundary conditions to see if there is any wall conditions
+            # loop through boundary conditions
             for condition in boundary_conditions:
                 if condition.type == "Open":
                     self.F += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
@@ -492,10 +278,9 @@ class CGImplicit(BaseSolver):
         """Set the initial condition.
 
         The water column height is assumed to be equal to the bathymetry unless the Problem specifies a different initial condition.
-        If the Problem doesn't specifiy a velocity initial condition, it is assumed to be zero.
+        If the Problem doesn't specify a velocity initial condition, it is assumed to be zero.
         """
         if self.problem.solution_var == "h" or self.problem.solution_var == "flux":
-            # rewrite for mixed element
             if self.verbose:
                 self.log("setting initial condition")
             # if the initial condition is specified set this, if not assume level starting condition
@@ -585,7 +370,6 @@ class CGImplicit(BaseSolver):
             )
 
         # weak form
-        # specifies time stepping scheme, save it as fe.constant so it is modifiable
         self.theta1 = theta1 = fe.Constant(self.domain, PETSc.ScalarType(theta))
 
         # start adding to residual
@@ -604,7 +388,6 @@ class CGImplicit(BaseSolver):
                 self.problem._get_standard_vars(self.u_n_old, "flux")
             )
         elif self.swe_type == "linear":
-            # if h is unkown
             self.Q = as_vector((self.u[0], self.u[1], self.u[2]))
             self.Qn = as_vector((self.u_n[0], self.u_n[1], self.u_n[2]))
             self.Qn_old = as_vector((self.u_n_old[0], self.u_n_old[1], self.u_n_old[2]))
@@ -633,14 +416,8 @@ class CGImplicit(BaseSolver):
         self.add_bcs_to_weak_form()
         self.F += inner(self.dQdt, self.p) * dx
 
-    def solve_init(
-        self,
-        # u_init = lambda x: np.ones(x.shape),
-        solver_parameters={},
-    ):
+    def solve_init(self, solver_parameters={}):
         """Initialize the Newton solver"""
-
-        # utilize the custom Newton solver class instead of the fe.petsc Nonlinear class
         Newton_obj = CustomNewtonProblem(self, solver_parameters=solver_parameters)
         return Newton_obj
 
@@ -674,8 +451,7 @@ class CGImplicit(BaseSolver):
                 raise
 
     def update_solution(self):
-        # advance boundary and
-        # save new solution as previous solution
+        """Advance solution to next time step."""
         self.u_n_old.x.array[:] = self.u_n.x.array[:]
         self.u_n.x.array[:] = self.u.x.array[:]
 
@@ -696,235 +472,117 @@ class CGImplicit(BaseSolver):
                 self.problem.ux_dofs_closed
             ]
 
-    """
-    def init_stations(self,points):
-        #reads in recording stations and outputs points on each processor
-        if len(points):
-            points = np.array(points)
-            # be robust to 2-d input
-            if points.shape[1] < 3:
-                old_points = points
-                points = np.zeros((len(points), 3))
-                points[:, :old_points.shape[1]] = old_points
-        else:
-            self.cells = []
-            self.station_bathy = np.array([], dtype=float)
-            return np.array([], dtype=float)
-        
-        domain = self.problem.mesh       
-        bb_tree = geometry.BoundingBoxTree(domain, domain.topology.dim)
-        cells = []
-        points_on_proc = []
-        # Find cells whose bounding-box collide with the the points
-        cell_candidates = geometry.compute_collisions(bb_tree, points)
-        # Choose one of the cells that contains the point
-        colliding_cells = geometry.compute_colliding_cells(domain, cell_candidates, points)
-        self.station_index = []
-        for i, point in enumerate(points):
-            if len(colliding_cells.links(i))>0:
-                points_on_proc.append(point)
-                cells.append(colliding_cells.links(i)[0])
-                self.station_index.append(i)
-        self.cells = cells
-        bathy_func = fe.Function(self.V_scalar)
-        bathy_func.interpolate(fe.Expression(self.problem.h_b, self.V_scalar.element.interpolation_points()))
-        self.station_bathy = bathy_func.eval(points_on_proc, self.cells)
-        #print("station bathy", self.station_bathy, points_on_proc)
-        points_on_proc = np.array(points_on_proc, dtype=np.float64)
-        return points_on_proc
-    """
-
+    # Station management methods (delegated to StationManager)
     def init_stations(self, points):
-        domain = self.problem.mesh
-        points = np.asarray(points, dtype=domain.geometry.x.dtype).reshape(-1, 3)
-        # reads in recording stations and outputs points on each processor
-        try:
-            # 060 old version
-            bb_tree = geometry.BoundingBoxTree(domain, domain.topology.dim)
-        except:
-            # 080 later versions
-            bb_tree = geometry.bb_tree(domain, domain.topology.dim)
-        cells = []
-        points_on_proc = []
-        # Find cells whose bounding-box collide with the the points
-        try:
-            # 060
-            cell_candidates = geometry.compute_collisions(bb_tree, points)
-        except:
-            # 080
-            cell_candidates = geometry.compute_collisions_points(
-                bb_tree,
-                points,
+        """Initialize recording stations. Delegates to StationManager."""
+        if self.station_manager is None:
+            self.station_manager = StationManager(
+                self.domain, self.V_scalar, self.problem.h_b, verbose=self.verbose
             )
-        # Choose one of the cells that contains the point
-        colliding_cells = geometry.compute_colliding_cells(
-            domain, cell_candidates, points
-        )
-        self.station_index = []
-        for i, point in enumerate(points):
-            if len(colliding_cells.links(i)) > 0:
-                points_on_proc.append(point)
-                cells.append(colliding_cells.links(i)[0])
-                self.station_index.append(i)
-        self.cells = cells
-        bathy_func = fe.Function(self.V_scalar)
-        bathy_func.interpolate(
-            fe.Expression(
-                self.problem.h_b, self.V_scalar.element.interpolation_points()
-            )
-        )
-        self.station_bathy = bathy_func.eval(points_on_proc, self.cells)
-        # print("station bathy", self.station_bathy, points_on_proc)
-        points_on_proc = np.array(points_on_proc, dtype=np.float64)
-        return points_on_proc
+
+        local_points = self.station_manager.init_stations(points)
+        # Keep backward compatibility by storing attributes
+        self.cells = self.station_manager.cells
+        self.station_index = self.station_manager.station_index
+        self.station_bathy = self.station_manager.station_bathy
+
+        return local_points
 
     def record_stations(self, u_sol, points_on_proc):
-        """saves time series at stations into a numpy array"""
-        h_values = u_sol.sub(0).eval(points_on_proc, self.cells)
-        if self.problem.solution_var in ["h", "flux"]:
-            h_values -= self.station_bathy
+        """Record time series at stations. Delegates to StationManager."""
+        if self.station_manager is None:
+            raise RuntimeError("Must call init_stations() before record_stations()")
+        return self.station_manager.record_stations(u_sol, self.problem.solution_var)
 
-        # correct for w/d for nicer plotting
-        # h_values = np.maximum(h_values,-self.station_bathy)
-        u_values = u_sol.sub(1).eval(points_on_proc, self.cells)
-        u_values = np.hstack([h_values, u_values])
-        return u_values
+    def check_dry_nodes(
+        self, solution, evaluation_points, save_bathy=False, save_true_bathy=False
+    ):
+        """Check for dry nodes at observation points. Delegates to StationManager."""
+        if self.station_manager is None:
+            raise RuntimeError("Must call init_stations() before check_dry_nodes()")
 
-    def initialize_video(self, filename):
-        # deprecated
-        # self.xdmf = io.XDMFFile(self.problem.mesh.comm, filename+"/"+filename+".xdmf", "w")
-        # self.xdmf.write_mesh(self.problem.mesh)
-        self.eta_plot = fe.Function(self.V_scalar)
-        self.eta_plot.name = "eta"
-        self.h_plot = fe.Function(self.V_scalar)
-        self.h_plot.name = "depth"
-        self.vel_plot = fe.Function(self.V_vel)
-        self.vel_plot.name = "depth averaged velocity"
-        self.bathy_plot = fe.Function(self.V_scalar)
-        self.bathy_plot.name = "bathymetry"
-
-        results_folder = Path(filename)
-        results_folder.mkdir(exist_ok=True, parents=True)
-        self.wse_writer = io.VTXWriter(
-            self.problem.mesh.comm,
-            results_folder / "WSE.bp",
-            self.eta_plot,
-            engine="BP4",
-        )
-        self.h_writer = io.VTXWriter(
-            self.problem.mesh.comm, results_folder / "h.bp", self.h_plot, engine="BP4"
-        )
-        self.vel_writer = io.VTXWriter(
-            self.problem.mesh.comm,
-            results_folder / "vel.bp",
-            self.vel_plot,
-            engine="BP4",
-        )
-        self.bathy_writer = io.VTXWriter(
-            self.problem.mesh.comm,
-            results_folder / "bathy.bp",
-            self.bathy_plot,
-            engine="BP4",
+        water_height, dry_node_indices = self.station_manager.check_dry_nodes(
+            solution, evaluation_points, save_bathy, save_true_bathy
         )
 
-    def finalize_video(self):
-        # deprecated
-        # self.xdmf.close()
-        self.wse_writer.close()
-        self.h_writer.close()
-        self.vel_writer.close()
-        self.bathy_writer.close()
+        # Save to storage if requested
+        if save_true_bathy:
+            bathy = self.problem.h_b.eval(evaluation_points, self.station_manager.cells)
+            self.storage.save_bathymetry(bathy, is_true_bathy=True)
+            self.storage.save_dry_nodes(dry_node_indices)
+        if save_bathy:
+            bathy = self.problem.h_b.eval(evaluation_points, self.station_manager.cells)
+            self.storage.save_bathymetry(bathy, is_true_bathy=False)
 
-    def plot_frame(self):
-        """Plot a frame of the state"""
-        # dimensional scales
-        # takes a function and plots as
-        # this will output a vector xyz, want to change
-        # adjusts for plotting
-        # self.eta_expr = fe.Expression( conditional(self.u.sub(0).collapse() - self.problem.h_b > -self.problem.h_b,  self.u.sub(0).collapse() - self.problem.h_b, -self.problem.h_b ), self.V_scalar.element.interpolation_points())
-        # simple but goes below original bathymetry
-        self.eta_expr = fe.Expression(
-            self.u.sub(0).collapse() - self.problem.h_b,
-            self.V_scalar.element.interpolation_points(),
-        )
-        self.eta_plot.interpolate(self.eta_expr)
-
-        # rwerite for mixed elements
-        self.v_expr = fe.Expression(
-            self.u.sub(1).collapse(), self.V_vel.element.interpolation_points()
-        )
-        self.vel_plot.interpolate(self.v_expr)
-        self.h_plot.interpolate(self.u.sub(0).collapse())
-
-        # deprecated
-        # self.xdmf.write_function(self.eta_plot,self.problem.t)
-        # self.xdmf.write_function(self.vel_plot,self.problem.t)
-        self.wse_writer.write(self.problem.t)
-        self.h_writer.write(self.problem.t)
-        self.vel_writer.write(self.problem.t)
-
-        if not self.problem.t:
-            # write bathymetry for first timestep only
-            if self.verbose:
-                self.log("Interpolating bathymetry")
-            self.bathy_plot.interpolate(
-                fe.Expression(
-                    self.problem.h_b, self.V_scalar.element.interpolation_points()
-                )
-            )
-            if self.verbose:
-                self.log("Writing bathymetry")
-            # self.xdmf.write_function(self.bathy_plot, self.problem.t)
-            self.bathy_writer.write(self.problem.t)
-            if self.verbose:
-                self.log("Wrote bathymetry")
-
-    def plot_frame_2(self):
-        # takes a function and plots as
-        # deptecated
-        # self.xdmf.write_function(self.u,0)
-        self.wse_writer.write(0)
-        self.h_writer.write(0)
-        self.vel_writer.write(0)
+        return water_height, dry_node_indices
 
     def gather_station(self, root, local_stats, local_vals):
-        comm = self.problem.mesh.comm
-        rank = comm.Get_rank()
-        gathered_vals = comm.gather(local_vals, root=root)
-        gathered_inds = comm.gather(np.array(self.station_index, dtype=int), root=root)
-        vals = []
-        inds = []
-        if rank == root:
-            vals = np.concatenate(gathered_vals, axis=1)
-            inds = np.concatenate(gathered_inds)
-        return inds, vals
+        """Gather station data to root process. Delegates to StationManager."""
+        if self.station_manager is None:
+            raise RuntimeError("Must call init_stations() before gather_station()")
+        return self.station_manager.gather_station(root, local_stats, local_vals)
 
+    # Visualization methods (delegated to SolverVisualizer)
+    def initialize_video(self, filename):
+        """Initialize video output. Delegates to SolverVisualizer."""
+        if self.visualizer is None:
+            self.visualizer = SolverVisualizer(
+                self.domain,
+                self.V_scalar,
+                self.V_vel,
+                self.problem,
+                verbose=self.verbose,
+            )
+        self.visualizer.initialize_video(filename)
+
+        # Keep backward compatibility by storing plot functions as attributes
+        self.eta_plot = self.visualizer.eta_plot
+        self.h_plot = self.visualizer.h_plot
+        self.vel_plot = self.visualizer.vel_plot
+        self.bathy_plot = self.visualizer.bathy_plot
+        self.wse_writer = self.visualizer.wse_writer
+        self.h_writer = self.visualizer.h_writer
+        self.vel_writer = self.visualizer.vel_writer
+        self.bathy_writer = self.visualizer.bathy_writer
+
+    def plot_frame(self):
+        """Plot a frame of the state. Delegates to SolverVisualizer."""
+        if self.visualizer is None:
+            raise RuntimeError("Must call initialize_video() before plot_frame()")
+        self.visualizer.plot_frame(self.u, self.problem.t)
+
+    def finalize_video(self):
+        """Close video writers. Delegates to SolverVisualizer."""
+        if self.visualizer is not None:
+            self.visualizer.finalize_video()
+
+    def plot_func(self, func, name="eta"):
+        """Plot a function interactively with PyVista. Delegates to SolverVisualizer."""
+        if self.visualizer is None:
+            self.visualizer = SolverVisualizer(
+                self.domain,
+                self.V_scalar,
+                self.V_vel,
+                self.problem,
+                verbose=self.verbose,
+            )
+        self.visualizer.plot_func_interactive(func, name)
+
+    # Storage methods (delegated to SolverStateStorage)
     def save_adjoints(self):
-        """Save adjoint Jacobian for parallel adjoint solve (distributed storage)."""
+        """Save adjoint Jacobian for parallel adjoint solve."""
         A_tlm = self.solver.assemble_A()
         A_adjoint = A_tlm.transpose()
         A_adjoint.assemble()
-        self.saved_adjoints.append(A_adjoint.copy())
+        self.storage.save_adjoint(A_adjoint)
 
     def save_jacobians(self, J):
-        """Save Jacobian matrix for 4D-Var adjoint computation.
-
-        Args:
-            J: PETSc.Mat - Jacobian from Newton solver
-
-        Note:
-            Each MPI rank stores only its local portion of ``J``. These
-            distributed matrices are used directly during adjoint solves
-            via transpose applications—no gathering required.
-        """
+        """Save Jacobian matrix for 4D-Var adjoint computation."""
         if J is not None:
-            # Store the Jacobian - it's already a PETSc matrix
-            # For parallel runs, each process stores its local part
-            self.saved_jacobians.append(J.copy())
+            self.storage.save_jacobian(J)
 
     def save_states(self, water_height=None, dry_node_indices=None):
         """Save global state vector with optional wetting/drying adjustments."""
-
         u_sol = self.u.x.array.copy().flatten()
 
         if dry_node_indices is not None and water_height is not None:
@@ -933,42 +591,7 @@ class CGImplicit(BaseSolver):
             water_height[dry_node_indices] = 0.0
             u_sol[sub_map] = water_height.copy().flatten()
 
-        self.saved_states.append(u_sol)
-
-    def check_dry_nodes(
-        self, solution, evaluation_points, save_bathy=False, save_true_bathy=False
-    ):
-        """
-        Identify and apply wetting/drying conditions at monitoring stations.
-
-        Args:
-            solution: FEniCS solution object containing water depth (H) and velocity components
-            evaluation_points: Coordinates where solution should be evaluated
-
-        Returns:
-            numpy.ndarray: Indices of dry nodes where H was set to zero
-        """
-        # Extract water depth values at evaluation points
-        water_height = solution.sub(0).eval(evaluation_points, self.cells)
-        bathy = self.problem.h_b.eval(evaluation_points, self.cells)
-
-        # Calculate water surface elevation relative to bathymetry
-        water_surface_elevation = water_height - bathy  # 432 x 1
-        # Identify dry nodes: where water surface is below the bottom
-        # (i.e., where elevation is negative relative to bathymetry)
-        is_dry = water_surface_elevation < -bathy  # 432 x 1
-        dry_node_indices = np.where(is_dry)[0]
-
-        if save_true_bathy:
-            self.saved_true_bathy.append(bathy.copy().flatten())
-            # Store dry nodes for tracking/analysis
-            self.dry_nodes.append(dry_node_indices.copy())
-        if save_bathy:
-            self.saved_bathy.append(bathy.copy().flatten())
-        # # Apply da friendly wetting/drying by setting water depth to zero at dry nodes
-        # if len(dry_node_indices) > 0 and self.adjoint_method:
-        #     solution.sub(0).x.array[dry_node_indices] = -bathy[dry_node_indices].flatten()
-        return water_height, dry_node_indices
+        self.storage.save_state(u_sol)
 
     def time_loop(
         self,
@@ -982,7 +605,7 @@ class CGImplicit(BaseSolver):
         save_bathy=False,
         save_true_bathy=False,
         make_wet=False,
-        store_jacobians=False,  # NEW: 4D-Var parameter
+        store_jacobians=False,
         observation_times=None,
     ):
         """Time-stepping loop with optional Jacobian storage for 4D-Var.
@@ -993,9 +616,8 @@ class CGImplicit(BaseSolver):
             plot_every: Plotting cadence.
             plot_name: Base name for visualization output.
             u_0: Optional initial condition override.
-            save_state: Save every state (legacy mode). Ignored when
-                ``observation_times`` is provided.
-            adjoint_method: Whether to assemble adjoint matrices (legacy).
+            save_state: Save every state (legacy mode).
+            adjoint_method: Whether to assemble adjoint matrices.
             save_bathy: Save bathymetry samples when applying wetting/drying.
             save_true_bathy: Save true bathymetry and dry node indices.
             make_wet: Apply wetting/drying adjustments before saving.
@@ -1004,12 +626,13 @@ class CGImplicit(BaseSolver):
         """
 
         if store_jacobians:
-            self.saved_jacobians = []
+            self.storage.saved_jacobians = []
             if self.verbose:
                 self.log("4D-Var mode: Jacobians will be stored during forward solve")
 
         if self.verbose:
             self.log("calling time loop")
+
         self.points_on_proc = local_points = self.init_stations(stations)
         self.station_data = np.zeros((self.problem.nt + 1, local_points.shape[0], 3))
 
@@ -1021,9 +644,7 @@ class CGImplicit(BaseSolver):
             self.u.x.array[:] = self.u_n.x.array[:]
 
         self.solver = solver = self.solve_init(solver_parameters=solver_parameters)
-        # plot the initial condition
-        # Mark commented, this seems to be incorrect
-        # self.update_solution()
+
         if self.verbose:
             self.log("plot every", plot_every)
             self.log("nt", self.problem.nt)
@@ -1049,7 +670,7 @@ class CGImplicit(BaseSolver):
 
         data_manager.save_timestep(timestep=0, local_points=local_points)
 
-        # take first 2 steps with implicit Euler since we dont have enough steps for higher order
+        # take first 2 steps with implicit Euler
         self.theta1.value = 0
         for a in range(min(2, self.problem.nt)):
             if self.verbose:
@@ -1069,8 +690,7 @@ class CGImplicit(BaseSolver):
                 local_points=local_points,
             )
 
-        # switch to high order time stepping
-
+        # switch to high order time stepping (BDF2)
         self.theta1.value = self.theta
         for a in range(2, self.problem.nt):
             if self.verbose:
@@ -1092,10 +712,6 @@ class CGImplicit(BaseSolver):
         if plot_every <= self.problem.nt:
             self.finalize_video()
 
-        # if len(stations):
-        #     inds, vals = self.gather_station(0, local_points, self.station_data)
-        # else:
-        #     inds, vals = None, None
         inds, vals = None, None
         self.vals = vals
         self.inds = inds
@@ -1104,7 +720,9 @@ class CGImplicit(BaseSolver):
             summary = data_manager.get_summary()
             self.log(f"Time loop complete: {summary}")
             if store_jacobians:
-                self.log(f"Stored {len(self.saved_jacobians)} Jacobians for 4D-Var")
+                self.log(
+                    f"Stored {len(self.storage.saved_jacobians)} Jacobians for 4D-Var"
+                )
 
         # Optionally evaluate and print L2 error
         if self.problem.check_solution_def is not None:
@@ -1112,19 +730,17 @@ class CGImplicit(BaseSolver):
             e0 = self.problem.check_solution(self.u, self.V, self.problem.t)
             print("L2 error at t=", str(self.problem.t), " is ", str(e0))
 
-        return (
-            self.u,
-            vals,
-        )
+        return (self.u, vals)
 
 
 class DGImplicit(CGImplicit):
+    """DG implicit time-stepping solver."""
+
     def init_fields(self):
         """Initialize the variables"""
         self.p_type = "DG"
 
-        # We generalize the code by now including 2 elements
-        # We generalize the code by now including mixed elements
+        # Use refactored element creation
         el_h = create_element(self.domain, self.p_type, self.p_degree[0])
         el_vel = create_element(self.domain, self.p_type, self.p_degree[1], shape=(2,))
         me = create_mixed_element([el_h, el_vel])
@@ -1134,45 +750,32 @@ class DGImplicit(CGImplicit):
         self.V_vel = self.V.sub(1).collapse()[0]
         self.V_scalar = self.V.sub(0).collapse()[0]
 
-        # split these up
-
         self.u = fe.Function(self.V)
         self.hel, self.vel_sol = self.u.split()
 
         self.p1, self.p2 = TestFunctions(self.V)
-
-        # try this to minimize rewrite but may want to change in future
         self.p = as_vector((self.p1, self.p2[0], self.p2[1]))
+
         self.u_n = fe.Function(self.V)
         self.u_n.name = "u_n"
-        # for second order timestep need n-1
         self.u_n_old = fe.Function(self.V)
         self.u_n_old.name = "u_n_old"
 
     def init_weak_form(self):
-        """Initialize the weak form"""
+        """Initialize the weak form with DG upwinding"""
         super().init_weak_form()
 
         # add DG upwinding
-        # Not sure if this is correct or stable yet
-        # simplest Lax-Friedrichs flux on F operator
-        # see https://fenicsproject.discourse.group/t/lax-friedrichs-flux-for-advection-equation/4647
         eps = 1e-16
-        # eps = 1e-8
         n = FacetNormal(self.domain)
-        # attempt at full expression from https://docu.ngsolve.org/v6.2.1810/i-tutorials/unit-3.4-simplehyp/shallow2D.html
-        # still doesnt work
+
         h, ux, uy = self.problem._get_standard_vars(self.u, "h")
         vela = as_vector((ux("+"), uy("+")))
         velb = as_vector((ux("-"), uy("-")))
 
-        # Mark looking at treatment conditionals
-        # vnorma = conditional(dot(vela,vela) > eps,sqrt(dot(vela,vela)),np.sqrt(eps))
-        # vnormb = conditional(dot(velb,velb) > eps,sqrt(dot(velb,velb)),np.sqrt(eps))
         vnorma = conditional(dot(vela, vela) > eps, sqrt(dot(vela, vela)), 0.0)
         vnormb = conditional(dot(velb, velb) > eps, sqrt(dot(velb, velb)), 0.0)
 
-        # TODO replace conditionals with smoother transition
         if self.swe_type == "full":
             C = conditional(
                 (vnorma + sqrt(g * h("+"))) > (vnormb + sqrt(g * h("-"))),
@@ -1181,7 +784,6 @@ class DGImplicit(CGImplicit):
             )
         elif self.swe_type == "linear":
             h_b = self.problem.get_h_b(self.u)
-            # C = conditional( (vnorma + sqrt(g*h_b('+')) ) > (vnormb + sqrt(g*h_b('-')) ), (vnorma + sqrt(g*h_b('+'))) ,  (vnormb + sqrt(g*h_b('-'))) )
             C = conditional(
                 (sqrt(g * h_b("+"))) > (sqrt(g * h_b("-"))),
                 (sqrt(g * h_b("+"))),
@@ -1190,8 +792,6 @@ class DGImplicit(CGImplicit):
 
         if self.problem.spherical:
             if self.problem.projected:
-                # qustion, even if we are discretizing by primitives should jump be based on flux variable or primitive?
-                # appears both work, using Q now
                 if self.verbose:
                     self.log("spherical projected DG!!")
                 flux = dot(avg(self.Fu), n("+")) + 0.5 * C * jump(self.Q)
@@ -1205,36 +805,27 @@ class DGImplicit(CGImplicit):
         self.F += inner(flux, jump(self.p)) * dS
 
     def add_bcs_to_weak_form(self):
-        """Add boundary integrals to the variational form.
-
-        This method may need to be overridden when implementing a solver with trace variables or an alternate approach to boundary conditions.
-        """
+        """Add boundary integrals for DG."""
         super().add_bcs_to_weak_form()
         boundary_conditions = self.problem.boundary_conditions
         ds_exterior = self.problem.ds
         n = FacetNormal(self.domain)
-        # slightly different weak enforcement for DG than CG
-        # work in progress, maybe missing Nitsche terms
+
         if self.p_type == "DG":
             if self.swe_type == "full":
                 if self.verbose:
                     self.log("Adding DG boundary conditions weakly")
                 h, ux, uy = self.problem._get_standard_vars(self.u, "h")
                 h_bc, ux_bc, uy_bc = self.problem._get_standard_vars(self.u_bc, "h")
-                # need to add jump terms for DG stability
-                boundary_conditions = self.problem.boundary_conditions
-                ds_exterior = self.problem.ds
-                # needed for velocity computations
+
                 vel = as_vector((ux, uy))
                 un = dot(vel, n)
-                # eps = 1e-16
                 eps = 1e-8
-                # vnorm = conditional(dot(vel,vel) > eps,sqrt(dot(vel,vel)),np.sqrt(eps))
                 vnorm = conditional(dot(vel, vel) > eps, sqrt(dot(vel, vel)), 0.0)
-                # needed for jump calculation on wall
+
                 jump_Q_wall = as_vector((0, 2 * h * un * n[0], 2 * h * un * n[1]))
                 C_wall = vnorm + sqrt(g * h)
-                # velocity has flipped sign in normal direction
+
                 u_wall = as_vector(
                     (
                         self.u[0],
@@ -1247,32 +838,13 @@ class DGImplicit(CGImplicit):
                     )
                 )
                 Fu_wall_ext = self.problem.make_Fu(u_wall)
-                # needed for jump calculation on open
-                jump_Q_open = as_vector(
-                    (h - h_bc, h * ux - h_bc * ux_bc, h * uy - h_bc * uy_bc)
-                )
-                C_open = vnorm + sqrt(g * conditional(h_bc > h, h_bc, h))
-                # if abs(jump_Q_open)
 
-                # h_bc_plus = conditional(h_bc > eps/2 , h_bc, eps)
-                # C_open = conditional( (vnorm + sqrt(g*h) ) > (vnorm + sqrt(g*h_bc_plus) ), (vnorm + sqrt(g*h)) ,  (vnorm+ sqrt(g*h_bc_plus)) )
-                # loop throught boundary conditions to see if there is any wall conditions
                 for condition in boundary_conditions:
                     if condition.type == "Open":
-                        # self.F += dot(
-                        #    0.5 * dot(self.Fu_open, n) + 0.5 * dot(self.Fu_open, n), self.p
-                        # ) * ds_exterior(condition.marker)
-                        #
-                        #  + dot(
-                        #    0.5 * C_open * jump_Q_open, self.p
-                        # ) * ds_exterior(condition.marker)
-                        # Fix to this so we can analyze the BCs later
                         self.F += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
                             condition.marker
                         )
-
                     if condition.type == "Wall":
-                        # self.F += dot(dot(self.Fu_wall, n), self.p)*ds_exterior(condition.marker) + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
                         self.F += dot(
                             0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
                         ) * ds_exterior(condition.marker) + dot(
@@ -1281,28 +853,21 @@ class DGImplicit(CGImplicit):
                             condition.marker
                         )
 
-                    # if condition.type == "OF":
-                    #    self.F += dot(dot(self.Fu_side_wall, n), self.p)*ds_exterior(condition.marker)
             elif self.swe_type == "linear":
                 if self.verbose:
                     self.log("Adding linearized DG boundary conditions weakly")
                 h, ux, uy = self.problem._get_standard_vars(self.u, "h")
                 h_bc, ux_bc, uy_bc = self.problem._get_standard_vars(self.u_bc, "h")
                 h_b = self.problem.get_h_b(self.u)
-                # need to add jump terms for DG stability
-                boundary_conditions = self.problem.boundary_conditions
-                ds_exterior = self.problem.ds
 
-                # needed for velocity computations
                 vel = as_vector((ux, uy))
                 un = dot(vel, n)
                 eps = 1e-16
-                # vnorm = conditional(dot(vel,vel) > eps,sqrt(dot(vel,vel)),np.sqrt(eps))
                 vnorm = conditional(dot(vel, vel) > eps, sqrt(dot(vel, vel)), 0.0)
-                # needed for jump calculation on wall
+
                 jump_Q_wall = as_vector((0, 2 * un * n[0], 2 * un * n[1]))
                 C_wall = sqrt(g * h_b)
-                # velocity has flipped sign in normal direction
+
                 u_wall = as_vector(
                     (
                         self.u[0],
@@ -1315,12 +880,9 @@ class DGImplicit(CGImplicit):
                     )
                 )
                 Fu_wall_ext = self.problem.make_Fu_linearized(u_wall)
-                # needed for jump calculation on open
                 jump_Q_open = as_vector((h - h_bc, ux - ux_bc, uy - uy_bc))
                 C_open = sqrt(g * h_b)
-                # h_bc_plus = conditional(h_bc > eps/2 , h_bc, eps)
-                # C_open = conditional( (vnorm + sqrt(g*h) ) > (vnorm + sqrt(g*h_bc_plus) ), (vnorm + sqrt(g*h)) ,  (vnorm+ sqrt(g*h_bc_plus)) )
-                # loop throught boundary conditions to see if there is any wall conditions
+
                 for condition in boundary_conditions:
                     if condition.type == "Open":
                         self.F += dot(
@@ -1330,9 +892,7 @@ class DGImplicit(CGImplicit):
                         ) * ds_exterior(
                             condition.marker
                         )
-
                     if condition.type == "Wall":
-                        # self.F += dot(dot(self.Fu_wall, n), self.p)*ds_exterior(condition.marker) + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
                         self.F += dot(
                             0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
                         ) * ds_exterior(condition.marker) + dot(
@@ -1341,16 +901,15 @@ class DGImplicit(CGImplicit):
                             condition.marker
                         )
 
-                    # if condition.type == "OF":
-                    #    self.F += dot(dot(self.Fu_side_wall, n), self.p)*ds_exterior(condition.marker)
-
 
 class DGImplicitNonConservative(DGImplicit):
+    """DG implicit solver with non-conservative formulation."""
+
     def init_weak_form(self):
-        """Initialize the weak form"""
+        """Initialize the weak form with non-conservative formulation."""
         theta = self.theta
         self.set_initial_condition()
-        # create fluxes
+
         self.u_bc = as_vector((self.problem.u_bc[0], self.u[1], self.u[2]))
         if self.swe_type == "full":
             print("Creating NONCONSERVATIVE DG FORM\n\n")
@@ -1368,29 +927,18 @@ class DGImplicitNonConservative(DGImplicit):
                 "Sorry, swe_type must either be linear or full, not %s" % self.swe_type
             )
 
-        # weak form
-        # specifies time stepping scheme, save it as fe.constant so it is modifiable
         self.theta1 = theta1 = fe.Constant(self.domain, PETSc.ScalarType(theta))
-
-        # start adding to residual
         self.F = -inner(self.Fu, grad(self.p)) * dx
         self.add_bcs_to_weak_form()
 
         self.dt = self.problem.dt
-
-        # add RHS to residual
         self.F += inner(self.S, self.p) * dx
 
-        # add contribution from time step
         h_b = self.problem.h_b
         if self.swe_type == "full":
             self.Q = as_vector(self.problem._get_standard_vars(self.u, "h"))
             self.Qn = as_vector(self.problem._get_standard_vars(self.u_n, "h"))
             self.Qn_old = as_vector(self.problem._get_standard_vars(self.u_n_old, "h"))
-        elif self.swe_type == "linear":
-            raise Exception(
-                "Sorry, swe_type must either be linear or full, not %s" % self.swe_type
-            )
         else:
             raise Exception(
                 "Sorry, swe_type must either be linear or full, not %s" % self.swe_type
@@ -1406,44 +954,24 @@ class DGImplicitNonConservative(DGImplicit):
         self.F += inner(self.dQdt, self.p) * dx
 
         # add DG upwinding
-        # Not sure if this is correct or stable yet
-        # simplest Lax-Friedrichs flux on F operator
-        # see https://fenicsproject.discourse.group/t/lax-friedrichs-flux-for-advection-equation/4647
-
         eps = 1e-16
         n = FacetNormal(self.domain)
-        # attempt at full expression from https://docu.ngsolve.org/v6.2.1810/i-tutorials/unit-3.4-simplehyp/shallow2D.html
-        # still doesnt work
         h, ux, uy = self.problem._get_standard_vars(self.u, "h")
         vela = as_vector((ux("+"), uy("+")))
         velb = as_vector((ux("-"), uy("-")))
 
-        # Mark looking at treatment conditionals
-        # vnorma = conditional(dot(vela,vela) > eps,sqrt(dot(vela,vela)),np.sqrt(eps))
-        # vnormb = conditional(dot(velb,velb) > eps,sqrt(dot(velb,velb)),np.sqrt(eps))
         vnorma = conditional(dot(vela, vela) > eps, sqrt(dot(vela, vela)), 0.0)
         vnormb = conditional(dot(velb, velb) > eps, sqrt(dot(velb, velb)), 0.0)
 
-        # TODO replace conditionals with smoother transition
         if self.swe_type == "full":
             C = conditional(
                 (vnorma + sqrt(g * h("+"))) > (vnormb + sqrt(g * h("-"))),
                 (vnorma + sqrt(g * h("+"))),
                 (vnormb + sqrt(g * h("-"))),
             )
-        elif self.swe_type == "linear":
-            h_b = self.problem.get_h_b(self.u)
-            # C = conditional( (vnorma + sqrt(g*h_b('+')) ) > (vnormb + sqrt(g*h_b('-')) ), (vnorma + sqrt(g*h_b('+'))) ,  (vnormb + sqrt(g*h_b('-'))) )
-            C = conditional(
-                (sqrt(g * h_b("+"))) > (sqrt(g * h_b("-"))),
-                (sqrt(g * h_b("+"))),
-                (sqrt(g * h_b("-"))),
-            )
 
         if self.problem.spherical:
             if self.problem.projected:
-                # qustion, even if we are discretizing by primitives should jump be based on flux variable or primitive?
-                # appears both work, using Q now
                 if self.verbose:
                     self.log("spherical projected DG!!")
                 flux = dot(avg(self.Fu), n("+")) + 0.5 * C * jump(self.Q)
@@ -1457,141 +985,34 @@ class DGImplicitNonConservative(DGImplicit):
         self.F += inner(flux, jump(self.p)) * dS
 
     def add_bcs_to_weak_form(self):
-        """Add boundary integrals to the variational form.
-
-        This method may need to be overridden when implementing a solver with trace variables or an alternate approach to boundary conditions.
-        """
+        """Add boundary integrals for non-conservative DG."""
         boundary_conditions = self.problem.boundary_conditions
         ds_exterior = self.problem.ds
         n = FacetNormal(self.domain)
-        # slightly different weak enforcement for DG than CG
-        # work in progress, maybe missing Nitsche terms
+
         if self.p_type == "DG":
             if self.swe_type == "full":
                 if self.verbose:
                     self.log("Adding DG boundary conditions weakly")
                 h, ux, uy = self.problem._get_standard_vars(self.u, "h")
                 h_bc, ux_bc, uy_bc = self.problem._get_standard_vars(self.u_bc, "h")
-                # need to add jump terms for DG stability
-                boundary_conditions = self.problem.boundary_conditions
-                ds_exterior = self.problem.ds
-                # needed for velocity computations
-                vel = as_vector((ux, uy))
-                un = dot(vel, n)
-                eps = 1e-16
-                # vnorm = conditional(dot(vel,vel) > eps,sqrt(dot(vel,vel)),np.sqrt(eps))
-                vnorm = conditional(dot(vel, vel) > eps, sqrt(dot(vel, vel)), 0.0)
-                # needed for jump calculation on wall
-                jump_Q_wall = as_vector((0, 2 * un * n[0], 2 * un * n[1]))
-                C_wall = vnorm + sqrt(g * h)
-                # velocity has flipped sign in normal direction
-                u_wall = as_vector(
-                    (
-                        self.u[0],
-                        self.u[1] * n[1] * n[1]
-                        - self.u[1] * n[0] * n[0]
-                        - 2 * self.u[2] * n[0] * n[1],
-                        self.u[2] * n[0] * n[0]
-                        - self.u[2] * n[1] * n[1]
-                        - 2 * self.u[1] * n[0] * n[1],
-                    )
-                )
-                Fu_wall_ext = self.problem.make_Fu(u_wall)
-                # needed for jump calculation on open
-                jump_Q_open = as_vector((h - h_bc, ux - ux_bc, uy - uy_bc))
-                C_open = vnorm + sqrt(g * conditional(h_bc > h, h_bc, h))
-                # if abs(jump_Q_open)
 
-                # h_bc_plus = conditional(h_bc > eps/2 , h_bc, eps)
-                # C_open = conditional( (vnorm + sqrt(g*h) ) > (vnorm + sqrt(g*h_bc_plus) ), (vnorm + sqrt(g*h)) ,  (vnorm+ sqrt(g*h_bc_plus)) )
-                # loop throught boundary conditions to see if there is any wall conditions
                 for condition in boundary_conditions:
                     if condition.type == "Open":
-                        # self.F += dot(
-                        #    0.5 * dot(self.Fu_open, n) + 0.5 * dot(self.Fu_open, n), self.p
-                        # ) * ds_exterior(condition.marker) + dot(
-                        #    0.5 * C_open * jump_Q_open, self.p
-                        # ) * ds_exterior(condition.marker)
-                        # Fix to this so we can analyze the BCs later
                         self.F += dot(dot(self.Fu_open, n), self.p) * ds_exterior(
                             condition.marker
                         )
                     if condition.type == "Wall":
                         self.F += dot(dot(self.Fu_wall, n), self.p) * ds_exterior(
                             condition.marker
-                        )  # + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
-                        # self.F += dot(
-                        #    0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
-                        # ) * ds_exterior(condition.marker) + dot(
-                        #    0.5 * C_wall * jump_Q_wall, self.p
-                        # ) * ds_exterior(condition.marker)
-                    # if condition.type == "OF":
-                    #    self.F += dot(dot(self.Fu_side_wall, n), self.p)*ds_exterior(condition.marker)
-            elif self.swe_type == "linear":
-                if self.verbose:
-                    self.log("Adding linearized DG boundary conditions weakly")
-                h, ux, uy = self.problem._get_standard_vars(self.u, "h")
-                h_bc, ux_bc, uy_bc = self.problem._get_standard_vars(self.u_bc, "h")
-                h_b = self.problem.get_h_b(self.u)
-                # need to add jump terms for DG stability
-                boundary_conditions = self.problem.boundary_conditions
-                ds_exterior = self.problem.ds
-
-                # needed for velocity computations
-                vel = as_vector((ux, uy))
-                un = dot(vel, n)
-                eps = 1e-16
-                # vnorm = conditional(dot(vel,vel) > eps,sqrt(dot(vel,vel)),np.sqrt(eps))
-                vnorm = conditional(dot(vel, vel) > eps, sqrt(dot(vel, vel)), 0.0)
-                # needed for jump calculation on wall
-                jump_Q_wall = as_vector((0, 2 * un * n[0], 2 * un * n[1]))
-                C_wall = sqrt(g * h_b)
-                # velocity has flipped sign in normal direction
-                u_wall = as_vector(
-                    (
-                        self.u[0],
-                        self.u[1] * n[1] * n[1]
-                        - self.u[1] * n[0] * n[0]
-                        - 2 * self.u[2] * n[0] * n[1],
-                        self.u[2] * n[0] * n[0]
-                        - self.u[2] * n[1] * n[1]
-                        - 2 * self.u[1] * n[0] * n[1],
-                    )
-                )
-                Fu_wall_ext = self.problem.make_Fu_linearized(u_wall)
-                # needed for jump calculation on open
-                jump_Q_open = as_vector((h - h_bc, ux - ux_bc, uy - uy_bc))
-                C_open = sqrt(g * h_b)
-                # h_bc_plus = conditional(h_bc > eps/2 , h_bc, eps)
-                # C_open = conditional( (vnorm + sqrt(g*h) ) > (vnorm + sqrt(g*h_bc_plus) ), (vnorm + sqrt(g*h)) ,  (vnorm+ sqrt(g*h_bc_plus)) )
-                # loop throught boundary conditions to see if there is any wall conditions
-                for condition in boundary_conditions:
-                    if condition.type == "Open":
-                        self.F += dot(
-                            0.5 * dot(self.Fu_open, n) + 0.5 * dot(self.Fu, n), self.p
-                        ) * ds_exterior(condition.marker) + dot(
-                            0.5 * C_open * jump_Q_open, self.p
-                        ) * ds_exterior(
-                            condition.marker
                         )
-                    if condition.type == "Wall":
-                        # self.F += dot(dot(self.Fu_wall, n), self.p)*ds_exterior(condition.marker) + dot(0.5*C_wall*jump_Q_wall, self.p)*ds_exterior(condition.marker)
-                        self.F += dot(
-                            0.5 * dot(self.Fu, n) + 0.5 * dot(Fu_wall_ext, n), self.p
-                        ) * ds_exterior(condition.marker) + dot(
-                            0.5 * C_wall * jump_Q_wall, self.p
-                        ) * ds_exterior(
-                            condition.marker
-                        )
-                    # if condition.type == "OF":
-                    #    self.F += dot(dot(self.Fu_side_wall, n), self.p)*ds_exterior(condition.marker)
 
 
 class SUPGImplicit(CGImplicit):
-    # try to cell avg
+    """SUPG stabilized implicit solver."""
+
     def project_L2(self, f, V):
-        # takes in f and projects to functionspace V
-        # V = f._V
+        """Project function to L2 space."""
         u = TrialFunction(V)
         v = TestFunction(V)
         a = inner(u, v) * dx
@@ -1602,144 +1023,60 @@ class SUPGImplicit(CGImplicit):
         return ux
 
     def init_weak_form(self):
+        """Initialize weak form with SUPG stabilization."""
         super().init_weak_form()
+
         n = FacetNormal(self.domain)
         eps = 1e-8
-        # time step parameter, 0.5 for crank-nicolson, 0 for implicit euler, 1 for explicit euler
         theta = self.theta
-        # temporal term from residual
         dQdt = self.dQdt
-        # non-conservative dQdT
         dQ_ncdt = self.dQ_ncdt
 
-        # get element height as elementwise constant function
+        # get element height
         tdim = self.domain.topology.dim
-
         self.domain.topology.create_connectivity(tdim, tdim)
         num_cells1 = self.domain.topology.index_map(tdim).size_local
         cells = np.arange(num_cells1, dtype=np.int32)
-        # h = _cpp.mesh.h(mesh._cpp_object, tdim, cells)
 
         try:
             h = cpp.mesh.h(self.domain, tdim, range(num_cells1))
         except TypeError:
             h = cpp.mesh.h(self.domain._cpp_object, tdim, cells)
 
-        # save as a DG function
         self.cellwise = functionspace(self.domain, ("DG", 0))
-        # V1 = functionspace(domain1,("CG",1))
         height1 = fe.Function(self.cellwise)
         height1.x.array[:num_cells1] = h
-        # deprecated
-        # 080
-        # height1.vector.ghostUpdate()
-        # 090
         height1.x.petsc_vec.ghostUpdate()
 
-        # tau from AdH
         alpha = 0.25
         spherical = self.problem.spherical
-        # set the upwid tensor
-        if self.problem.solution_var == "eta":
-            # WARNING Deprecated!!!!
 
-            # tau from AdH
-            # using previous time step
-            if spherical:
-                factor = sqrt(
-                    self.problem.S
-                    * self.problem.S
-                    * (self.u_n[1] * self.u_n[1] + self.u_n[2] * self.u_n[2])
-                    + g * (self.u_n[0] + self.problem.h_b)
-                )
-            else:
-                factor = sqrt(
-                    self.u_n[1] * self.u_n[1]
-                    + self.u_n[2] * self.u_n[2]
-                    + g * (self.u_n[0] + self.problem.h_b)
-                )
-
-            # upwinding from non-conservative SWE seems to work best when using primitives
-            T1 = as_matrix(
-                (
-                    (self.u[1], (self.u[0] + self.problem.h_b), 0),
-                    (g, self.u[1], 0),
-                    (0, 0, self.u[1]),
-                )
-            )
-            T2 = as_matrix(
-                (
-                    (self.u[2], 0, (self.u[0] + self.problem.h_b)),
-                    (0, self.u[2], 0),
-                    (g, 0, self.u[2]),
-                )
-            )
-            if spherical:
-                if self.problem.projected:
-                    T1 = T1 * self.problem.S
-                else:
-                    T1 = T1 * self.problem.S / R
-                    T2 = T2 / R
-
-            # need a special source for SUPG term compatible with non-conservative SWE
-            S_temp = self.problem.make_Source(self.u, form="canonical")
-            S_nc = as_vector(
-                (
-                    S_temp[0],
-                    S_temp[1] / (self.u[0] + self.problem.h_b),
-                    S_temp[2] / (self.u[0] + self.problem.h_b),
-                )
-            )
-
-        elif self.problem.solution_var == "h":
+        if self.problem.solution_var == "h":
             h, ux, uy = self.problem._get_standard_vars(self.u, "h")
             h_n, ux_n, uy_n = self.problem._get_standard_vars(self.u_n, "h")
-            # factor from adH
-            # previous time step linearizes but seems to be worse at larger time steps
-
-            # cell_avg not implemented :((((
-            # nonlinear but seems to help convergence
-            # factor = sqrt(self.u[1]*self.u[1] + self.u[2]*self.u[2] + g*(self.u[0]))
-            # eps=1e-4
-            # factor = conditional(factor>eps, factor, eps)
 
             if self.swe_type == "full":
                 factor = sqrt(ux_n * ux_n + uy_n * uy_n + g * (h_n))
                 T1 = as_matrix(((ux, h, 0), (g, ux, 0), (0, 0, ux)))
                 T2 = as_matrix(((uy, 0, h), (0, uy, 0), (g, 0, uy)))
 
-                # need a special source for SUPG term compatible with non-conservative SWE
-
                 if self.wd:
-                    # need custom vector for nc
                     S_nc = self.problem.make_Source(self.u, form="canonical")
                 else:
                     S_temp = self.problem.make_Source(self.u, form="canonical")
                     S_nc = as_vector((S_temp[0], S_temp[1] / h, S_temp[2] / h))
 
             elif self.swe_type == "linear":
-                alpha = 0.1  # 0.5/(2**self.p_degree[0])
+                alpha = 0.1
                 h_b = self.problem.get_h_b(self.u)
                 factor = sqrt(ux_n * ux_n + uy_n * uy_n + g * (h_b))
                 T1 = as_matrix(((0, h_b, 0), (g, 0, 0), (0, 0, 0)))
                 T2 = as_matrix(((0, 0, h_b), (0, 0, 0), (g, 0, 0)))
-                # need a special source for SUPG term compatible with non-conservative SWE
                 S_temp = self.problem.make_Source_linearized(self.u, form="canonical")
                 S_nc = as_vector((S_temp[0], S_temp[1], S_temp[2]))
-            else:
-                raise Exception(
-                    "Sorry, swe_type must either be linear or full, not %s"
-                    % self.swe_type
-                )
 
             if spherical:
-                # factor = sqrt(
-                #    self.problem.S * self.problem.S * (self.u[1]*self.u[1] + self.u[2]*self.u[2])
-                #    + g*(self.u[0]))
                 if self.problem.projected:
-                    # S_nc = as_vector((S_temp[0]/self.u[0],S_temp[1]/self.u[0], S_temp[2]/self.u[0]))
-                    # factor = sqrt(self.problem.S**2*(self.u[1]*self.u[1] + self.u[2]*self.u[2]) + g*(self.u[0]))
-
                     factor = sqrt(
                         self.problem.S**2
                         * (self.u_n[1] * self.u_n[1] + self.u_n[2] * self.u_n[2])
@@ -1750,65 +1087,6 @@ class SUPGImplicit(CGImplicit):
                     T1 = T1 * self.problem.S / R
                     T2 = T2 / R
 
-            # Experimental shock capturing term
-            # not used currently
-
-            tau_shock = alpha * height1 / factor
-            dQdxdPdx = elem_mult(self.Q.dx(0), self.p.dx(0))
-            dQdydPdy = elem_mult(self.Q.dx(1), self.p.dx(1))
-            # alternative shock capturing
-            dUdxdPdx = elem_mult(self.u.dx(0), self.p.dx(0))
-            dUdydPdy = elem_mult(self.u.dx(1), self.p.dx(1))
-            # option 1
-            # self.F += tau_shock*inner(dQ_ncdt +T1*self.u.dx(0) + T2*self.u.dx(1) + S_nc, dQdxdPdx +dQdydPdy)*dx
-            # option 2
-            # UNCOMMENT THIS
-            # self.F += tau_shock*inner(dQ_ncdt +T1*self.problem.S*self.u.dx(0) + T2*self.u.dx(1) + S_nc, dUdxdPdx +dUdydPdy)*dx
-
-            ############################################################################
-        elif self.problem.solution_var == "flux":
-            # WARNING: not used
-            # factor from adH
-            factor = sqrt(
-                self.u_n[1] * self.u_n[1]
-                + self.u_n[2] * self.u_n[2]
-                + g * (self.u_n[0])
-            )
-
-            # try upwinding tensor by differentiating using conserved variables instead of solution vars, doesnt seem to be as stable
-            T1 = as_matrix(
-                (
-                    (0, 1, 0),
-                    (
-                        self.u[0] * g - self.u[1] * self.u[1] / (self.u[0] * self.u[0]),
-                        2 * self.u[1] / self.u[0],
-                        0,
-                    ),
-                    (
-                        -self.u[1] * self.u[2] / (self.u[0] * self.u[0]),
-                        self.u[2] / self.u[0],
-                        self.u[1] / self.u[0],
-                    ),
-                )
-            )
-            T2 = as_matrix(
-                (
-                    (0, 0, 1),
-                    (
-                        -self.u[2] * self.u[1] / (self.u[0] * self.u[0]),
-                        self.u[2] / self.u[0],
-                        self.u[1] / self.u[0],
-                    ),
-                    (
-                        self.u[0] * g - self.u[2] * self.u[2] / (self.u[0] * self.u[0]),
-                        0,
-                        2 * self.u[2] / self.u[0],
-                    ),
-                )
-            )
-
-        # adH Tau
-        if self.problem.solution_var == "eta" or self.problem.solution_var == "h":
             tau_SUPG = as_vector(
                 (
                     alpha * height1 / factor,
@@ -1817,57 +1095,22 @@ class SUPGImplicit(CGImplicit):
                 )
             )
 
-        elif self.problem.solution_var == "flux":
-            # try tau from Chen
-            mag_vel = sqrt(
-                self.u_n[1] * self.u_n[1] / (self.u_n[0] * self.u_n[0])
-                + self.u_n[2] * self.u_n[2] / (self.u_n[0] * self.u_n[0])
-            )
-            tau_SUPG = as_vector(
+            # petrov terms for SUPG
+            temp_x = as_vector(
                 (
-                    pow(2 / self.dt + 2 * mag_vel / height1, -1),
-                    pow(2 / self.dt + 2 * mag_vel / height1, -1),
-                    pow(2 / self.dt + 2 * mag_vel / height1, -1),
+                    tau_SUPG[0] * self.p[0].dx(0),
+                    tau_SUPG[1] * self.p[1].dx(0),
+                    tau_SUPG[2] * self.p[2].dx(0),
+                )
+            )
+            temp_y = as_vector(
+                (
+                    tau_SUPG[0] * self.p[0].dx(1),
+                    tau_SUPG[1] * self.p[1].dx(1),
+                    tau_SUPG[2] * self.p[2].dx(1),
                 )
             )
 
-        # petrov terms for SUPG
-        temp_x = as_vector(
-            (
-                tau_SUPG[0] * self.p[0].dx(0),
-                tau_SUPG[1] * self.p[1].dx(0),
-                tau_SUPG[2] * self.p[2].dx(0),
-            )
-        )
-        temp_y = as_vector(
-            (
-                tau_SUPG[0] * self.p[0].dx(1),
-                tau_SUPG[1] * self.p[1].dx(1),
-                tau_SUPG[2] * self.p[2].dx(1),
-            )
-        )
-
-        # Conservative residual with SUPG (doesnt seem to work as well when primitives are unkown)
-        #########################################################################################
-        if self.problem.solution_var == "flux":
-            # Warning: not used
-            self.F += (
-                inner(dQdt + div(self.Fu) + self.S, (T1 * temp_x + T2 * temp_y)) * dx
-            )
-
-            # attempt adding interior penalty
-            # still may need work, but appears to help stability in channel case
-            #####################################################################
-            omega_cip = avg(1 / self.u[0])
-            vel = as_vector((self.u[1], self.u[2]))
-            # self.F += omega_cip*avg(height1**2)*avg(dot(vel,n))*inner(jump(dot(grad(self.u),n)),jump(dot(grad(self.p),n)))*dS
-            ####################################################################
-        ##################################################################################
-
-        # for primitives use non-conservative SWE as the residual
-        # seems to work best
-        ########################################################################
-        if self.problem.solution_var == "eta" or self.problem.solution_var == "h":
             if spherical:
                 self.F += (
                     inner(
@@ -1876,7 +1119,6 @@ class SUPGImplicit(CGImplicit):
                     )
                     * dx
                 )
-
             else:
                 self.F += (
                     inner(
@@ -1886,55 +1128,42 @@ class SUPGImplicit(CGImplicit):
                     * dx
                 )
 
-            ######################################################################
-            # attempt adding interior penalty
-            # still may need work, but appears to help stability in channel case
-            #####################################################################
-            omega_cip = 1.0
-            vel = as_vector((self.u[1], self.u[2]))
-            # self.F += omega_cip*avg(height1**2)*avg(dot(vel,n))*inner(jump(dot(grad(self.u),n)),jump(dot(grad(self.p),n)))*dS
-            ###################################################################
-
 
 class DGCGImplicit(DGImplicit):
-    # DG continuity and CG momentum with SUPG
+    """DG continuity and CG momentum with SUPG."""
+
     def init_fields(self):
-        """Initialize the variables"""
+        """Initialize the variables with CG for momentum."""
         self.p_type = "CG"
 
-        # We generalize the code by now including 2 elements
-        # We generalize the code by now including mixed elements
+        # Use refactored element creation
         el_h = create_element(self.domain, self.p_type, self.p_degree[0])
         el_vel = create_element(self.domain, self.p_type, self.p_degree[1], shape=(2,))
         me = create_mixed_element([el_h, el_vel])
         self.V = functionspace(self.domain, me)
 
-        # for plotting
         self.V_vel = self.V.sub(1).collapse()[0]
         self.V_scalar = self.V.sub(0).collapse()[0]
         if self.verbose:
             self.log("V scalar", self.V_scalar)
 
-        # split these up
-
         self.u = fe.Function(self.V)
         self.hel, self.vel_sol = self.u.split()
 
         self.p1, self.p2 = TestFunctions(self.V)
-
-        # try this to minimize rewrite but may want to change in future
         self.p = as_vector((self.p1, self.p2[0], self.p2[1]))
+
         self.u_n = fe.Function(self.V)
         self.u_n.name = "u_n"
-        # for second order timestep need n-1
         self.u_n_old = fe.Function(self.V)
         self.u_n_old.name = "u_n_old"
 
     def init_weak_form(self):
-        # add entire SUPG weak form
+        """Initialize weak form - adds SUPG from parent."""
         super().init_weak_form()
 
 
+# Solver factory
 _get_solver = {
     "CG": CGImplicit,
     "SUPG": SUPGImplicit,
@@ -1945,9 +1174,20 @@ _get_solver = {
 
 
 def get_solver(solver_type: str) -> BaseSolver:
+    """Get solver class by type string.
+
+    Args:
+        solver_type: One of 'CG', 'SUPG', 'DGCG', 'DG', 'DGNC'
+
+    Returns:
+        Solver class
+
+    Raises:
+        ValueError: If solver_type is unknown
+    """
     try:
         return _get_solver[solver_type.upper()]
     except KeyError:
         raise ValueError(
-            f"Unknown solver type {solver_type}, options available are: {_get_solver.keys()}"
+            f"Unknown solver type {solver_type}, options available are: {list(_get_solver.keys())}"
         )
