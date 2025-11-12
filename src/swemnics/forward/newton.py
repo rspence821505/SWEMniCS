@@ -1,7 +1,13 @@
 """
 Custom Newton solver for general nonlinear variational problems.
 
-This was implemented because more control was desired over the Newton iteration than provided by the built-in NonlinearProblem class.
+This was implemented because more control was desired over the Newton iteration
+than provided by the built-in NonlinearProblem class.
+
+MODIFICATIONS FOR 4D-VAR:
+- CustomNewtonProblem.solve() now accepts return_jacobian flag
+- Returns final Jacobian matrix for efficient adjoint computation
+- NewtonSolver.solve() also returns Jacobian when requested
 """
 
 from dolfinx import fem as fe, nls, log, geometry, io, cpp
@@ -85,8 +91,18 @@ class CustomNewtonProblem:
         if self.comm.rank == 0:
             print(*msg)
 
-    def solve(self, u, max_it=5):
-        """Solve the nonlinear problem at u"""
+    def solve(self, u, max_it=5, return_jacobian=False):
+        """Solve the nonlinear problem at u
+
+        Args:
+            u: Solution function to update in-place
+            max_it: Maximum Newton iterations (default: 5)
+            return_jacobian: If True, return final Jacobian for adjoint (default: False)
+
+        Returns:
+            If return_jacobian=False: None (solution stored in u)
+            If return_jacobian=True: (None, J) where J is the final Jacobian matrix (PETSc.Mat)
+        """
 
         dx = fe.Function(u._V)
         i = 0
@@ -101,23 +117,16 @@ class CustomNewtonProblem:
             A.zeroEntries()
             petsc.assemble_matrix(A, self.jacobian, bcs=self.bcs)
             A.assemble()
-            # return A.copy().transpose()
 
             petsc.assemble_vector(L, self.residual)
 
             L.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
             L.scale(-1)
             # Compute b - J(u_D-u_(i-1))
-            # 080
-            # petsc.apply_lifting(L, [self.jacobian], [self.bcs], x0=[u.vector], scale=1)
-            # 090
             petsc.apply_lifting(
                 L, [self.jacobian], [self.bcs], x0=[u.x.petsc_vec], alpha=1
             )
             # Set dx|_bc = u_{i-1}-u_D
-            # 080
-            # petsc.set_bc(L, self.bcs, u.vector, 1.0)
-            # 090
             petsc.set_bc(L, self.bcs, u.x.petsc_vec, 1.0)
             L.ghostUpdate(
                 addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD
@@ -126,31 +135,15 @@ class CustomNewtonProblem:
                 self.log("Residual norm", L.norm(0))
             # Solve linear problem
             if self.pc_type == "element_block":
-                # print("A cond num", la.cond(petsc_to_csr(A).todense()))
                 new_A, new_rhs = self.pc.precondition(L)
-                # print("new_A cond num", la.cond(petsc_to_csr(new_A).todense()))
-                # solver.reset()
-                # print(solver.getPC().getType())
-                # raise ValueError()
                 solver = PETSc.KSP().create(self.comm)
                 solver.setType("gmres")
                 solver.setTolerances(rtol=1e-8, atol=1e-9)
                 solver.getPC().setType("mat")
                 solver.setOperators(A, self.pc.mat)
-                # start = time.time()
-                # 080
-                # solver.solve(L, dx.vector)
-                # 090
                 solver.solve(L, dx.x.petsc_vec)
-                # print("solved in ", time.time()-start)
             else:
-                # start = time.time()
-                # print("pc type", solver.getPC().getType())
-                # 080
-                # solver.solve(L, dx.vector)
-                # 090
                 solver.solve(L, dx.x.petsc_vec)
-                # print("solved in ", time.time()-start)
 
             dx.x.scatter_forward()
             if self.verbose:
@@ -159,19 +152,14 @@ class CustomNewtonProblem:
                     + f", iterations {solver.getIterationNumber()}, resid norm {solver.getResidualNorm()}"
                 )
             if solver.getConvergedReason() == -9:
-                # raise RuntimeError("Linear Solver failed due to nans or infs!!!!")
                 sys.exit(1)
 
             # Update u_{i+1} = u_i + delta x_i
-            # not working in parallel?
             u.x.array[:] += relaxation_parameter * dx.x.array[:]
 
             i += 1
 
             if i == 1:
-                # 080
-                # self.dx_0_norm = dx.vector.norm(0)
-                # 090
                 self.dx_0_norm = dx.x.petsc_vec.norm(0)
                 if self.verbose:
                     self.log("dx_0 norm,", self.dx_0_norm)
@@ -181,17 +169,10 @@ class CustomNewtonProblem:
             if self.dx_0_norm > 1e-8:
                 dx.x.array[:] = np.array(dx.x.array[:] / self.dx_0_norm)
             # why wont this update unless I call it??
-            # dx.vector.update()
-            # 080
-            # dx.vector.assemble()
-            # 090
             dx.x.petsc_vec.assemble()
             # print('dx after', dx.vector.getArray())
 
             # Compute norm of update
-            # 080
-            # correction_norm = dx.vector.norm(0)
-            # 090
             correction_norm = dx.x.petsc_vec.norm(0)
             if self.verbose:
                 self.log(f"Netwon Iteration {i}: Correction norm {correction_norm}")
@@ -203,10 +184,14 @@ class CustomNewtonProblem:
                         self.log("Still haven't converged. Reducing relax param")
                     relaxation_parameter /= 2
 
-            # print(A.getValuesCSR())
-        # print(L.getArray())
-        # print(L.getArray().size)
-        # print(u.x.array[:])
+        # Return Jacobian if requested (for 4D-Var adjoint)
+        if return_jacobian:
+            # Return a copy of the final Jacobian matrix
+            # This is the matrix ∂R/∂u evaluated at the converged solution
+            J_final = A.copy()
+            return None, J_final
+        else:
+            return None
 
     def assemble_A(self):
         self.A.zeroEntries()
@@ -253,8 +238,6 @@ class ElementBlockPreconditioner:
         )
         block_inds = block_inds.astype(np.int32)
         self.mat.setValuesBlockedCSR(block_inds, block_inds[:-1], inv)
-        # for i in range(len(inv)):
-        #    mat.setValuesBlocked(block_inds[i:i+1], block_inds[i:i+1], inv[i])
         self.mat.assemble()
         new_rhs = self.mat.createVecRight()
         self.mat.mult(rhs, new_rhs)
@@ -294,24 +277,10 @@ class NewtonSolver:
         viewer = PETSc.Viewer().createASCII("default_output.txt")
         ksp.view(viewer)
 
-        # ksp.setType("preonly")
-        # pc = ksp.getPC()
-        # pc.setType("lu")
-        # pc.setFactorSolverType("mumps")
-        # pc.setFactorSetUpSolverType()
-
         opts[f"{option_prefix}ksp_type"] = "preonly"
-        # opts[f"{option_prefix}pc_type"] = "bjacobi"
-        # opts[f"{option_prefix}pc_factor_mat_solver_type"] = "ilu"
-
-        # option_prefix = ksp.getOptionsPrefix()
-        # opts[f"{option_prefix}ksp_type"] = "gmres"#"preonly"#"gmres"#"richardson"#"preonly"#"cg"
         opts[f"{option_prefix}pc_type"] = "lu"  # "bjacobi"#"none"#"lu"#"gamg"
 
         opts[f"{option_prefix}pc_factor_solver_type"] = "mumps"
-        # pc = ksp.getPC()
-        # pc.getFactorMatrix().setMumpsIcntl(icntl=24, ival=1)  # For pressure nullspace
-        # pc.getFactorMatrix().setMumpsIcntl(icntl=25, ival=0)  # For pressure nullspace
 
         ksp.setFromOptions()
 
@@ -323,9 +292,32 @@ class NewtonSolver:
             print(line)
         # print(self.u.vector.getArray())
 
-    def solve(self, u):
+    def solve(self, u, return_jacobian=False):
+        """Solve the nonlinear problem
+
+        Args:
+            u: Solution function to update
+            return_jacobian: If True, attempt to extract and return Jacobian (default: False)
+
+        Returns:
+            If return_jacobian=False: r (convergence reason)
+            If return_jacobian=True: (r, J) where J is the Jacobian or None if unavailable
+
+        Note: The built-in NewtonSolver doesn't easily expose the Jacobian.
+              For 4D-Var applications, prefer using CustomNewtonProblem.
+        """
         # print('before Newton', u.x.array[:])
         r = self.solver.solve(u)
-        # print(self.solver.A.getValuesCSR())
-        # print(self.solver.b.getArray())
-        # print(u.x.array[:])
+
+        if return_jacobian:
+            # The built-in NewtonSolver stores Jacobian in self.solver.A
+            # We can try to extract it, but CustomNewtonProblem is preferred for 4D-Var
+            try:
+                J = self.solver.A.copy() if hasattr(self.solver, "A") else None
+                return r, J
+            except:
+                print("Warning: Could not extract Jacobian from NewtonSolver.")
+                print("For 4D-Var, use CustomNewtonProblem instead.")
+                return r, None
+        else:
+            return r

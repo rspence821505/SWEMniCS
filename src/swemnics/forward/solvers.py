@@ -40,7 +40,6 @@ from petsc4py import PETSc
 import numpy as np
 from swemnics.forward.newton import CustomNewtonProblem
 from swemnics.physics.constants import g, R
-from scipy.sparse import csr_matrix, vstack
 
 try:
     import pyvista
@@ -51,48 +50,10 @@ except ImportError:
     have_pyvista = False
 
 from petsc4py.PETSc import ScalarType
-from typing import Literal
+from typing import Literal, Optional, Sequence
 
 
-def petsc_to_csr(A):
-    """Convert a PETSc matrix to a CSR matrix."""
-    indptr, indices, data = (
-        A.getValuesCSR()
-    )  # row start locations, maps values to columns, and values
-    return csr_matrix((data, indices, indptr), shape=A.size)
-
-
-def gather_petsc_matrix_global(A: PETSc.Mat, comm: MPI.Comm):
-    """Gather full PETSc matrix to rank 0 as a global SciPy CSR matrix."""
-    rank = comm.Get_rank()
-
-    # Get local part of matrix
-    indptr, indices, data = A.getValuesCSR()
-    m_local = len(indptr) - 1
-    n_global = A.getSize()[1]
-
-    local = {
-        "indptr": indptr,
-        "indices": indices,
-        "data": data,
-        "shape": (m_local, n_global),
-    }
-
-    all_local = comm.gather(local, root=0)
-
-    if rank == 0:
-        blocks = []
-        for part in all_local:
-            part_csr = csr_matrix(
-                (part["data"], part["indices"], part["indptr"]), shape=part["shape"]
-            )
-            blocks.append(part_csr)
-        full = vstack(blocks).tocsr()
-        return full
-    else:
-        return None
-
-
+# NOTE: Jacobians/adjoints remain as distributed PETSc matrices for parallel solves.
 def create_element(mesh: mesh.Mesh, family: str, degree: int, shape: tuple[int] = ()):
     """Compatible element creation for UFL and Basix.
 
@@ -131,6 +92,156 @@ def create_mixed_element(elements: list[AbstractFiniteElement]):
         return mixed_element(elements)
 
 
+class TimeStepDataManager:
+    """Centralized manager for saving timestep data during time loops."""
+
+    def __init__(
+        self,
+        solver,
+        save_state: bool = False,
+        make_wet: bool = False,
+        save_bathy: bool = False,
+        save_true_bathy: bool = False,
+        store_jacobians: bool = False,
+        save_adjoints: bool = False,
+        observation_times: Optional[Sequence[int]] = None,
+        verbose: bool = False,
+    ):
+        self.solver = solver
+        self.save_state = save_state
+        self.make_wet = make_wet
+        self.save_bathy = save_bathy
+        self.save_true_bathy = save_true_bathy
+        self.store_jacobians = store_jacobians
+        self.save_adjoints = save_adjoints
+        self.verbose = verbose
+
+        if observation_times is not None:
+            self.observation_times = set(observation_times)
+            self.obs_mode = True
+        else:
+            self.observation_times = None
+            self.obs_mode = False
+
+        self._saved_count = 0
+        self._skipped_count = 0
+        self._start_time = None
+
+        if self.verbose and self.solver.mpi_rank == 0:
+            if self.obs_mode:
+                self.solver.log(
+                    f"DataManager: Observation mode - saving at {len(self.observation_times)} timesteps"
+                )
+            else:
+                self.solver.log("DataManager: Saving at all timesteps")
+
+    def should_save_at(self, timestep: int) -> bool:
+        """Return True if data should be saved at the given timestep."""
+        if self.observation_times is None:
+            return self.save_state or self.store_jacobians or self.save_adjoints
+        return timestep in self.observation_times
+
+    def save_timestep(
+        self, timestep: int, J: Optional[PETSc.Mat] = None, local_points=None
+    ):
+        """Save configured data for the current timestep.
+
+        Args:
+            timestep: Current timestep index (0-based).
+            J: Optional Jacobian (distributed PETSc.Mat, never gathered).
+            local_points: Observation coordinates for wetting/drying logic.
+        """
+        if self._start_time is None:
+            import time
+
+            self._start_time = time.time()
+
+        if not self.should_save_at(timestep):
+            self._skipped_count += 1
+            return
+
+        if J is not None and self.store_jacobians:
+            self.solver.save_jacobians(J)
+
+        if self.save_adjoints and timestep > 0:
+            self.solver.save_adjoints()
+
+        if self.save_state:
+            self._save_state_with_wd(local_points)
+
+        self._saved_count += 1
+
+        if self.verbose and self.solver.mpi_rank == 0 and self._saved_count % 10 == 0:
+            import time
+
+            elapsed = time.time() - self._start_time
+            rate = self._saved_count / elapsed if elapsed > 0 else 0.0
+            self.solver.log(
+                f"DataManager: Saved {self._saved_count} timesteps ({rate:.1f} saves/sec)"
+            )
+
+    def _save_state_with_wd(self, local_points):
+        """Internal helper to save state with optional wetting/drying handling."""
+        if self.make_wet and local_points is not None and len(local_points) > 0:
+            water_height, dry_node_indices = self.solver.check_dry_nodes(
+                self.solver.u,
+                local_points,
+                save_bathy=self.save_bathy,
+                save_true_bathy=self.save_true_bathy,
+            )
+            self.solver.save_states(
+                water_height=water_height,
+                dry_node_indices=dry_node_indices,
+            )
+        else:
+            self.solver.save_states()
+
+    def estimate_memory_usage(self, n_dofs: int, nnz_per_row: int = 10) -> dict:
+        """Estimate memory usage for stored data (in MB)."""
+        bytes_per_float = 8
+        n_saves = (
+            len(self.observation_times) if self.obs_mode else self.solver.problem.nt
+        )
+        estimates: dict[str, float] = {}
+
+        if self.save_state:
+            state_mb = (n_saves * n_dofs * bytes_per_float) / (1024**2)
+            estimates["states"] = state_mb
+
+        if self.store_jacobians:
+            jac_mb = (n_saves * n_dofs * nnz_per_row * bytes_per_float) / (1024**2)
+            estimates["jacobians"] = jac_mb
+
+        if self.save_adjoints:
+            adj_mb = (n_saves * n_dofs * nnz_per_row * bytes_per_float) / (1024**2)
+            estimates["adjoints"] = adj_mb
+
+        estimates["total"] = sum(estimates.values())
+        return estimates
+
+    def get_summary(self) -> dict:
+        """Return summary statistics for saved data."""
+        return {
+            "saved": self._saved_count,
+            "skipped": self._skipped_count,
+            "mode": "observation" if self.obs_mode else "all_timesteps",
+            "observation_times": (
+                list(self.observation_times) if self.obs_mode else None
+            ),
+            "n_states": len(self.solver.saved_states),
+            "n_jacobians": len(self.solver.saved_jacobians),
+            "n_adjoints": len(self.solver.saved_adjoints),
+            "n_dry_nodes": len(self.solver.dry_nodes),
+        }
+
+    def __repr__(self) -> str:
+        summary = self.get_summary()
+        return (
+            f"TimeStepDataManager(mode={summary['mode']}, "
+            f"saved={summary['saved']}, skipped={summary['skipped']})"
+        )
+
+
 class BaseSolver:
     """Defines a base solver class that solves the steady-state shallow-water equations."""
 
@@ -167,11 +278,13 @@ class BaseSolver:
         self.swe_type = swe_type
         self.F_no_dt = None
         self.verbose = verbose
-        self.saved_adjoints = []
+        # Storage for parallel 4D-Var computations (distributed PETSc matrices)
+        self.saved_adjoints = []  # List[PETSc.Mat] – adjoint Jacobians per timestep
         self.saved_states = []
         self.dry_nodes = []
         self.saved_true_bathy = []
         self.saved_bathy = []
+        self.saved_jacobians = []  # List[PETSc.Mat] – forward Jacobians per timestep
 
         if self.verbose:
             self.log("SWE TYPE", self.swe_type)
@@ -531,14 +644,23 @@ class CGImplicit(BaseSolver):
         Newton_obj = CustomNewtonProblem(self, solver_parameters=solver_parameters)
         return Newton_obj
 
-    def solve_timestep(self, solver):
+    def solve_timestep(self, solver, store_jacobian=False):
         """Solve the nonlinear problem at the current time step.
 
         Args:
           solver: Newton solver.
+          store_jacobian: If True, request Jacobian from Newton solver (for 4D-Var).
+
+        Returns:
+          J: Jacobian matrix if store_jacobian=True, else None
         """
         try:
-            solver.solve(self.u)
+            if store_jacobian:
+                _, J = solver.solve(self.u, return_jacobian=True)
+                return J
+            else:
+                solver.solve(self.u, return_jacobian=False)
+                return None
         except RuntimeError:
             h_fun = self.u.sub(0).collapse()
             hvals = h_fun.x.array[:]
@@ -778,44 +900,38 @@ class CGImplicit(BaseSolver):
         return inds, vals
 
     def save_adjoints(self):
-        """Assemble Jacobian, transpose it, and gather full CSR matrix on rank 0."""
-        comm = (
-            self.problem.mesh.comm
-        )  # assumes self.problem.comm is MPI.COMM_WORLD or similar
-
+        """Save adjoint Jacobian for parallel adjoint solve (distributed storage)."""
         A_tlm = self.solver.assemble_A()
         A_adjoint = A_tlm.transpose()
         A_adjoint.assemble()
+        self.saved_adjoints.append(A_adjoint.copy())
 
-        # if self.mpi_rank == 0:
-        #     print(f"[Rank 0] Gathering full A_adjoint matrix", flush=True)
+    def save_jacobians(self, J):
+        """Save Jacobian matrix for 4D-Var adjoint computation.
 
-        A_csr = gather_petsc_matrix_global(A_adjoint, comm)
+        Args:
+            J: PETSc.Mat - Jacobian from Newton solver
 
-        if self.mpi_rank == 0:
-            self.saved_adjoints.append(A_csr.copy())
+        Note:
+            Each MPI rank stores only its local portion of ``J``. These
+            distributed matrices are used directly during adjoint solves
+            via transpose applications—no gathering required.
+        """
+        if J is not None:
+            # Store the Jacobian - it's already a PETSc matrix
+            # For parallel runs, each process stores its local part
+            self.saved_jacobians.append(J.copy())
 
-    def save_states(
-        self,
-        make_wet=False,
-        local_points=None,
-        water_height=None,
-        dry_node_indices=None,
-    ):
-        """Gather and save global state vector"""
+    def save_states(self, water_height=None, dry_node_indices=None):
+        """Save global state vector with optional wetting/drying adjustments."""
 
-        # Default: copy the current solution
         u_sol = self.u.x.array.copy().flatten()
-        if dry_node_indices is not None:
+
+        if dry_node_indices is not None and water_height is not None:
             V_sub = self.problem.V.sub(0)
             _, sub_map = V_sub.collapse()
-            water_height[dry_node_indices] = (
-                0.0  # Set water depth to zero at dry nodes i.e. eta = -hb
-            )
-            # water_height[dry_node_indices] = -bathy[dry_node_indices]  # Set water depth to zero at dry nodes
-            u_sol[sub_map] = (
-                water_height.copy().flatten()
-            )  # Update solution with modified water depth
+            water_height[dry_node_indices] = 0.0
+            u_sol[sub_map] = water_height.copy().flatten()
 
         self.saved_states.append(u_sol)
 
@@ -866,13 +982,31 @@ class CGImplicit(BaseSolver):
         save_bathy=False,
         save_true_bathy=False,
         make_wet=False,
+        store_jacobians=False,  # NEW: 4D-Var parameter
+        observation_times=None,
     ):
+        """Time-stepping loop with optional Jacobian storage for 4D-Var.
 
-        # self.saved_states = []
-        # self.saved_adjoints = []
-        # self.dry_nodes = []
-        # self.saved_bathy = []
-        # self.saved_true_bathy = []
+        Args:
+            solver_parameters: Parameters passed to the nonlinear solver.
+            stations: Monitoring station coordinates.
+            plot_every: Plotting cadence.
+            plot_name: Base name for visualization output.
+            u_0: Optional initial condition override.
+            save_state: Save every state (legacy mode). Ignored when
+                ``observation_times`` is provided.
+            adjoint_method: Whether to assemble adjoint matrices (legacy).
+            save_bathy: Save bathymetry samples when applying wetting/drying.
+            save_true_bathy: Save true bathymetry and dry node indices.
+            make_wet: Apply wetting/drying adjustments before saving.
+            store_jacobians: Store Jacobians for 4D-Var adjoint computation.
+            observation_times: Optional iterable of timestep indices to save.
+        """
+
+        if store_jacobians:
+            self.saved_jacobians = []
+            if self.verbose:
+                self.log("4D-Var mode: Jacobians will be stored during forward solve")
 
         if self.verbose:
             self.log("calling time loop")
@@ -880,7 +1014,7 @@ class CGImplicit(BaseSolver):
         self.station_data = np.zeros((self.problem.nt + 1, local_points.shape[0], 3))
 
         # set initial guess for the first time step
-        if u_0 == None:
+        if u_0 is None:
             self.u.x.array[:] = self.u_n.x.array[:]
         else:
             self.u_n.x.array[:] = u_0.x.array[:]
@@ -900,25 +1034,20 @@ class CGImplicit(BaseSolver):
             self.initialize_video(plot_name)
             self.plot_frame()
 
-        # if len(stations):
-        #     self.station_data[0, :, :] = self.record_stations(self.u, local_points)
+        effective_save_state = save_state or (observation_times is not None)
+        data_manager = TimeStepDataManager(
+            solver=self,
+            save_state=effective_save_state,
+            make_wet=make_wet,
+            save_bathy=save_bathy,
+            save_true_bathy=save_true_bathy,
+            store_jacobians=store_jacobians,
+            save_adjoints=adjoint_method,
+            observation_times=observation_times,
+            verbose=self.verbose,
+        )
 
-        if save_state:
-            if make_wet:
-                water_height, dry_node_indices = self.check_dry_nodes(
-                    self.u,
-                    local_points,
-                    save_bathy=save_bathy,
-                    save_true_bathy=save_true_bathy,
-                )
-                self.save_states(
-                    make_wet=make_wet,
-                    local_points=local_points,
-                    water_height=water_height,
-                    dry_node_indices=dry_node_indices,
-                )
-            else:
-                self.save_states(make_wet=make_wet, local_points=local_points)
+        data_manager.save_timestep(timestep=0, local_points=local_points)
 
         # take first 2 steps with implicit Euler since we dont have enough steps for higher order
         self.theta1.value = 0
@@ -927,37 +1056,18 @@ class CGImplicit(BaseSolver):
                 self.log("Time Step Number", a, "Out of", self.problem.nt)
                 self.log(a / self.problem.nt * 100, "% Complete")
             self.update_solution()
-            # working version here
-            self.solve_timestep(solver)
 
-            # add data to station variable
-            # if len(stations):
-            #     self.station_data[a + 1, :, :] = self.record_stations(
-            #         self.u, local_points
-            #     )
+            should_get_jacobian = store_jacobians and data_manager.should_save_at(a + 1)
+            J = self.solve_timestep(solver, store_jacobian=should_get_jacobian)
 
             if a % plot_every == 0 and plot_every <= self.problem.nt:
                 self.plot_frame()
 
-            if save_state:
-                if make_wet:
-                    water_height, dry_node_indices = self.check_dry_nodes(
-                        self.u,
-                        local_points,
-                        save_bathy=save_bathy,
-                        save_true_bathy=save_true_bathy,
-                    )
-                    self.save_states(
-                        make_wet=make_wet,
-                        local_points=local_points,
-                        water_height=water_height,
-                        dry_node_indices=dry_node_indices,
-                    )
-                else:
-                    self.save_states(make_wet=make_wet, local_points=local_points)
-
-            if adjoint_method:
-                self.save_adjoints()
+            data_manager.save_timestep(
+                timestep=a + 1,
+                J=J,
+                local_points=local_points,
+            )
 
         # switch to high order time stepping
 
@@ -967,35 +1077,17 @@ class CGImplicit(BaseSolver):
                 self.log("Time Step Number", a, "Out of", self.problem.nt)
                 self.log(a / self.problem.nt * 100, "% Complete")
             self.update_solution()
-            # working version
-            self.solve_timestep(solver)
+            should_get_jacobian = store_jacobians and data_manager.should_save_at(a + 1)
+            J = self.solve_timestep(solver, store_jacobian=should_get_jacobian)
 
-            # if len(stations):
-            #     self.station_data[a + 1, :, :] = self.record_stations(
-            #         self.u, local_points
-            #     )
+            data_manager.save_timestep(
+                timestep=a + 1,
+                J=J,
+                local_points=local_points,
+            )
+
             if a % plot_every == 0:
                 self.plot_frame()
-
-            if save_state:
-                if make_wet:
-                    water_height, dry_node_indices = self.check_dry_nodes(
-                        self.u,
-                        local_points,
-                        save_bathy=save_bathy,
-                        save_true_bathy=save_true_bathy,
-                    )
-                    self.save_states(
-                        make_wet=make_wet,
-                        local_points=local_points,
-                        water_height=water_height,
-                        dry_node_indices=dry_node_indices,
-                    )
-                else:
-                    self.save_states(make_wet=make_wet, local_points=local_points)
-
-            if adjoint_method:
-                self.save_adjoints()
 
         if plot_every <= self.problem.nt:
             self.finalize_video()
@@ -1008,7 +1100,13 @@ class CGImplicit(BaseSolver):
         self.vals = vals
         self.inds = inds
 
-        # optionally evaluate and print L2 error
+        if self.verbose:
+            summary = data_manager.get_summary()
+            self.log(f"Time loop complete: {summary}")
+            if store_jacobians:
+                self.log(f"Stored {len(self.saved_jacobians)} Jacobians for 4D-Var")
+
+        # Optionally evaluate and print L2 error
         if self.problem.check_solution_def is not None:
             print("Checking solution at ", self.problem.t)
             e0 = self.problem.check_solution(self.u, self.V, self.problem.t)

@@ -92,35 +92,29 @@ class ImplicitAdjointSolver:
 
         return lambda_next
 
-    def _solve_transpose_system(self, n: int, forcing: PETSc.Vec) -> PETSc.Vec:
-        """
-        Solve transpose linear system: Jᵀ·λⁿ = RHS.
+    class ImplicitAdjointSolver:
+        def _solve_transpose_system(self, J: PETSc.Mat, rhs: PETSc.Vec):
+            """
+            Solve J^T · λ = rhs using the DISTRIBUTED Jacobian.
 
-        The Jacobian J = ∂R/∂uⁿ⁺¹ from forward Newton solve
-        is reused by transposing it.
+            The Jacobian J = ∂R/∂uⁿ⁺¹ from forward Newton solve
+            is reused by transposing it.
 
-        Args:
-            n: Time index
-            forcing: Right-hand side
+            Args:
+                n: Time index
+                forcing: Right-hand side
 
-        Returns:
-            Solution λⁿ
-        """
-        # Get Jacobian from forward solve
-        J = self.jacobians[n]
+            Returns:
+                Solution λⁿ
+            """
 
-        # Set up KSP for transpose solve
-        if self.ksp is None:
-            self._setup_ksp()
+            ksp = PETSc.KSP().create(J.getComm())
+            ksp.setOperators(J)
+            ksp.setTransposeMode(True)  # Parallel transpose solve
 
-        self.ksp.setOperators(J)
-        self.ksp.setTransposeMode(True)  # Solve Jᵀx = b
-
-        # Solve
-        lambda_n = forcing.duplicate()
-        self.ksp.solve(forcing, lambda_n)
-
-        return lambda_n
+            lambda_n = rhs.duplicate()
+            ksp.solve(rhs, lambda_n)
+            return lambda_n
 
     def _assemble_adjoint_forcing(
         self,
