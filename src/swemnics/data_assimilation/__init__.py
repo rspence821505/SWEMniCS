@@ -18,37 +18,6 @@ observation_operator : Observation operators (existing, to be refactored)
 qoi_maps : QoI maps for DC-4DVar (TODO: to be implemented)
 """
 
-from .covariance import (
-    CovarianceMatrix,
-    DiagonalCovariance,
-    DenseCovariance,
-    ImplicitCovariance,
-    create_observation_covariance,
-    create_background_covariance_from_ensemble,
-    check_covariance_symmetry,
-    check_inverse_consistency,
-)
-
-__all__ = [
-    "CovarianceMatrix",
-    "DiagonalCovariance",
-    "DenseCovariance",
-    "ImplicitCovariance",
-    "create_observation_covariance",
-    "create_background_covariance_from_ensemble",
-    "check_covariance_symmetry",
-    "check_inverse_consistency",
-]
-
-__version__ = "0.1.0"
-"""Data assimilation utilities for SWEMniCS.
-
-This package contains covariance models, cost functions, observation
-operators, QoI maps, and diagnostic metrics used by the 4D-Var and
-Data-Consistent assimilation workflows.  The most commonly used symbols
-are re-exported here for easy access via ``swemnics.data_assimilation``.
-"""
-
 from __future__ import annotations
 
 from .covariance import (
@@ -84,6 +53,8 @@ from .metrics import (
     DAMetrics,
     CostFunctionHistory,
 )
+
+__version__ = "0.1.0"
 
 __all__ = [
     # Covariance utilities

@@ -15,6 +15,7 @@ from swemnics.data_assimilation.covariance import (
     DiagonalCovariance,
     DenseCovariance,
     ImplicitCovariance,
+    PrecisionBasedCovariance,
     create_observation_covariance,
     create_background_covariance_from_ensemble,
     check_covariance_symmetry,
@@ -185,7 +186,7 @@ def example_implicit_covariance_precision():
     precision.assemblyBegin()
     precision.assemblyEnd()
 
-    B = ImplicitCovariance(comm, precision, inverse_is_explicit=True)
+    B = PrecisionBasedCovariance(comm, precision, inverse_is_explicit=True)
 
     print(f"Implicit background covariance: {n_dofs} DoFs")
     print(f"Precision matrix: α={alpha}, β={beta}")

@@ -457,8 +457,8 @@ class DenseCovariance(CovarianceMatrix):
             self.mat.destroy()
 
 
-class ImplicitCovariance(CovarianceMatrix):
-    """Implicit covariance via inverse application.
+class PrecisionBasedCovariance(CovarianceMatrix):
+    """Implicit covariance via precision matrix.
 
     Instead of storing C explicitly, store C⁻¹ or a way to apply C⁻¹.
     This is efficient when:
@@ -474,7 +474,7 @@ class ImplicitCovariance(CovarianceMatrix):
     >>> # C⁻¹ = αI + β·L where L is the graph Laplacian
     >>> alpha, beta = 1.0, 0.1
     >>> precision = alpha * identity + beta * laplacian
-    >>> B = ImplicitCovariance(
+    >>> B = PrecisionBasedCovariance(
     ...     comm, precision, inverse_is_explicit=True
     ... )
     """
@@ -525,7 +525,6 @@ class ImplicitCovariance(CovarianceMatrix):
 
     def _set_preconditioner(self, pc: PETSc.PC) -> None:
         """Set PC type with graceful fallback if HYPRE is unavailable."""
-
         try:
             pc.setType(self._preferred_pc)
         except PETSc.Error:
@@ -591,145 +590,6 @@ class ImplicitCovariance(CovarianceMatrix):
             self.ksp_inverse.destroy()
         if hasattr(self, "precision_mat"):
             self.precision_mat.destroy()
-
-
-"""
-Covariance matrix representations for 4D-Var.
-
-Implements various covariance structures (diagonal, full, implicit)
-with efficient inverse operations needed for cost function computation.
-"""
-
-from abc import ABC, abstractmethod
-from typing import Optional
-import numpy as np
-from petsc4py import PETSc
-from mpi4py import MPI
-
-
-class CovarianceMatrix(ABC):
-    """
-    Abstract base class for covariance matrices.
-
-    Provides interface for covariance operations:
-    - C·v: Apply covariance
-    - C⁻¹·v: Apply inverse covariance
-    - sqrt(C)·v: Apply square root (for sampling)
-    """
-
-    def __init__(self, size: int, comm: MPI.Comm = None):
-        """
-        Initialize covariance matrix.
-
-        Args:
-            size: Dimension of covariance matrix
-            comm: MPI communicator
-        """
-        self.size = size
-        self.comm = comm or MPI.COMM_WORLD
-
-    @abstractmethod
-    def apply(self, v: PETSc.Vec) -> PETSc.Vec:
-        """
-        Apply covariance: w = C·v.
-
-        Args:
-            v: Input vector
-
-        Returns:
-            C·v
-        """
-        pass
-
-    @abstractmethod
-    def apply_inverse(self, v: PETSc.Vec) -> PETSc.Vec:
-        """
-        Apply inverse covariance: w = C⁻¹·v.
-
-        Args:
-            v: Input vector
-
-        Returns:
-            C⁻¹·v
-        """
-        pass
-
-    def apply_sqrt(self, v: PETSc.Vec) -> PETSc.Vec:
-        """
-        Apply square root: w = sqrt(C)·v.
-
-        Args:
-            v: Input vector
-
-        Returns:
-            sqrt(C)·v
-        """
-        raise NotImplementedError("Square root not implemented")
-
-    def inner_product(
-        self, v1: PETSc.Vec, v2: PETSc.Vec, inverse: bool = False
-    ) -> float:
-        """
-        Compute C-weighted inner product: ⟨v1, C·v2⟩ or ⟨v1, C⁻¹·v2⟩.
-
-        Args:
-            v1: First vector
-            v2: Second vector
-            inverse: If True, use C⁻¹ instead of C
-
-        Returns:
-            Weighted inner product
-        """
-        if inverse:
-            Cv2 = self.apply_inverse(v2)
-        else:
-            Cv2 = self.apply(v2)
-        return v1.dot(Cv2)
-
-
-class DiagonalCovariance(CovarianceMatrix):
-    """
-    Diagonal covariance matrix.
-
-    C = diag(σ₁², σ₂², ..., σₙ²)
-
-    Most efficient representation for uncorrelated errors.
-    """
-
-    def __init__(self, variances: PETSc.Vec, comm: MPI.Comm = None):
-        """
-        Initialize diagonal covariance.
-
-        Args:
-            variances: Vector of variances σᵢ²
-            comm: MPI communicator
-        """
-        super().__init__(variances.size, comm)
-        self.variances = variances.copy()
-
-        # Precompute inverse
-        self.inv_variances = variances.copy()
-        self.inv_variances.reciprocal()
-
-    def apply(self, v: PETSc.Vec) -> PETSc.Vec:
-        """Multiply by diagonal: w = diag(σ²)·v."""
-        w = v.copy()
-        w.pointwiseMult(v, self.variances)
-        return w
-
-    def apply_inverse(self, v: PETSc.Vec) -> PETSc.Vec:
-        """Multiply by inverse diagonal: w = diag(1/σ²)·v."""
-        w = v.copy()
-        w.pointwiseMult(v, self.inv_variances)
-        return w
-
-    def apply_sqrt(self, v: PETSc.Vec) -> PETSc.Vec:
-        """Multiply by sqrt(diag): w = diag(σ)·v."""
-        sqrt_var = self.variances.copy()
-        sqrt_var.sqrtabs()
-        w = v.copy()
-        w.pointwiseMult(v, sqrt_var)
-        return w
 
 
 class FullCovariance(CovarianceMatrix):

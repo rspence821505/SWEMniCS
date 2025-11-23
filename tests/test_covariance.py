@@ -24,6 +24,7 @@ from swemnics.data_assimilation.covariance import (
     DiagonalCovariance,
     DenseCovariance,
     ImplicitCovariance,
+    PrecisionBasedCovariance,
     create_observation_covariance,
     check_covariance_symmetry,
     check_inverse_consistency,
@@ -371,7 +372,7 @@ class TestDenseCovariance:
         assert check_covariance_symmetry(C, tol=1e-10)
 
 
-class TestImplicitCovariance:
+class TestPrecisionBasedCovariance:
     """Tests for ImplicitCovariance class."""
 
     def test_explicit_precision_apply_inverse(self, comm):
@@ -391,7 +392,7 @@ class TestImplicitCovariance:
         precision.assemblyBegin()
         precision.assemblyEnd()
 
-        C = ImplicitCovariance(comm, precision, inverse_is_explicit=True)
+        C = PrecisionBasedCovariance(comm, precision, inverse_is_explicit=True)
 
         # Test inverse application (should be identity)
         v = C.create_vec()
@@ -424,7 +425,7 @@ class TestImplicitCovariance:
         precision.assemblyBegin()
         precision.assemblyEnd()
 
-        C = ImplicitCovariance(comm, precision, inverse_is_explicit=True)
+        C = PrecisionBasedCovariance(comm, precision, inverse_is_explicit=True)
 
         # This test is relaxed due to iterative solver tolerance
         assert check_inverse_consistency(C, tol=1e-5)
