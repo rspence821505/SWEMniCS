@@ -124,7 +124,7 @@ solver.time_loop(
     stations=stations,
     plot_every=1,
     plot_name="SUPG_tide",
-    save_states=True,
+    save_state=True,
     adjoint_method=True,
 )
 

@@ -18,4 +18,4 @@ finally:
 
 __all__ = ["FrictionLaw", "__version__"]
 
-from .problems import FrictionLaw
+from .forward.problems import FrictionLaw

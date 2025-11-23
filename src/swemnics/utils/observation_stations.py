@@ -52,7 +52,25 @@ class StationManager:
         Returns:
             Array of points located on this processor
         """
-        points = np.asarray(points, dtype=self.domain.geometry.x.dtype).reshape(-1, 3)
+        # Convert points to numpy array
+        points = np.asarray(points, dtype=self.domain.geometry.x.dtype)
+
+        # DOLFINx geometry functions always expect 3D points, even for 2D meshes
+        # Reshape to (n_points, 3), padding with zeros if necessary
+        if points.size == 0:
+            points = points.reshape(-1, 3)
+        else:
+            if points.ndim == 1:
+                points = points.reshape(1, -1)
+
+            n_points = points.shape[0]
+            if points.shape[1] < 3:
+                # Pad with zeros for missing dimensions (e.g., 2D -> 3D)
+                padding = np.zeros((n_points, 3 - points.shape[1]), dtype=points.dtype)
+                points = np.hstack([points, padding])
+            elif points.shape[1] > 3:
+                # Truncate to 3 dimensions
+                points = points[:, :3]
 
         if len(points) == 0:
             self.cells = []
@@ -121,11 +139,19 @@ class StationManager:
             h_values -= self.station_bathy
 
         # Evaluate velocity at stations
-        u_values = u_sol.sub(1).eval(self.points_on_proc, self.cells)
+        vel_values = u_sol.sub(1).eval(self.points_on_proc, self.cells)
 
-        # Combine into single array
-        u_values = np.hstack([h_values, u_values])
-        return u_values
+        # Ensure proper shapes for concatenation
+        # h_values should be (n_stations,) and vel_values should be (n_stations, 2)
+        if h_values.ndim == 1:
+            h_values = h_values.reshape(-1, 1)  # Shape: (n_stations, 1)
+        if vel_values.ndim == 1:
+            # Single station case
+            vel_values = vel_values.reshape(1, -1)  # Shape: (1, 2)
+
+        # Combine into single array: [h, u, v]
+        result = np.hstack([h_values, vel_values])
+        return result
 
     def check_dry_nodes(
         self,
@@ -154,7 +180,14 @@ class StationManager:
         """
         # Extract water depth values at evaluation points
         water_height = solution.sub(0).eval(evaluation_points, self.cells)
-        bathy = self.h_b.eval(evaluation_points, self.cells)
+
+        # Get bathymetry values
+        # If h_b is a Constant, use its value; otherwise evaluate it
+        if hasattr(self.h_b, 'eval'):
+            bathy = self.h_b.eval(evaluation_points, self.cells)
+        else:
+            # For Constant objects, use the stored station bathymetry from init_stations
+            bathy = self.station_bathy
 
         # Calculate water surface elevation relative to bathymetry
         water_surface_elevation = water_height - bathy
