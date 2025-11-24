@@ -4,19 +4,38 @@ Cost function implementations for 4D-Var data assimilation.
 Implements standard 4D-Var, DC-4DVar, and DC-WME variants
 following Spence et al. (2025).
 
-This module provides both explicit and implicit adjoint implementations:
-- Explicit adjoint: For testing with simple forward models
-- Implicit adjoint: For production use with BDF2 implicit schemes
+Mathematical Formulations
+-------------------------
+Standard 4D-Var:
+    J(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
+         + ½ Σ_k ⟨H_k(u_k) - y_k, R_k⁻¹(H_k(u_k) - y_k)⟩
 
-Author: Rylan Spence
-Date: 2025
+DC-4DVar (Data-Consistent):
+    J_DC(m) = J(m) - ½ Σ_k ⟨Q_k(m) - Q_k(m_b), L_k⁻¹(Q_k(m) - Q_k(m_b))⟩
+
+DC-WME (Weighted Mean Error):
+    Q_wme,k(m) = (1/√N) Σ_{j=0}^{k-1} R_j^{-1/2}(H_j(M_{j:0}(m)) - y_j)
+    J_WME(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
+             + ½ ‖Q_wme(m)‖²
+             - ½ ⟨Q_wme(m) - Q_wme(m_b), L_wme⁻¹(Q_wme(m) - Q_wme(m_b))⟩
 """
 
 from abc import ABC, abstractmethod
+from typing import Optional, List, Tuple, Dict, Union, Callable
+from dataclasses import dataclass
 from petsc4py import PETSc
 from mpi4py import MPI
-from typing import Optional, List, Tuple, Dict
 import numpy as np
+
+
+@dataclass
+class CostFunctionResult:
+    """Container for cost function evaluation results."""
+
+    value: float
+    background_term: float
+    observation_term: float
+    predictability_term: float = 0.0
 
 
 class CostFunction(ABC):
@@ -25,128 +44,17 @@ class CostFunction(ABC):
 
     Defines the interface for computing cost function value,
     gradient, and Hessian-vector products.
-    """
-
-    def __init__(
-        self, forward_model, observation_operator, background_cov, observation_cov
-    ):
-        """
-        Initialize cost function.
-
-        Args:
-            forward_model: Forward model M_{k:0}
-            observation_operator: Observation operator H_k
-            background_cov: Background error covariance B
-            observation_cov: Observation error covariance R_k
-        """
-        self.forward_model = forward_model
-        self.obs_op = observation_operator
-        self.B = background_cov
-        self.R = observation_cov
-
-        # Cache for forward trajectory
-        self._trajectory = None
-        self._jacobians = None
-
-    @abstractmethod
-    def value(self, m: PETSc.Vec) -> float:
-        """
-        Compute cost function value J(m).
-
-        Args:
-            m: Control variable (initial condition)
-
-        Returns:
-            Cost function value
-        """
-        pass
-
-    @abstractmethod
-    def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
-        """
-        Compute gradient ∇J(m) via adjoint method.
-
-        Args:
-            m: Control variable
-
-        Returns:
-            Gradient vector
-        """
-        pass
-
-    def hessian_vector_product(self, m: PETSc.Vec, v: PETSc.Vec) -> PETSc.Vec:
-        """
-        Compute Hessian-vector product Hv using Gauss-Newton approximation.
-
-        Args:
-            m: Control variable
-            v: Direction vector
-
-        Returns:
-            H·v
-        """
-        raise NotImplementedError("Gauss-Newton Hessian not yet implemented")
-
-    def _run_forward_model(
-        self, m: PETSc.Vec, store_jacobians: bool = True
-    ) -> Tuple[List, Optional[List]]:
-        """
-        Run forward model and cache trajectory.
-
-        Args:
-            m: Initial condition
-            store_jacobians: Whether to cache Jacobians for adjoint
-
-        Returns:
-            (trajectory, jacobians) tuple
-        """
-        self._trajectory, self._jacobians = self.forward_model.solve(
-            m, store_jacobians=store_jacobians
-        )
-        return self._trajectory, self._jacobians
-
-
-class FourDVarCost(CostFunction):
-    """
-    Standard 4D-Var cost function with implicit adjoint gradient.
-
-    This class implements the full 4D-Var cost function with:
-    - Background term for regularization
-    - Observation terms at multiple time steps
-    - Gradient via adjoint solver (explicit or implicit)
-    - Gauss-Newton Hessian approximation for optimization
-
-    The implementation supports both explicit and implicit time-stepping:
-    - use_implicit_adjoint=False: For explicit schemes (u_{n+1} = A*u_n)
-    - use_implicit_adjoint=True: For implicit BDF2 schemes
 
     Attributes
     ----------
     forward_model : ForwardModel
-        Forward model M_{k:0} with Jacobian caching
+        Forward model M_{k:0} that propagates initial conditions.
     obs_op : ObservationOperator
-        Observation operator H_k
+        Observation operator H_k mapping state to observations.
     B : CovarianceMatrix
-        Background error covariance
-    R : Dict[int, CovarianceMatrix]
-        Observation error covariances R_k for each observation time
-    m_b : PETSc.Vec
-        Background state (prior)
-    observations : Dict[int, PETSc.Vec]
-        Observations {k: y_k} at each observation time
-    obs_times : List[int]
-        Time indices where observations are available
-    use_implicit_adjoint : bool
-        Whether to use implicit BDF2 adjoint (True) or explicit (False)
-
-    Methods
-    -------
-    value(m)
-        Compute cost function J(m)
-    gradient(m)
-        Compute gradient ∇J(m) via adjoint
-    hessian_vector_product(m, v)
-        Compute Hessian-vector product H·v (Gauss-Newton approximation)
+        Background error covariance.
+    R : CovarianceMatrix
+        Observation error covariance.
     """
 
     def __init__(
@@ -154,12 +62,168 @@ class FourDVarCost(CostFunction):
         forward_model,
         observation_operator,
         background_cov,
-        observation_cov: Dict[int, any],
+        observation_cov,
+        comm: Optional[MPI.Comm] = None,
+    ):
+        """
+        Initialize cost function.
+
+        Parameters
+        ----------
+        forward_model : ForwardModel
+            Forward model M_{k:0}.
+        observation_operator : ObservationOperator
+            Observation operator H_k.
+        background_cov : CovarianceMatrix
+            Background error covariance B.
+        observation_cov : CovarianceMatrix or Dict[int, CovarianceMatrix]
+            Observation error covariance R_k. Can be a single covariance
+            for all times or a dictionary mapping time indices to covariances.
+        comm : MPI.Comm, optional
+            MPI communicator. Defaults to MPI.COMM_WORLD.
+        """
+        self.forward_model = forward_model
+        self.obs_op = observation_operator
+        self.B = background_cov
+        self.R = observation_cov
+        self.comm = comm if comm is not None else MPI.COMM_WORLD
+
+        # Cache for forward trajectory and Jacobians
+        self._trajectory: Optional[List[PETSc.Vec]] = None
+        self._jacobians: Optional[List[PETSc.Mat]] = None
+        self._current_control: Optional[PETSc.Vec] = None
+
+    @abstractmethod
+    def value(self, m: PETSc.Vec) -> float:
+        """
+        Compute cost function value J(m).
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable (initial condition).
+
+        Returns
+        -------
+        float
+            Cost function value.
+        """
+        pass
+
+    @abstractmethod
+    def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
+        """
+        Compute gradient ∇J(m) via adjoint method.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
+
+        Returns
+        -------
+        PETSc.Vec
+            Gradient vector.
+        """
+        pass
+
+    def hessian_vector_product(self, m: PETSc.Vec, v: PETSc.Vec) -> PETSc.Vec:
+        """
+        Compute Hessian-vector product Hv using Gauss-Newton approximation.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
+        v : PETSc.Vec
+            Direction vector.
+
+        Returns
+        -------
+        PETSc.Vec
+            H·v
+        """
+        raise NotImplementedError("Gauss-Newton Hessian not yet implemented")
+
+    def _run_forward_model(
+        self, m: PETSc.Vec, store_jacobians: bool = True
+    ) -> Tuple[List[PETSc.Vec], Optional[List[PETSc.Mat]]]:
+        """
+        Run forward model and cache trajectory.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Initial condition.
+        store_jacobians : bool
+            Whether to cache Jacobians for adjoint.
+
+        Returns
+        -------
+        Tuple[List[PETSc.Vec], Optional[List[PETSc.Mat]]]
+            (trajectory, jacobians) tuple.
+        """
+        # Check if we can reuse cached trajectory
+        if self._current_control is not None:
+            diff = m.duplicate()
+            diff.waxpy(-1.0, self._current_control, m)
+            if diff.norm() < 1e-14:
+                return self._trajectory, self._jacobians
+
+        # Run forward model
+        self._trajectory, self._jacobians = self.forward_model.solve(
+            m, store_jacobians=store_jacobians
+        )
+        self._current_control = m.copy()
+
+        return self._trajectory, self._jacobians
+
+    def _get_observation_covariance(self, k: int):
+        """Get observation covariance for time index k."""
+        if isinstance(self.R, dict):
+            return self.R.get(k, self.R.get(0, list(self.R.values())[0]))
+        return self.R
+
+    def clear_cache(self):
+        """Clear cached trajectory and Jacobians."""
+        self._trajectory = None
+        self._jacobians = None
+        self._current_control = None
+
+
+class FourDVarCost(CostFunction):
+    """
+    Standard 4D-Var cost function.
+
+    J(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
+         + ½ Σ_k ⟨H_k(u_k) - y_k, R_k⁻¹(H_k(u_k) - y_k)⟩
+
+    The gradient is computed via the adjoint method:
+        ∇J(m) = B⁻¹(m - m_b) + λ₀
+
+    where λ₀ is the initial adjoint variable obtained by backward
+    integration of the adjoint equations.
+
+    Attributes
+    ----------
+    m_b : PETSc.Vec
+        Background state.
+    y_obs : List[PETSc.Vec]
+        Observation vectors at each observation time.
+    obs_times : List[int]
+        Time indices where observations are available.
+    """
+
+    def __init__(
+        self,
+        forward_model,
+        observation_operator,
+        background_cov,
+        observation_cov,
         m_background: PETSc.Vec,
-        observations: Dict[int, PETSc.Vec],
+        observations: List[PETSc.Vec],
         obs_times: List[int],
-        comm: Optional[PETSc.Comm] = None,
-        use_implicit_adjoint: bool = False,
+        comm: Optional[MPI.Comm] = None,
     ):
         """
         Initialize standard 4D-Var cost function.
@@ -167,991 +231,911 @@ class FourDVarCost(CostFunction):
         Parameters
         ----------
         forward_model : ForwardModel
-            Forward model with solve(m, store_jacobians=True) method
+            Forward model.
         observation_operator : ObservationOperator
-            Observation operator with apply() and apply_adjoint() methods
+            Observation operator.
         background_cov : CovarianceMatrix
-            Background error covariance B with apply_inverse() method
-        observation_cov : Dict[int, CovarianceMatrix]
-            Observation error covariances {k: R_k} with apply_inverse() method
+            Background covariance B.
+        observation_cov : CovarianceMatrix
+            Observation covariance R.
         m_background : PETSc.Vec
-            Background state vector
-        observations : Dict[int, PETSc.Vec]
-            Observation vectors {k: y_k}
+            Background state m_b.
+        observations : List[PETSc.Vec]
+            List of observation vectors y_k.
         obs_times : List[int]
-            Sorted list of observation time indices
-        comm : PETSc.Comm, optional
-            MPI communicator (defaults to PETSc.COMM_WORLD)
-        use_implicit_adjoint : bool, optional
-            Use implicit BDF2 adjoint (True) or explicit adjoint (False).
-            Default is False for compatibility with simple test models.
+            List of observation time indices.
+        comm : MPI.Comm, optional
+            MPI communicator.
         """
-        self.forward_model = forward_model
-        self.obs_op = observation_operator
-        self.B = background_cov
-        self.R = observation_cov
-        self.m_b = m_background.copy()
-        self.observations = {k: y_k.copy() for k, y_k in observations.items()}
-        self.obs_times = sorted(obs_times)
-        self.use_implicit_adjoint = use_implicit_adjoint
+        super().__init__(
+            forward_model, observation_operator, background_cov, observation_cov, comm
+        )
+        self.m_b = m_background
+        self.y_obs = observations
+        self.obs_times = obs_times
 
-        # MPI communicator
-        self.comm = comm if comm is not None else PETSc.COMM_WORLD
-        self.rank = self.comm.getRank()
-
-        # Cached trajectory and Jacobians from last forward solve
-        self._trajectory = None
-        self._jacobians = None
-        self._last_m = None
-
-        # Counters for performance tracking
-        self.num_forward_solves = 0
-        self.num_adjoint_solves = 0
-
-        # Validate input dimensions
-        self._validate_inputs()
-
-    def _validate_inputs(self):
-        """
-        Validate input dimensions and consistency.
-
-        Raises
-        ------
-        ValueError
-            If dimensions are inconsistent
-        """
-        # Check that all observation times are valid
-        for k in self.obs_times:
-            if k not in self.observations:
-                raise ValueError(f"Observation time {k} missing in observations dict")
-            if k not in self.R:
-                raise ValueError(f"Observation time {k} missing in covariance dict")
-
-        # Check dimensions match
-        n_state = self.m_b.getSize()
-        for k in self.obs_times:
-            n_obs = self.observations[k].getSize()
-            # Note: Can't easily check R[k] dimensions without solving
-            # Will be caught during apply_inverse if mismatch
+        # Validate inputs
+        if len(observations) != len(obs_times):
+            raise ValueError(
+                f"Number of observations ({len(observations)}) must match "
+                f"number of observation times ({len(obs_times)})"
+            )
 
     def value(self, m: PETSc.Vec) -> float:
         """
-        Compute 4D-Var cost function value J(m).
+        Compute standard 4D-Var cost.
 
-        J(m) = J_b(m) + J_o(m)
-
-        where:
-            J_b(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩          (background term)
-            J_o(m) = ½ Σ_k ⟨d_k, R_k⁻¹ d_k⟩            (observation terms)
-            d_k = H_k(u_k) - y_k                        (innovation at time k)
+        J(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
+             + ½ Σ_k ⟨H_k(u_k) - y_k, R_k⁻¹(H_k(u_k) - y_k)⟩
 
         Parameters
         ----------
         m : PETSc.Vec
-            Control variable (initial condition)
+            Control variable (initial condition).
 
         Returns
         -------
         float
-            Cost function value J(m)
-
-        Notes
-        -----
-        This method runs the forward model if needed and caches the
-        trajectory for subsequent gradient computation. The forward
-        solve stores Jacobians from Newton iterations for efficient
-        adjoint computation.
+            Cost function value.
         """
-        # Run forward model (with caching)
-        trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+        # Run forward model
+        trajectory, _ = self._run_forward_model(m, store_jacobians=False)
 
         # Background term: ½⟨m - m_b, B⁻¹(m - m_b)⟩
-        m_minus_mb = m.copy()
-        m_minus_mb.axpy(-1.0, self.m_b)  # m - m_b
+        background_term = self._compute_background_term(m)
 
-        B_inv_m_minus_mb = self.B.apply_inverse(m_minus_mb)
-        J_b = 0.5 * m_minus_mb.dot(B_inv_m_minus_mb)
+        # Observation term: ½ Σ_k ⟨H_k(u_k) - y_k, R_k⁻¹(H_k(u_k) - y_k)⟩
+        observation_term = self._compute_observation_term(trajectory)
 
-        # Observation terms: ½ Σ_k ⟨d_k, R_k⁻¹ d_k⟩
-        J_o = 0.0
-        for k in self.obs_times:
+        return background_term + observation_term
+
+    def value_detailed(self, m: PETSc.Vec) -> CostFunctionResult:
+        """
+        Compute cost with detailed breakdown.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
+
+        Returns
+        -------
+        CostFunctionResult
+            Result with individual terms.
+        """
+        trajectory, _ = self._run_forward_model(m, store_jacobians=False)
+        background = self._compute_background_term(m)
+        observation = self._compute_observation_term(trajectory)
+
+        return CostFunctionResult(
+            value=background + observation,
+            background_term=background,
+            observation_term=observation,
+        )
+
+    def _compute_background_term(self, m: PETSc.Vec) -> float:
+        """Compute ½⟨m - m_b, B⁻¹(m - m_b)⟩."""
+        # Compute deviation from background
+        delta_m = m.duplicate()
+        delta_m.waxpy(-1.0, self.m_b, m)  # delta_m = m - m_b
+
+        # Apply B⁻¹
+        B_inv_delta = self.B.apply_inverse(delta_m)
+
+        # Compute inner product (uses MPI reduction internally)
+        result = 0.5 * delta_m.dot(B_inv_delta)
+
+        return result
+
+    def _compute_observation_term(self, trajectory: List[PETSc.Vec]) -> float:
+        """Compute ½ Σ_k ⟨H_k(u_k) - y_k, R_k⁻¹(H_k(u_k) - y_k)⟩."""
+        total = 0.0
+
+        for i, k in enumerate(self.obs_times):
             # Get state at observation time
             u_k = trajectory[k]
 
             # Apply observation operator: H_k(u_k)
-            H_u_k = self.obs_op.apply(u_k, time_index=k)
+            Hu_k = self.obs_op.forward(u_k, time_index=k)
 
-            # Innovation: d_k = H_k(u_k) - y_k
-            d_k = H_u_k.copy()
-            d_k.axpy(-1.0, self.observations[k])
+            # Compute innovation: d_k = H_k(u_k) - y_k
+            d_k = Hu_k.duplicate()
+            d_k.waxpy(-1.0, self.y_obs[i], Hu_k)  # d_k = Hu_k - y_k
 
-            # Weighted innovation: R_k⁻¹ d_k
-            R_inv_d_k = self.R[k].apply_inverse(d_k)
+            # Apply R_k⁻¹
+            R_k = self._get_observation_covariance(k)
+            R_inv_d = R_k.apply_inverse(d_k)
 
-            # Add to observation cost: ½⟨d_k, R_k⁻¹ d_k⟩
-            J_o += 0.5 * d_k.dot(R_inv_d_k)
+            # Compute weighted inner product
+            total += 0.5 * d_k.dot(R_inv_d)
 
-        # Total cost
-        J_total = J_b + J_o
-
-        # MPI collective (ensure all ranks agree)
-        mpi_comm = self.comm.tompi4py()
-        J_total = mpi_comm.allreduce(J_total, op=MPI.SUM)
-
-        if self.rank == 0:
-            print(
-                f"Cost function: J = {J_total:.6e} (J_b = {J_b:.6e}, J_o = {J_o:.6e})"
-            )
-
-        return J_total
+        return total
 
     def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
         """
-        Compute gradient ∇J(m) via adjoint method.
+        Compute gradient via adjoint method.
 
-        The gradient is computed using the discrete adjoint equations:
-
-        ∇J(m) = B⁻¹(m - m_b) + λ_0
-
-        where λ_0 is obtained by solving the adjoint system backward in time.
+        ∇J(m) = B⁻¹(m - m_b) + λ₀
 
         Parameters
         ----------
         m : PETSc.Vec
-            Control variable (initial condition)
+            Control variable.
 
         Returns
         -------
         PETSc.Vec
-            Gradient vector ∇J(m)
-
-        Notes
-        -----
-        This method reuses cached Jacobians from the forward solve.
-        The implementation uses either explicit or implicit adjoint
-        depending on the use_implicit_adjoint flag.
+            Gradient vector.
         """
-        # Run forward model if not already cached for this m
+        # Run forward model with Jacobian caching
         trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
 
-        # Background gradient contribution: B⁻¹(m - m_b)
-        m_minus_mb = m.copy()
-        m_minus_mb.axpy(-1.0, self.m_b)
-        grad_background = self.B.apply_inverse(m_minus_mb)
+        # Compute background gradient: B⁻¹(m - m_b)
+        delta_m = m.duplicate()
+        delta_m.waxpy(-1.0, self.m_b, m)
+        grad_background = self.B.apply_inverse(delta_m)
 
-        # Adjoint contribution: λ_0
-        if self.use_implicit_adjoint:
-            lambda_0 = self._solve_adjoint_system_implicit(trajectory, jacobians)
-        else:
-            lambda_0 = self._solve_adjoint_system_explicit(trajectory, jacobians)
+        # Compute adjoint contribution via backward sweep
+        lambda_0 = self._solve_adjoint(trajectory, jacobians)
 
-        # Total gradient: ∇J = B⁻¹(m - m_b) + λ_0
-        grad = grad_background.copy()
+        # Total gradient
+        grad = grad_background.duplicate()
         grad.axpy(1.0, lambda_0)
-
-        # Track counter
-        self.num_adjoint_solves += 1
-
-        if self.rank == 0:
-            grad_norm = grad.norm()
-            print(f"Gradient: ‖∇J‖ = {grad_norm:.6e}")
 
         return grad
 
-    def _solve_adjoint_system_explicit(
+    def _solve_adjoint(
         self, trajectory: List[PETSc.Vec], jacobians: List[PETSc.Mat]
     ) -> PETSc.Vec:
         """
-        Solve adjoint system for EXPLICIT forward model.
-
-        For explicit scheme where u_{n+1} = A * u_n, the adjoint is:
-            λ_n = A^T * λ_{n+1} + forcing_n
-
-        This is the correct adjoint for simple test models like:
-            u_{n+1} = A * u_n
+        Solve adjoint equations backward in time.
 
         Parameters
         ----------
         trajectory : List[PETSc.Vec]
-            Forward trajectory [u_0, u_1, ..., u_N]
+            Forward trajectory.
         jacobians : List[PETSc.Mat]
-            Cached Jacobians [J_1, J_2, ..., J_N] from forward solve
+            Jacobians from forward solve.
 
         Returns
         -------
         PETSc.Vec
-            Adjoint at initial time λ_0
+            Initial adjoint λ₀.
         """
-        N = len(trajectory) - 1
+        # Compute observation forcings at each time
+        obs_forcings = self._compute_observation_forcings(trajectory)
 
-        if N == 0:
-            # No time steps, just return observation forcing at t=0
-            lambda_0 = trajectory[0].copy()
-            lambda_0.zeroEntries()
-            if 0 in self.obs_times:
-                lambda_0 = self._compute_observation_forcing(trajectory[0], 0)
-            return lambda_0
+        # Solve adjoint using implicit adjoint solver
+        from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
 
-        # Initialize terminal adjoint
-        lambda_current = trajectory[0].copy()
-        lambda_current.zeroEntries()
+        adjoint_solver = ImplicitAdjointSolver(
+            self.forward_model, trajectory, jacobians, self.forward_model.dt
+        )
 
-        if N in self.obs_times:
-            lambda_current = self._compute_observation_forcing(trajectory[N], N)
+        # Terminal condition (usually zero)
+        terminal = trajectory[-1].duplicate()
+        terminal.zeroEntries()
 
-        # Backward sweep: n = N-1, N-2, ..., 0
-        for n in range(N - 1, -1, -1):
-            # Observation forcing at time n
-            forcing_n = trajectory[0].copy()
-            forcing_n.zeroEntries()
+        lambda_0 = adjoint_solver.solve(terminal, obs_forcings)
 
-            if n in self.obs_times:
-                forcing_n = self._compute_observation_forcing(trajectory[n], n)
+        return lambda_0
 
-            # For explicit scheme: λ_n = A^T * λ_{n+1} + forcing_n
-            if jacobians and n < len(jacobians):
-                J = jacobians[n]
-
-                # Apply A^T to lambda_{n+1}
-                lambda_new = lambda_current.duplicate()
-                J.multTranspose(lambda_current, lambda_new)
-
-                # Add observation forcing
-                lambda_new.axpy(1.0, forcing_n)
-
-                lambda_current = lambda_new
-            else:
-                # No Jacobian available, just use forcing
-                lambda_current = forcing_n.copy()
-
-        return lambda_current
-
-    def _solve_adjoint_system_implicit(
-        self, trajectory: List[PETSc.Vec], jacobians: List[PETSc.Mat]
-    ) -> PETSc.Vec:
+    def _compute_observation_forcings(
+        self, trajectory: List[PETSc.Vec]
+    ) -> List[Optional[PETSc.Vec]]:
         """
-        Solve adjoint system for IMPLICIT BDF2 scheme.
+        Compute adjoint forcing from observations at each time.
 
-        For implicit BDF2 with residual:
-            R(u^{n+1}; u^n, u^{n-1}) = (3u^{n+1} - 4u^n + u^{n-1})/(2Δt) + F(u^{n+1})
+        Returns H_k^T R_k^{-1} (H_k(u_k) - y_k) at observation times.
+        """
+        N = len(trajectory)
+        forcings = [None] * N
 
-        The Jacobian is:
-            J_n = ∂R/∂u^{n+1} = (3/(2Δt))M + ∂F/∂u
+        for i, k in enumerate(self.obs_times):
+            u_k = trajectory[k]
 
-        The adjoint equation is:
-            J_n^T λ_n = (4/(2Δt))M^T λ_{n+1} - (1/(2Δt))M^T λ_{n+2} + forcing_n
+            # Forward observation: H_k(u_k)
+            Hu_k = self.obs_op.forward(u_k, time_index=k)
 
-        This requires solving transpose linear systems.
+            # Innovation: d_k = H_k(u_k) - y_k
+            d_k = Hu_k.duplicate()
+            d_k.waxpy(-1.0, self.y_obs[i], Hu_k)
+
+            # Apply R_k⁻¹
+            R_k = self._get_observation_covariance(k)
+            R_inv_d = R_k.apply_inverse(d_k)
+
+            # Apply adjoint observation operator: H_k^T R_k^{-1} d_k
+            forcings[k] = self.obs_op.adjoint(R_inv_d, time_index=k)
+
+        return forcings
+
+
+class DCFourDVarCost(FourDVarCost):
+    """
+    Data-Consistent 4D-Var (DC-4DVar) cost function.
+
+    J_DC(m) = J(m) - ½ Σ_k ⟨Q_k(m) - Q_k(m_b), L_k⁻¹(Q_k(m) - Q_k(m_b))⟩
+
+    Includes predictability term to prevent assimilation of
+    unpredictable small scales. The predictability term acts as
+    "targeted unregularization" that reduces the impact of statistical
+    bias in directions informed by observations.
+
+    The gradient is:
+        ∇J_DC(m) = ∇J(m) - Σ_k DQ_k^T L_k⁻¹(Q_k(m) - Q_k(m_b))
+
+    where DQ_k is the Jacobian of the QoI map.
+
+    Mathematical Background
+    -----------------------
+    The predicted error covariance L_k represents the push-forward of
+    the background covariance through the QoI map:
+        L_k = Q_k B Q_k^T
+
+    The predictability assumption requires:
+        λ_min(L_k) ≥ γ · λ_max(R_k)
+
+    for some γ > 0, ensuring observations are trusted only when they
+    improve upon the model's predicted uncertainty.
+
+    Attributes
+    ----------
+    qoi_map : QoIMap
+        Quantity of Interest map Q_k.
+    L_k : Dict[int, CovarianceMatrix]
+        Predicted error covariance at each observation time.
+    m_b_qoi : Dict[int, PETSc.Vec]
+        QoI evaluated at background: Q_k(m_b).
+    """
+
+    def __init__(
+        self,
+        forward_model,
+        observation_operator,
+        background_cov,
+        observation_cov,
+        m_background: PETSc.Vec,
+        observations: List[PETSc.Vec],
+        obs_times: List[int],
+        qoi_map=None,
+        predicted_cov: Optional[Dict] = None,
+        gamma: float = 1.0,
+        comm: Optional[MPI.Comm] = None,
+    ):
+        """
+        Initialize DC-4DVar cost function.
 
         Parameters
         ----------
-        trajectory : List[PETSc.Vec]
-            Forward trajectory [u_0, u_1, ..., u_N]
-        jacobians : List[PETSc.Mat]
-            Cached Jacobians [J_1, J_2, ..., J_N] from forward solve
-
-        Returns
-        -------
-        PETSc.Vec
-            Adjoint at initial time λ_0
+        forward_model : ForwardModel
+            Forward model.
+        observation_operator : ObservationOperator
+            Observation operator.
+        background_cov : CovarianceMatrix
+            Background covariance B.
+        observation_cov : CovarianceMatrix
+            Observation covariance R.
+        m_background : PETSc.Vec
+            Background state.
+        observations : List[PETSc.Vec]
+            Observation vectors.
+        obs_times : List[int]
+            Observation time indices.
+        qoi_map : QoIMap, optional
+            Quantity of Interest map. If None, uses StandardQoI.
+        predicted_cov : Dict[int, CovarianceMatrix], optional
+            Pre-computed predicted covariances L_k. If None, computed
+            from background covariance.
+        gamma : float
+            Scaling factor for predictability check (default 1.0).
+        comm : MPI.Comm, optional
+            MPI communicator.
         """
-        N = len(trajectory) - 1
-        dt = self.forward_model.dt
+        super().__init__(
+            forward_model,
+            observation_operator,
+            background_cov,
+            observation_cov,
+            m_background,
+            observations,
+            obs_times,
+            comm,
+        )
 
-        if N == 0:
-            lambda_0 = trajectory[0].copy()
-            lambda_0.zeroEntries()
-            if 0 in self.obs_times:
-                lambda_0 = self._compute_observation_forcing(trajectory[0], 0)
-            return lambda_0
+        # Set QoI map (default to standard: Q_k = H_k ∘ M_{k:0})
+        if qoi_map is None:
+            from .qoi_maps import StandardQoI
 
-        # Initialize adjoint variables for BDF2 (need two previous values)
-        lambda_next_next = trajectory[0].copy()
-        lambda_next_next.zeroEntries()  # λ^{N+1} = 0 (doesn't exist)
+            self.qoi_map = StandardQoI(forward_model, observation_operator)
+        else:
+            self.qoi_map = qoi_map
 
-        lambda_next = trajectory[0].copy()
-        lambda_next.zeroEntries()  # λ^N = 0 (terminal condition)
+        # Predicted error covariance L_k
+        self._L_k = predicted_cov
+        self.gamma = gamma
 
-        # Add terminal observation forcing if present
-        if N in self.obs_times:
-            terminal_forcing = self._compute_observation_forcing(trajectory[N], N)
-            lambda_next.axpy(1.0, terminal_forcing)
+        # Cache for background QoI values
+        self._m_b_qoi: Optional[Dict[int, PETSc.Vec]] = None
 
-        # Backward sweep: n = N-1, N-2, ..., 0
-        for n in range(N - 1, -1, -1):
-            # Assemble RHS for adjoint step
-            rhs = lambda_next.copy()
-            rhs.zeroEntries()
+        # Cache for linearized QoI maps
+        self._linearized_qoi: Dict[int, object] = {}
 
-            # BDF2 time coupling: (4/(2Δt))M^T λ_{n+1}
-            # Assuming M = I (identity mass matrix)
-            rhs.axpy(4.0 / (2.0 * dt), lambda_next)
-
-            # BDF2 time coupling: -(1/(2Δt))M^T λ_{n+2}
-            if n < N - 1:  # Only apply if λ_{n+2} exists
-                rhs.axpy(-1.0 / (2.0 * dt), lambda_next_next)
-
-            # Add observation forcing if present at this time
-            if n in self.obs_times:
-                obs_forcing = self._compute_observation_forcing(trajectory[n], n)
-                rhs.axpy(1.0, obs_forcing)
-
-            # Solve transpose system: J_n^T λ^n = rhs
-            if jacobians and n < len(jacobians):
-                lambda_n = self._solve_transpose_system(jacobians[n], rhs)
-            else:
-                lambda_n = rhs.copy()
-
-            # Update for next iteration
-            lambda_next_next = lambda_next
-            lambda_next = lambda_n
-
-        return lambda_next
-
-    def _compute_observation_forcing(self, u_n: PETSc.Vec, n: int) -> PETSc.Vec:
+    def value(self, m: PETSc.Vec) -> float:
         """
-        Compute observation forcing term for adjoint RHS.
+        Compute DC-4DVar cost with predictability term.
 
-        forcing_n = (∂H_n/∂u)^T R_n⁻¹ (H_n(u_n) - y_n)
-
-        This is the adjoint of the observation operator applied to
-        the weighted innovation.
-
-        Parameters
-        ----------
-        u_n : PETSc.Vec
-            State at time n
-        n : int
-            Time index
-
-        Returns
-        -------
-        PETSc.Vec
-            Observation forcing vector
-        """
-        # Compute innovation: d_n = H_n(u_n) - y_n
-        H_u_n = self.obs_op.apply(u_n, time_index=n)
-        d_n = H_u_n.copy()
-        d_n.axpy(-1.0, self.observations[n])
-
-        # Weight by observation covariance: R_n⁻¹ d_n
-        R_inv_d_n = self.R[n].apply_inverse(d_n)
-
-        # Apply observation operator adjoint: H_n^T (R_n⁻¹ d_n)
-        forcing = self.obs_op.apply_adjoint(R_inv_d_n, u_n, time_index=n)
-
-        return forcing
-
-    def _solve_transpose_system(self, J: PETSc.Mat, rhs: PETSc.Vec) -> PETSc.Vec:
-        """
-        Solve transpose linear system: J^T x = rhs.
-
-        This uses PETSc's KSP solver with transpose flag enabled.
-        The Jacobian J is from the forward Newton solve.
-
-        Parameters
-        ----------
-        J : PETSc.Mat
-            Jacobian matrix from forward solve
-        rhs : PETSc.Vec
-            Right-hand side vector
-
-        Returns
-        -------
-        PETSc.Vec
-            Solution to J^T x = rhs
-
-        Notes
-        -----
-        The solver is configured for transpose mode, which is critical
-        for implicit adjoint computation. Uses GMRES with ILU
-        preconditioning by default.
-        """
-        if J is None:
-            # Handle special case (e.g., initial step)
-            return rhs.copy()
-
-        # Create KSP solver
-        ksp = PETSc.KSP().create(comm=self.comm)
-        ksp.setOperators(J)
-
-        # Configure solver
-        ksp.setType(PETSc.KSP.Type.GMRES)
-        ksp.getPC().setType(PETSc.PC.Type.ILU)
-        ksp.setTolerances(rtol=1e-10, atol=1e-12, max_it=1000)
-
-        # Set convergence monitoring
-        if self.rank == 0:
-            ksp.setMonitor(lambda ksp, its, rnorm: None)  # Silent
-
-        # Solve J^T x = rhs using transpose solve
-        solution = rhs.duplicate()
-        ksp.solveTranspose(rhs, solution)
-
-        # Check convergence
-        if ksp.getConvergedReason() < 0:
-            if self.rank == 0:
-                print(
-                    f"WARNING: Transpose solve did not converge: {ksp.getConvergedReason()}"
-                )
-
-        ksp.destroy()
-        return solution
-
-    def _run_forward_model(
-        self, m: PETSc.Vec, store_jacobians: bool = True
-    ) -> Tuple[List[PETSc.Vec], Optional[List[PETSc.Mat]]]:
-        """
-        Run forward model and cache trajectory/Jacobians.
-
-        This method intelligently caches results to avoid redundant
-        forward solves when computing both value and gradient.
+        J_DC(m) = J(m) - ½ Σ_k ⟨Q_k(m) - Q_k(m_b), L_k⁻¹(Q_k(m) - Q_k(m_b))⟩
 
         Parameters
         ----------
         m : PETSc.Vec
-            Initial condition
-        store_jacobians : bool
-            Whether to store Jacobians for adjoint (default: True)
+            Control variable.
 
         Returns
         -------
-        trajectory : List[PETSc.Vec]
-            State trajectory [u_0, u_1, ..., u_N]
-        jacobians : Optional[List[PETSc.Mat]]
-            Jacobian matrices [J_1, ..., J_N] or None
-
-        Notes
-        -----
-        The forward model's solve method must support:
-            trajectory, jacobians = forward_model.solve(m, store_jacobians=True)
+        float
+            DC-4DVar cost function value.
         """
-        # Check if we can reuse cached trajectory
-        if self._last_m is not None and self._vectors_equal(m, self._last_m):
-            if self._trajectory is not None:
-                return self._trajectory, self._jacobians
+        # Compute standard 4D-Var cost
+        J_standard = super().value(m)
 
-        # Run forward model
-        trajectory, jacobians = self.forward_model.solve(
-            m, store_jacobians=store_jacobians
-        )
+        # Compute predictability term
+        predictability_term = self._compute_predictability_term(m)
 
-        # Cache results
-        self._trajectory = trajectory
-        self._jacobians = jacobians
-        self._last_m = m.copy()
+        return J_standard - predictability_term
 
-        # Track counter
-        self.num_forward_solves += 1
-
-        return trajectory, jacobians
-
-    def _vectors_equal(self, v1: PETSc.Vec, v2: PETSc.Vec, tol: float = 1e-14) -> bool:
+    def value_detailed(self, m: PETSc.Vec) -> CostFunctionResult:
         """
-        Check if two vectors are equal within tolerance.
+        Compute cost with detailed breakdown.
 
         Parameters
         ----------
-        v1, v2 : PETSc.Vec
-            Vectors to compare
-        tol : float
-            Tolerance for comparison
+        m : PETSc.Vec
+            Control variable.
 
         Returns
         -------
-        bool
-            True if vectors are equal within tolerance
+        CostFunctionResult
+            Result with all terms.
         """
-        diff = v1.copy()
-        diff.axpy(-1.0, v2)
-        diff_norm = diff.norm()
-        return diff_norm < tol
+        standard_result = super().value_detailed(m)
+        predictability = self._compute_predictability_term(m)
+
+        return CostFunctionResult(
+            value=standard_result.value - predictability,
+            background_term=standard_result.background_term,
+            observation_term=standard_result.observation_term,
+            predictability_term=predictability,
+        )
+
+    def _compute_predictability_term(self, m: PETSc.Vec) -> float:
+        """
+        Compute ½ Σ_k ⟨Q_k(m) - Q_k(m_b), L_k⁻¹(Q_k(m) - Q_k(m_b))⟩.
+
+        This term penalizes deviations from the background in the
+        QoI space, weighted by the inverse predicted covariance.
+        """
+        # Ensure background QoI is computed
+        self._ensure_background_qoi()
+
+        # Ensure predicted covariances are available
+        self._ensure_predicted_covariance()
+
+        total = 0.0
+
+        for i, k in enumerate(self.obs_times):
+            # Evaluate QoI at current control: Q_k(m)
+            Q_k_m = self.qoi_map.evaluate(m, k)
+
+            # Get background QoI: Q_k(m_b)
+            Q_k_mb = self._m_b_qoi[k]
+
+            # Compute correction residual: q_k = Q_k(m) - Q_k(m_b)
+            q_k = Q_k_m.duplicate()
+            q_k.waxpy(-1.0, Q_k_mb, Q_k_m)
+
+            # Apply L_k⁻¹
+            L_k = self._get_predicted_covariance(k)
+            L_inv_q = L_k.apply_inverse(q_k)
+
+            # Compute weighted inner product
+            total += 0.5 * q_k.dot(L_inv_q)
+
+        return total
+
+    def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
+        """
+        Compute DC-4DVar gradient.
+
+        ∇J_DC(m) = ∇J(m) - Σ_k DQ_k^T L_k⁻¹(Q_k(m) - Q_k(m_b))
+
+        The predictability gradient correction removes the gradient
+        contribution from unpredictable components.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
+
+        Returns
+        -------
+        PETSc.Vec
+            Gradient vector.
+        """
+        # Compute standard 4D-Var gradient
+        grad_standard = super().gradient(m)
+
+        # Compute predictability gradient correction
+        grad_predictability = self._compute_predictability_gradient(m)
+
+        # DC gradient = standard gradient - predictability gradient
+        grad_standard.axpy(-1.0, grad_predictability)
+
+        return grad_standard
+
+    def _compute_predictability_gradient(self, m: PETSc.Vec) -> PETSc.Vec:
+        """
+        Compute Σ_k DQ_k^T L_k⁻¹(Q_k(m) - Q_k(m_b)).
+
+        This requires the adjoint of the linearized QoI map.
+        """
+        self._ensure_background_qoi()
+        self._ensure_predicted_covariance()
+
+        # Initialize gradient
+        grad = m.duplicate()
+        grad.zeroEntries()
+
+        for i, k in enumerate(self.obs_times):
+            # Evaluate QoI: Q_k(m)
+            Q_k_m = self.qoi_map.evaluate(m, k)
+
+            # Correction residual: q_k = Q_k(m) - Q_k(m_b)
+            q_k = Q_k_m.duplicate()
+            q_k.waxpy(-1.0, self._m_b_qoi[k], Q_k_m)
+
+            # Apply L_k⁻¹: w_k = L_k⁻¹ q_k
+            L_k = self._get_predicted_covariance(k)
+            w_k = L_k.apply_inverse(q_k)
+
+            # Linearize QoI at m
+            linearized_qoi = self.qoi_map.linearize(m, k)
+
+            # Apply adjoint: DQ_k^T w_k
+            grad_k = linearized_qoi.apply_adjoint(w_k)
+
+            # Accumulate
+            grad.axpy(1.0, grad_k)
+
+        return grad
+
+    def _ensure_background_qoi(self):
+        """Compute and cache QoI at background state."""
+        if self._m_b_qoi is None:
+            self._m_b_qoi = {}
+            for k in self.obs_times:
+                self._m_b_qoi[k] = self.qoi_map.evaluate(self.m_b, k)
+
+    def _ensure_predicted_covariance(self):
+        """Ensure predicted covariance L_k is available."""
+        if self._L_k is None:
+            self._L_k = {}
+            for k in self.obs_times:
+                self._L_k[k] = self._compute_predicted_covariance(k)
+
+    def _get_predicted_covariance(self, k: int):
+        """Get predicted covariance for time index k."""
+        if isinstance(self._L_k, dict):
+            return self._L_k.get(k)
+        return self._L_k
+
+    def _compute_predicted_covariance(self, k: int):
+        """
+        Compute L_k = Q_k B Q_k^T at observation time k.
+
+        The predicted error covariance represents the push-forward
+        of background uncertainty through the QoI map.
+
+        For efficiency, we use either:
+        1. Monte Carlo estimation (sampling-based)
+        2. TLM-based computation (deterministic)
+
+        Parameters
+        ----------
+        k : int
+            Time index.
+
+        Returns
+        -------
+        CovarianceMatrix
+            Predicted error covariance L_k.
+        """
+        from .qoi_maps import QoICovarianceEstimator
+
+        estimator = QoICovarianceEstimator(self.qoi_map, self.B, num_samples=100)
+        return estimator.estimate(self.m_b, k)
+
+    def check_predictability_assumption(self, k: int) -> Tuple[bool, float]:
+        """
+        Check if predictability assumption holds at time k.
+
+        The predictability assumption requires:
+            λ_min(L_k) ≥ γ · λ_max(R_k)
+
+        Parameters
+        ----------
+        k : int
+            Time index.
+
+        Returns
+        -------
+        Tuple[bool, float]
+            (assumption_holds, ratio) where ratio = λ_min(L_k) / λ_max(R_k).
+        """
+        self._ensure_predicted_covariance()
+
+        L_k = self._get_predicted_covariance(k)
+        R_k = self._get_observation_covariance(k)
+
+        # Get eigenvalue bounds
+        lambda_min_L = L_k.min_eigenvalue()
+        lambda_max_R = R_k.max_eigenvalue()
+
+        ratio = lambda_min_L / lambda_max_R
+        holds = ratio >= self.gamma
+
+        return holds, ratio
 
     def hessian_vector_product(self, m: PETSc.Vec, v: PETSc.Vec) -> PETSc.Vec:
         """
-        Compute Hessian-vector product H·v using Gauss-Newton approximation.
+        Compute Gauss-Newton Hessian-vector product for DC-4DVar.
 
-        The Gauss-Newton Hessian is:
-            H_GN = B⁻¹ + Σ_k (∂H_k/∂m)^T R_k⁻¹ (∂H_k/∂m)
+        H_GN · v ≈ B⁻¹·v + Σ_k J_k^T (R_k⁻¹ - L_k⁻¹) J_k · v
 
-        where ∂H_k/∂m is the sensitivity of observations to initial condition.
-
-        This approximation neglects second-order derivative terms, making
-        it positive semi-definite and suitable for optimization.
+        where J_k = DQ_k is the Jacobian of the QoI map.
 
         Parameters
         ----------
         m : PETSc.Vec
-            Current control variable
+            Control variable.
         v : PETSc.Vec
-            Direction vector
+            Direction vector.
 
         Returns
         -------
         PETSc.Vec
-            Hessian-vector product H·v
-
-        Notes
-        -----
-        The Hessian-vector product is computed using:
-        1. Tangent linear model (TLM) to propagate perturbation forward
-        2. Observation operator Jacobian application
-        3. Adjoint of observation operator
-
-        This avoids explicitly forming the Hessian matrix.
+            H_GN · v.
         """
-        # Background term: B⁻¹ v
+        self._ensure_predicted_covariance()
+
+        # Background term: B⁻¹·v
         Hv = self.B.apply_inverse(v)
 
-        # Run tangent linear model: δu_k = (∂M_k/∂m) v
-        # This requires forward solve with stored Jacobians
-        trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+        # Observation terms
+        for i, k in enumerate(self.obs_times):
+            # Linearize QoI at m
+            linearized_qoi = self.qoi_map.linearize(m, k)
 
-        # Propagate perturbation through TLM
-        delta_trajectory = self._propagate_tlm(v, jacobians)
+            # Forward: J_k · v
+            Jv = linearized_qoi.apply(v)
 
-        # Accumulate observation terms
-        for k in self.obs_times:
-            # Linearized observation: δy_k = (∂H_k/∂u) δu_k
-            delta_u_k = delta_trajectory[k]
-            delta_y_k = self.obs_op.linearize_apply(
-                delta_u_k, trajectory[k], time_index=k
-            )
+            # Apply (R_k⁻¹ - L_k⁻¹)
+            R_k = self._get_observation_covariance(k)
+            L_k = self._get_predicted_covariance(k)
 
-            # Weight by observation covariance: R_k⁻¹ δy_k
-            R_inv_delta_y = self.R[k].apply_inverse(delta_y_k)
+            # w = R_k⁻¹ · Jv
+            w = R_k.apply_inverse(Jv)
 
-            # Apply observation operator adjoint: (∂H_k/∂u)^T R_k⁻¹ δy_k
-            obs_contrib = self.obs_op.apply_adjoint(
-                R_inv_delta_y, trajectory[k], time_index=k
-            )
+            # w -= L_k⁻¹ · Jv
+            L_inv_Jv = L_k.apply_inverse(Jv)
+            w.axpy(-1.0, L_inv_Jv)
 
-            # Propagate back to initial time via adjoint TLM
-            initial_contrib = self._propagate_adjoint_tlm(obs_contrib, k, jacobians)
+            # Adjoint: J_k^T · w
+            JTw = linearized_qoi.apply_adjoint(w)
 
-            # Add to Hessian-vector product
-            Hv.axpy(1.0, initial_contrib)
+            # Accumulate
+            Hv.axpy(1.0, JTw)
 
         return Hv
 
-    def _propagate_tlm(
-        self, v: PETSc.Vec, jacobians: List[PETSc.Mat]
-    ) -> List[PETSc.Vec]:
-        """
-        Propagate perturbation forward using tangent linear model.
 
-        For explicit scheme: δu^{n+1} = J_n * δu^n
-        For implicit BDF2: J_n δu^{n+1} = (4/(2Δt))M δu^n - (1/(2Δt))M δu^{n-1}
+class DCWMEFourDVarCost(DCFourDVarCost):
+    """
+    DC-4DVar with Weighted Mean Error QoI.
+
+    Q_wme(m) = (1/√N) Σ_{k=1}^{N} R_k^{-1/2} [H_k(M_{k:0}(m)) - y_k]
+
+    J_WME(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
+             + ½ ‖Q_wme(m)‖²
+             - ½ ⟨Q_wme(m) - Q_wme(m_b), L_wme⁻¹(Q_wme(m) - Q_wme(m_b))⟩
+
+    The WME formulation uses cumulative time-averaged innovation as QoI
+    for improved stability with sparse observations. Key properties:
+
+    1. Uncertainties decrease at rate proportional to number of observations
+    2. Propagating MUD estimate produces unbiased sample mean of observed data
+    3. Predictability assumption guaranteed to hold for sufficiently large N
+
+    Attributes
+    ----------
+    L_wme : CovarianceMatrix
+        Predicted covariance for WME QoI.
+    """
+
+    def __init__(
+        self,
+        forward_model,
+        observation_operator,
+        background_cov,
+        observation_cov,
+        m_background: PETSc.Vec,
+        observations: List[PETSc.Vec],
+        obs_times: List[int],
+        predicted_cov_wme=None,
+        comm: Optional[MPI.Comm] = None,
+    ):
+        """
+        Initialize DC-WME cost function.
 
         Parameters
         ----------
-        v : PETSc.Vec
-            Initial perturbation δu_0 = v
-        jacobians : List[PETSc.Mat]
-            Cached Jacobians from forward solve
+        forward_model : ForwardModel
+            Forward model.
+        observation_operator : ObservationOperator
+            Observation operator.
+        background_cov : CovarianceMatrix
+            Background covariance B.
+        observation_cov : CovarianceMatrix
+            Observation covariance R.
+        m_background : PETSc.Vec
+            Background state.
+        observations : List[PETSc.Vec]
+            Observation vectors.
+        obs_times : List[int]
+            Observation time indices.
+        predicted_cov_wme : CovarianceMatrix, optional
+            Predicted covariance for WME. If None, estimated.
+        comm : MPI.Comm, optional
+            MPI communicator.
+        """
+        # Create WME QoI map
+        from .qoi_maps import WeightedMeanErrorQoI
+
+        wme_qoi = WeightedMeanErrorQoI(
+            forward_model, observation_operator, observations, observation_cov
+        )
+
+        super().__init__(
+            forward_model,
+            observation_operator,
+            background_cov,
+            observation_cov,
+            m_background,
+            observations,
+            obs_times,
+            qoi_map=wme_qoi,
+            predicted_cov=None,
+            comm=comm,
+        )
+
+        # WME-specific predicted covariance
+        self._L_wme = predicted_cov_wme
+
+        # Cache for WME accumulation
+        self._wme_cache: Dict[str, PETSc.Vec] = {}
+
+    def value(self, m: PETSc.Vec) -> float:
+        """
+        Compute DC-WME cost.
+
+        J_WME(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
+                 + ½ ‖Q_wme(m)‖²
+                 - ½ ⟨Q_wme(m) - Q_wme(m_b), L_wme⁻¹(Q_wme(m) - Q_wme(m_b))⟩
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
 
         Returns
         -------
-        List[PETSc.Vec]
-            Perturbation trajectory [δu_0, δu_1, ..., δu_N]
+        float
+            DC-WME cost function value.
         """
-        if not jacobians:
-            return [v.copy()]
+        # Background term
+        background_term = self._compute_background_term(m)
 
-        N = len(jacobians)
+        # WME data misfit: ½ ‖Q_wme(m)‖²
+        Q_wme_m = self._compute_wme(m)
+        data_misfit = 0.5 * Q_wme_m.dot(Q_wme_m)
 
-        # Initialize perturbation trajectory
-        delta_traj = [v.copy()]  # δu_0 = v
+        # Predictability term: ½ ⟨Q_wme(m) - Q_wme(m_b), L⁻¹(...)⟩
+        predictability = self._compute_wme_predictability(m, Q_wme_m)
 
-        if self.use_implicit_adjoint:
-            # Implicit BDF2 TLM
-            dt = self.forward_model.dt
-            delta_u_nm1 = v.copy()  # δu^{n-1}
-            delta_u_n = v.copy()  # δu^n
+        return background_term + data_misfit - predictability
 
-            for n in range(N):
-                # Assemble RHS for TLM step
-                rhs = delta_u_n.duplicate()
-                rhs.zeroEntries()
-                rhs.axpy(4.0 / (2.0 * dt), delta_u_n)
-                rhs.axpy(-1.0 / (2.0 * dt), delta_u_nm1)
-
-                # Solve J_n δu^{n+1} = rhs
-                ksp = PETSc.KSP().create(comm=self.comm)
-                ksp.setOperators(jacobians[n])
-                ksp.setType(PETSc.KSP.Type.GMRES)
-                ksp.getPC().setType(PETSc.PC.Type.ILU)
-                ksp.setTolerances(rtol=1e-10, atol=1e-12)
-
-                delta_u_next = rhs.duplicate()
-                ksp.solve(rhs, delta_u_next)
-                ksp.destroy()
-
-                delta_traj.append(delta_u_next.copy())
-
-                # Update for next step
-                delta_u_nm1 = delta_u_n
-                delta_u_n = delta_u_next
-        else:
-            # Explicit TLM: δu^{n+1} = J_n * δu^n
-            delta_u_current = v.copy()
-
-            for n in range(N):
-                delta_u_next = delta_u_current.duplicate()
-                jacobians[n].mult(delta_u_current, delta_u_next)
-                delta_traj.append(delta_u_next.copy())
-                delta_u_current = delta_u_next
-
-        return delta_traj
-
-    def _propagate_adjoint_tlm(
-        self,
-        forcing: PETSc.Vec,
-        time_index: int,
-        jacobians: List[PETSc.Mat],
-    ) -> PETSc.Vec:
+    def _compute_wme(self, m: PETSc.Vec) -> PETSc.Vec:
         """
-        Propagate adjoint forcing back to initial time.
-
-        This is used in Hessian-vector product computation to transport
-        observation information back to the control space.
+        Compute WME QoI: Q_wme(m) = (1/√N) Σ_k R_k^{-1/2}(H_k(u_k) - y_k).
 
         Parameters
         ----------
-        forcing : PETSc.Vec
-            Forcing at time time_index
-        time_index : int
-            Time index where forcing is applied
-        jacobians : List[PETSc.Mat]
-            Cached Jacobians from forward solve
+        m : PETSc.Vec
+            Control variable.
 
         Returns
         -------
         PETSc.Vec
-            Contribution to gradient at initial time
+            WME vector.
         """
-        if not jacobians or time_index == 0:
-            return forcing.copy()
+        # Use final observation time for WME evaluation
+        k_final = self.obs_times[-1]
+        return self.qoi_map.evaluate(m, k_final)
 
-        lambda_current = forcing.copy()
-
-        if self.use_implicit_adjoint:
-            # Implicit adjoint backward propagation
-            dt = self.forward_model.dt
-            lambda_next_next = forcing.copy()
-            lambda_next_next.zeroEntries()
-
-            for n in range(time_index - 1, -1, -1):
-                # Assemble RHS
-                rhs = lambda_current.duplicate()
-                rhs.zeroEntries()
-                rhs.axpy(4.0 / (2.0 * dt), lambda_current)
-                if n < time_index - 1:
-                    rhs.axpy(-1.0 / (2.0 * dt), lambda_next_next)
-
-                # Solve transpose system
-                lambda_n = self._solve_transpose_system(jacobians[n], rhs)
-
-                lambda_next_next = lambda_current
-                lambda_current = lambda_n
-        else:
-            # Explicit adjoint backward propagation: λ_n = J^T * λ_{n+1}
-            for n in range(time_index - 1, -1, -1):
-                lambda_new = lambda_current.duplicate()
-                jacobians[n].multTranspose(lambda_current, lambda_new)
-                lambda_current = lambda_new
-
-        return lambda_current
-
-    def clear_cache(self):
+    def _compute_wme_predictability(self, m: PETSc.Vec, Q_wme_m: PETSc.Vec) -> float:
         """
-        Clear cached trajectory and Jacobians to free memory.
+        Compute WME predictability term.
 
-        Useful for long optimization runs where caching becomes
-        memory intensive.
+        ½ ⟨Q_wme(m) - Q_wme(m_b), L_wme⁻¹(Q_wme(m) - Q_wme(m_b))⟩
         """
-        self._trajectory = None
-        self._jacobians = None
-        self._last_m = None
+        # Ensure background WME is computed
+        if "Q_wme_mb" not in self._wme_cache:
+            self._wme_cache["Q_wme_mb"] = self._compute_wme(self.m_b)
 
-    def get_diagnostics(self) -> Dict[str, any]:
+        Q_wme_mb = self._wme_cache["Q_wme_mb"]
+
+        # Correction residual
+        delta_Q = Q_wme_m.duplicate()
+        delta_Q.waxpy(-1.0, Q_wme_mb, Q_wme_m)
+
+        # Ensure L_wme is available
+        self._ensure_wme_predicted_covariance()
+
+        # Apply L_wme⁻¹
+        L_inv_delta = self._L_wme.apply_inverse(delta_Q)
+
+        return 0.5 * delta_Q.dot(L_inv_delta)
+
+    def _ensure_wme_predicted_covariance(self):
+        """Ensure WME predicted covariance is available."""
+        if self._L_wme is None:
+            from .qoi_maps import QoICovarianceEstimator
+
+            estimator = QoICovarianceEstimator(self.qoi_map, self.B, num_samples=100)
+            # Use final time for WME covariance
+            self._L_wme = estimator.estimate(self.m_b, self.obs_times[-1])
+
+    def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
         """
-        Get diagnostic information about cost function evaluations.
+        Compute DC-WME gradient.
+
+        ∇J_WME(m) = B⁻¹(m - m_b) + J^T(Q_wme - L_wme⁻¹(Q_wme - Q_wme,b))
+
+        where J = (1/√N) Σ_k R_k^{-1/2} H_k M_k is constant for linear models.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
 
         Returns
         -------
-        Dict
-            Dictionary with counters and statistics
+        PETSc.Vec
+            Gradient vector.
         """
-        return {
-            "num_forward_solves": self.num_forward_solves,
-            "num_adjoint_solves": self.num_adjoint_solves,
-            "num_obs_times": len(self.obs_times),
-            "obs_times": self.obs_times,
-            "adjoint_type": "implicit" if self.use_implicit_adjoint else "explicit",
-        }
+        # Run forward model for trajectory
+        trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+
+        # Background gradient: B⁻¹(m - m_b)
+        delta_m = m.duplicate()
+        delta_m.waxpy(-1.0, self.m_b, m)
+        grad = self.B.apply_inverse(delta_m)
+
+        # Compute WME values
+        Q_wme_m = self._compute_wme(m)
+
+        if "Q_wme_mb" not in self._wme_cache:
+            self._wme_cache["Q_wme_mb"] = self._compute_wme(self.m_b)
+        Q_wme_mb = self._wme_cache["Q_wme_mb"]
+
+        # Correction residual
+        delta_Q = Q_wme_m.duplicate()
+        delta_Q.waxpy(-1.0, Q_wme_mb, Q_wme_m)
+
+        # Compute forcing: Q_wme - L_wme⁻¹(Q_wme - Q_wme,b)
+        self._ensure_wme_predicted_covariance()
+        L_inv_delta = self._L_wme.apply_inverse(delta_Q)
+
+        forcing = Q_wme_m.duplicate()
+        forcing.axpy(-1.0, L_inv_delta)
+
+        # Apply adjoint of WME Jacobian
+        linearized_wme = self.qoi_map.linearize(m, self.obs_times[-1])
+        grad_wme = linearized_wme.apply_adjoint(forcing)
+
+        # Accumulate
+        grad.axpy(1.0, grad_wme)
+
+        return grad
 
 
-# ============================================================================
-# TESTING UTILITIES
-# ============================================================================
-
-
-def taylor_remainder_test(
-    cost_function: FourDVarCost,
-    m0: PETSc.Vec,
-    direction: Optional[PETSc.Vec] = None,
-    epsilons: Optional[List[float]] = None,
-) -> bool:
+# Factory function for creating cost functions
+def create_cost_function(
+    variant: str,
+    forward_model,
+    observation_operator,
+    background_cov,
+    observation_cov,
+    m_background: PETSc.Vec,
+    observations: List[PETSc.Vec],
+    obs_times: List[int],
+    **kwargs,
+) -> CostFunction:
     """
-    Perform Taylor remainder test for gradient verification.
-
-    Tests the convergence:
-        |J(m + εv) - J(m) - ε⟨∇J(m), v⟩| = O(ε²)
+    Factory function for creating cost functions.
 
     Parameters
     ----------
-    cost_function : FourDVarCost
-        Cost function to test
-    m0 : PETSc.Vec
-        Base point for test
-    direction : PETSc.Vec, optional
-        Test direction (random if None)
-    epsilons : List[float], optional
-        List of perturbation sizes
+    variant : str
+        Cost function variant: "4dvar", "dc", or "dc_wme".
+    forward_model : ForwardModel
+        Forward model.
+    observation_operator : ObservationOperator
+        Observation operator.
+    background_cov : CovarianceMatrix
+        Background covariance.
+    observation_cov : CovarianceMatrix
+        Observation covariance.
+    m_background : PETSc.Vec
+        Background state.
+    observations : List[PETSc.Vec]
+        Observation vectors.
+    obs_times : List[int]
+        Observation time indices.
+    **kwargs
+        Additional arguments for specific variants.
 
     Returns
     -------
-    bool
-        True if test passes (O(ε²) convergence observed)
+    CostFunction
+        Configured cost function instance.
     """
-    if direction is None:
-        direction = m0.duplicate()
-        direction.setRandom()
-        direction.scale(1.0 / direction.norm())
+    variant = variant.lower()
 
-    if epsilons is None:
-        epsilons = [10 ** (-i) for i in range(1, 8)]
-
-    # Compute base values
-    J0 = cost_function.value(m0)
-    grad0 = cost_function.gradient(m0)
-    directional_deriv = grad0.dot(direction)
-
-    print("\nTaylor Remainder Test:")
-    print(f"{'ε':>12} {'|Remainder|':>15} {'Order':>10}")
-    print("-" * 40)
-
-    prev_remainder = None
-    orders = []
-
-    for eps in epsilons:
-        # Perturbed point
-        m_eps = m0.copy()
-        m_eps.axpy(eps, direction)
-
-        # Compute perturbed cost
-        J_eps = cost_function.value(m_eps)
-
-        # Taylor remainder: |J(m+εv) - J(m) - ε⟨∇J, v⟩|
-        remainder = abs(J_eps - J0 - eps * directional_deriv)
-
-        # Estimate convergence order
-        if prev_remainder is not None:
-            order = np.log(prev_remainder / remainder) / np.log(2.0)
-            orders.append(order)
-            print(f"{eps:12.2e} {remainder:15.6e} {order:10.2f}")
-        else:
-            print(f"{eps:12.2e} {remainder:15.6e} {'---':>10}")
-
-        prev_remainder = remainder
-
-    # Check if order is approximately 2 (indicating correct gradient)
-    avg_order = np.mean(orders[-3:])  # Average last 3 orders
-    passed = 1.8 <= avg_order <= 2.2
-
-    print(f"\nAverage order (last 3): {avg_order:.2f}")
-    print(f"Test {'PASSED' if passed else 'FAILED'}")
-
-    return passed
-
-
-def adjoint_consistency_test(
-    cost_function: FourDVarCost,
-    m0: PETSc.Vec,
-    tolerance: float = 1e-10,
-) -> bool:
-    """
-    Test adjoint consistency: ⟨TLM·v, w⟩ = ⟨v, Adjoint·w⟩.
-
-    Parameters
-    ----------
-    cost_function : FourDVarCost
-        Cost function to test
-    m0 : PETSc.Vec
-        Point at which to test
-    tolerance : float
-        Tolerance for test pass
-
-    Returns
-    -------
-    bool
-        True if test passes
-    """
-    # Create random vectors
-    v = m0.duplicate()
-    v.setRandom()
-
-    w = m0.duplicate()
-    w.setRandom()
-
-    # Compute LHS: ⟨H·v, w⟩
-    Hv = cost_function.hessian_vector_product(m0, v)
-    lhs = Hv.dot(w)
-
-    # Compute RHS: ⟨v, H·w⟩ (H should be symmetric)
-    Hw = cost_function.hessian_vector_product(m0, w)
-    rhs = v.dot(Hw)
-
-    # Check symmetry
-    rel_error = abs(lhs - rhs) / abs(lhs)
-
-    print(f"\nAdjoint Consistency Test:")
-    print(f"LHS = {lhs:.10e}")
-    print(f"RHS = {rhs:.10e}")
-    print(f"Relative error = {rel_error:.10e}")
-
-    passed = rel_error < tolerance
-    print(f"Test {'PASSED' if passed else 'FAILED'}")
-
-    return passed
-
-
-# class DCFourDVarCost(CostFunction):
-#     """
-#     Data-Consistent 4D-Var (DC-4DVar) cost function.
-
-#     J_DC(m) = J(m) - ½ Σ_k ⟨Q_k(m) - Q_k(m_b), L_k⁻¹(Q_k(m) - Q_k(m_b))⟩
-
-#     Includes predictability term to prevent assimilation of
-#     unpredictable small scales.
-#     """
-
-#     def __init__(
-#         self,
-#         forward_model,
-#         observation_operator,
-#         background_cov,
-#         observation_cov,
-#         m_background: PETSc.Vec,
-#         observations: List[PETSc.Vec],
-#         obs_times: List[int],
-#         qoi_map=None,
-#     ):
-#         """
-#         Initialize DC-4DVar cost function.
-
-#         Args:
-#             forward_model: Forward model
-#             observation_operator: Observation operator
-#             background_cov: Background covariance B
-#             observation_cov: Observation covariance R
-#             m_background: Background state
-#             observations: Observation vectors
-#             obs_times: Observation time indices
-#             qoi_map: Quantity of Interest map Q_k
-#         """
-#         super().__init__(
-#             forward_model, observation_operator, background_cov, observation_cov
-#         )
-#         self.m_b = m_background
-#         self.y_obs = observations
-#         self.obs_times = obs_times
-#         self.qoi_map = qoi_map
-
-#         # Predicted error covariance L_k (computed from B)
-#         self._L_k = None
-
-#     def value(self, m: PETSc.Vec) -> float:
-#         """Compute DC-4DVar cost with predictability term."""
-#         # TODO: Implement standard term - predictability term
-#         pass
-
-#     def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
-#         """Compute DC-4DVar gradient."""
-#         # TODO: Implement with predictability gradient correction
-#         pass
-
-#     def _compute_predicted_covariance(self, k: int) -> PETSc.Mat:
-#         """
-#         Compute L_k = Q_k B Q_k^T at observation time k.
-
-#         Args:
-#             k: Time index
-
-#         Returns:
-#             Predicted error covariance matrix
-#         """
-#         # TODO: Implement TLM-based covariance propagation
-#         pass
-
-
-# class DCWMEFourDVarCost(DCFourDVarCost):
-#     """
-#     DC-4DVar with Weighted Mean Error QoI.
-
-#     Q_wme,k(m) = (1/k) Σ_{j=0}^{k-1} (H_j(M_{j:0}(m)) - y_j)
-
-#     Uses cumulative time-averaged innovation as QoI
-#     for improved stability with sparse observations.
-#     """
-
-#     def __init__(
-#         self,
-#         forward_model,
-#         observation_operator,
-#         background_cov,
-#         observation_cov,
-#         m_background: PETSc.Vec,
-#         observations: List[PETSc.Vec],
-#         obs_times: List[int],
-#     ):
-#         """Initialize DC-WME cost function."""
-#         super().__init__(
-#             forward_model,
-#             observation_operator,
-#             background_cov,
-#             observation_cov,
-#             m_background,
-#             observations,
-#             obs_times,
-#         )
-
-#         # Cache for WME accumulation
-#         self._wme_accumulator = {}
-
-#     def value(self, m: PETSc.Vec) -> float:
-#         """Compute DC-WME cost."""
-#         # TODO: Implement with WME QoI
-#         pass
-
-#     def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
-#         """Compute DC-WME gradient."""
-#         # TODO: Implement with WME adjoint contribution
-#         pass
-
-#     def _compute_wme_qoi(self, trajectory: List, k: int) -> PETSc.Vec:
-#         """
-#         Compute WME QoI at time k.
-
-#         Q_wme,k = (1/k) Σ_{j=0}^{k-1} (H_j(u_j) - y_j)
-
-#         Args:
-#             trajectory: Forward trajectory [u_0, ..., u_k]
-#             k: Current time index
-
-#         Returns:
-#             WME vector
-#         """
-#         # TODO: Implement weighted mean error accumulation
-#         pass
+    if variant == "4dvar" or variant == "standard":
+        return FourDVarCost(
+            forward_model,
+            observation_operator,
+            background_cov,
+            observation_cov,
+            m_background,
+            observations,
+            obs_times,
+        )
+    elif variant == "dc" or variant == "dc_4dvar":
+        return DCFourDVarCost(
+            forward_model,
+            observation_operator,
+            background_cov,
+            observation_cov,
+            m_background,
+            observations,
+            obs_times,
+            qoi_map=kwargs.get("qoi_map"),
+            predicted_cov=kwargs.get("predicted_cov"),
+            gamma=kwargs.get("gamma", 1.0),
+        )
+    elif variant == "dc_wme" or variant == "wme":
+        return DCWMEFourDVarCost(
+            forward_model,
+            observation_operator,
+            background_cov,
+            observation_cov,
+            m_background,
+            observations,
+            obs_times,
+            predicted_cov_wme=kwargs.get("predicted_cov_wme"),
+        )
+    else:
+        raise ValueError(f"Unknown cost function variant: {variant}")
