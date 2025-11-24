@@ -72,6 +72,9 @@ class CustomNewtonProblem:
         self.L = petsc.create_vector(self.residual)
         self.solver = PETSc.KSP().create(self.comm)
 
+        # Set a unique options prefix for this solver
+        self.solver.setOptionsPrefix("newton_")
+
         self.solver.setTolerances(
             rtol=solver_parameters.get("ksp_rtol", 1e-8),
             atol=solver_parameters.get("ksp_atol", 1e-9),
@@ -87,6 +90,17 @@ class CustomNewtonProblem:
         else:
             self.pc = self.solver.getPC()
             self.pc.setType(self.pc_type)
+
+            # For Block Jacobi in parallel, use no preconditioner on each block
+            # This avoids issues with missing diagonal entries from boundary conditions
+            # (LU, ILU, and Jacobi all fail when diagonal entries are zero/missing)
+            if self.pc_type == "bjacobi":
+                # Set options for sub-preconditioner using the solver's prefix
+                opts = PETSc.Options()
+                opts["newton_sub_pc_type"] = "none"  # No preconditioning (robust to BCs)
+                opts["newton_sub_ksp_type"] = "gmres"  # Use GMRES on each block
+                opts["newton_sub_ksp_max_it"] = "100"  # Allow more iterations
+                self.solver.setFromOptions()
 
     def log(self, *msg):
         if self.comm.rank == 0:

@@ -375,13 +375,12 @@ class TestNewtonParallel:
         # Solve twice with same initial condition
         solutions = []
         for i in range(2):
-            u_test = fe.Function(V)
-            u_test.x.array[:] = 0.1
-            solver.u = u_test
+            # Modify existing Function (don't create new one - breaks weak form!)
+            solver.u.x.array[:] = 0.1
 
             newton = CustomNewtonProblem(solver, solver_parameters={})
-            newton.solve(u_test, return_jacobian=False)
-            solutions.append(u_test.x.array.copy())
+            newton.solve(solver.u, return_jacobian=False)
+            solutions.append(solver.u.x.array.copy())
 
         # Should get identical results
         diff = np.linalg.norm(solutions[0] - solutions[1])
