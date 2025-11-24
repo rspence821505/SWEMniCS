@@ -425,20 +425,78 @@ class CGImplicit(BaseSolver):
         """Solve the nonlinear problem at the current time step.
 
         Args:
-          solver: Newton solver.
-          store_jacobian: If True, request Jacobian from Newton solver (for 4D-Var).
+        solver: Newton solver (CustomNewtonProblem instance).
+        store_jacobian: If True, request Jacobian from Newton solver (for 4D-Var).
 
         Returns:
-          J: Jacobian matrix if store_jacobian=True, else None
+        J: Jacobian matrix if store_jacobian=True, else None.
+            The Jacobian is ∂R/∂u evaluated at the converged solution.
+
+        Raises:
+        RuntimeError: If negative water depths detected.
+        ValueError: If store_jacobian=True but Jacobian extraction fails.
+
+        Notes:
+        For 4D-Var data assimilation, the Jacobian is automatically copied by
+        the Newton solver to prevent overwriting in subsequent timesteps.
         """
         try:
             if store_jacobian:
                 _, J = solver.solve(self.u, return_jacobian=True)
+
+                # Validate Jacobian was successfully extracted
+                if J is None:
+                    raise ValueError(
+                        "Jacobian extraction failed: Newton solver returned None. "
+                        "Ensure CustomNewtonProblem is being used (not NewtonSolver)."
+                    )
+
+                # Validate it's a proper PETSc matrix
+                if not isinstance(J, PETSc.Mat):
+                    raise ValueError(
+                        f"Expected PETSc.Mat for Jacobian, got {type(J)}. "
+                        "This indicates an issue with Newton solver implementation."
+                    )
+
+                # Verify matrix is assembled and has nonzero size
+                if J.assembled == False:
+                    raise ValueError(
+                        "Jacobian matrix is not assembled. "
+                        "This indicates an issue with Newton solver implementation."
+                    )
+
+                size = J.getSize()
+                if size[0] == 0 or size[1] == 0:
+                    raise ValueError(
+                        f"Jacobian has invalid size {size}. "
+                        "Expected non-zero square matrix."
+                    )
+
+                # Optional: verify it's square (required for adjoint solve)
+                if size[0] != size[1]:
+                    raise ValueError(
+                        f"Jacobian must be square for adjoint computation, got {size}"
+                    )
+
+                # Log success in verbose mode
+                if self.verbose and self.mpi_rank == 0:
+                    nnz = J.getInfo()["nz_used"]
+                    self.log(
+                        f"  Jacobian extracted: {size[0]}x{size[1]}, nnz={int(nnz)}"
+                    )
+
+                # NOTE: Newton solver already returns a copy (J_final = A.copy()),
+                # so we don't need to copy again here. However, to be
+                # extra defensive, you could uncomment the following line:
+                # J = J.copy()
+
                 return J
             else:
                 solver.solve(self.u, return_jacobian=False)
                 return None
-        except RuntimeError:
+
+        except RuntimeError as e:
+            # Handle negative water depth errors
             h_fun = self.u.sub(0).collapse()
             hvals = h_fun.x.array[:]
             min_h = hvals.min()
@@ -448,6 +506,14 @@ class CGImplicit(BaseSolver):
             coords = self.problem.reverse_projection(coords)
             print(f"first coords of negative h on {self.mpi_rank}", coords[bad_h][:1])
             if not self.mpi_rank:
+                raise
+        except ValueError as e:
+            # Re-raise validation errors with context
+            if "Jacobian" in str(e):
+                print(f"ERROR on rank {self.mpi_rank}: {e}")
+                if not self.mpi_rank:
+                    raise
+            else:
                 raise
 
     def update_solution(self):

@@ -72,6 +72,19 @@ class LBFGSOptimizer(Optimizer):
         self.verbose = self.options.get("verbose", False)
         self.comm = MPI.COMM_WORLD
 
+    @staticmethod
+    def _clone_vec(vec: PETSc.Vec) -> PETSc.Vec:
+        """
+        Create a deep copy of a PETSc vector.
+
+        Using duplicate+axpy avoids relying on Vec.copy semantics and ensures
+        the new vector owns its storage.
+        """
+        vec_copy = vec.duplicate()
+        vec_copy.set(0.0)
+        vec_copy.axpy(1.0, vec)
+        return vec_copy
+
     def solve(self, x0: PETSc.Vec) -> PETSc.Vec:
         """
         Minimize cost function using L-BFGS.
@@ -138,7 +151,8 @@ class LBFGSOptimizer(Optimizer):
                     print(
                         f"Warning: Non-descent direction detected. Resetting to steepest descent."
                     )
-                direction.copy(grad)
+                direction.destroy()
+                direction = self._clone_vec(grad)
                 direction.scale(-1.0)
                 # Clear history to restart
                 self._clear_history()
@@ -201,10 +215,14 @@ class LBFGSOptimizer(Optimizer):
         Returns:
             Search direction p (descent direction)
         """
-        q = grad.copy()
+        q = self._clone_vec(grad)
 
         # Number of stored corrections
         num_corrections = len(self.s_history)
+
+        if num_corrections == 0:
+            q.scale(-1.0)
+            return q
 
         # First loop: backward recursion
         alphas = []
@@ -233,7 +251,7 @@ class LBFGSOptimizer(Optimizer):
         else:
             gamma = 1.0
 
-        r = q.copy()
+        r = self._clone_vec(q)
         r.scale(gamma)
 
         # Second loop: forward recursion
@@ -378,10 +396,15 @@ class PreconditionedLBFGS(LBFGSOptimizer):
 
         Replaces H_0 = γI with H_0 = P where P is the preconditioner.
         """
-        q = grad.copy()
+        q = self._clone_vec(grad)
 
         # First loop: backward
         num_corrections = len(self.s_history)
+        if num_corrections == 0:
+            r = self.preconditioner.apply(q)
+            r.scale(-1.0)
+            q.destroy()
+            return r
         alphas = []
         for i in range(num_corrections - 1, -1, -1):
             alpha_i = self.rho_history[i] * self.s_history[i].dot(q)

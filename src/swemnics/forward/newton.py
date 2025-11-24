@@ -7,6 +7,7 @@ than provided by the built-in NonlinearProblem class.
 MODIFICATIONS FOR 4D-VAR:
 - CustomNewtonProblem.solve() now accepts return_jacobian flag
 - Returns final Jacobian matrix for efficient adjoint computation
+- Jacobian is reassembled at converged solution for correctness
 - NewtonSolver.solve() also returns Jacobian when requested
 """
 
@@ -55,11 +56,11 @@ class CustomNewtonProblem:
         # relaxation parameter for Newton solver
         self.relaxation_parameter = 1.00
         # underlying linear solver
-        # default for serial is lu, default for mulitprocessor is gmres
+        # For serial: use direct solver (LU) which is robust to boundary conditions
+        # For parallel: use GMRES with block Jacobi preconditioner
         if self.comm.Get_size() == 1:
-            # print("serial run")
-            self.ksp_type = "gmres"  # preonly
-            self.pc_type = "ilu"  # lu
+            self.ksp_type = "preonly"  # Direct solver, no iterations
+            self.pc_type = "lu"  # LU factorization
         else:
             self.ksp_type = "gmres"
             self.pc_type = "bjacobi"
@@ -102,15 +103,24 @@ class CustomNewtonProblem:
         Returns:
             If return_jacobian=False: None (solution stored in u)
             If return_jacobian=True: (None, J) where J is the final Jacobian matrix (PETSc.Mat)
+                J = ∂R/∂u evaluated at the converged solution u
+
+        Notes:
+            For 4D-Var data assimilation, the Jacobian is reassembled at the converged
+            solution to ensure correctness. During the Newton loop, the Jacobian is
+            evaluated at u_i, then we update u_{i+1} = u_i + dx_i. When we break due
+            to convergence, we need J evaluated at u_{i+1}, not u_i.
         """
 
         dx = fe.Function(u._V)
         i = 0
+        converged = False
         rank = self.comm.rank
         A, L, solver = self.A, self.L, self.solver
         relaxation_parameter = self.relaxation_parameter
+
         while i < self.max_it:
-            # Assemble Jacobian and residual
+            # Assemble Jacobian and residual at current u
             with L.localForm() as loc_L:
                 loc_L.set(0)
 
@@ -133,6 +143,7 @@ class CustomNewtonProblem:
             )
             if self.verbose:
                 self.log("Residual norm", L.norm(0))
+
             # Solve linear problem
             if self.pc_type == "element_block":
                 new_A, new_rhs = self.pc.precondition(L)
@@ -154,7 +165,7 @@ class CustomNewtonProblem:
             if solver.getConvergedReason() == -9:
                 sys.exit(1)
 
-            # Update u_{i+1} = u_i + delta x_i
+            # Update u_{i+1} = u_i + alpha * dx_i
             u.x.array[:] += relaxation_parameter * dx.x.array[:]
 
             i += 1
@@ -164,36 +175,51 @@ class CustomNewtonProblem:
                 if self.verbose:
                     self.log("dx_0 norm,", self.dx_0_norm)
 
-            # this is relative but breaks in parallel?
-            # print('dx before', dx.vector.getArray())
+            # Normalize dx for convergence check (relative to first iteration)
             if self.dx_0_norm > 1e-8:
                 dx.x.array[:] = np.array(dx.x.array[:] / self.dx_0_norm)
-            # why wont this update unless I call it??
             dx.x.petsc_vec.assemble()
-            # print('dx after', dx.vector.getArray())
 
             # Compute norm of update
             correction_norm = dx.x.petsc_vec.norm(0)
             if self.verbose:
-                self.log(f"Netwon Iteration {i}: Correction norm {correction_norm}")
+                self.log(f"Newton Iteration {i}: Correction norm {correction_norm}")
+
+            # Check convergence
             if correction_norm < self.atol:
+                converged = True
+                if self.verbose:
+                    self.log(f"Newton solver converged in {i} iterations")
                 break
+
+            # Optionally reduce relaxation parameter if not converging
             if hasattr(self, "reduction_it"):
                 if i and i % self.reduction_it == 0:
                     if self.verbose:
                         self.log("Still haven't converged. Reducing relax param")
                     relaxation_parameter /= 2
 
-        # Return Jacobian if requested (for 4D-Var adjoint)
+        # Handle Jacobian return for 4D-Var
         if return_jacobian:
-            # Return a copy of the final Jacobian matrix
-            # This is the matrix ∂R/∂u evaluated at the converged solution
+            # CRITICAL: If we converged, the Jacobian A was assembled at u_i,
+            # but u was updated to u_{i+1} = u_i + dx. For correct adjoint
+            # computation, we need ∂R/∂u evaluated at the CONVERGED solution u_{i+1}.
+            # Therefore, we reassemble the Jacobian one final time.
+            if converged:
+                if self.verbose:
+                    self.log("Reassembling Jacobian at converged solution for 4D-Var")
+                A.zeroEntries()
+                petsc.assemble_matrix(A, self.jacobian, bcs=self.bcs)
+                A.assemble()
+
+            # Return a copy to avoid issues with A being modified in subsequent timesteps
             J_final = A.copy()
             return None, J_final
         else:
             return None
 
     def assemble_A(self):
+        """Assemble and return a copy of the Jacobian matrix at current state"""
         self.A.zeroEntries()
         petsc.assemble_matrix(self.A, self.jacobian, bcs=self.bcs)
         self.A.assemble()
