@@ -105,6 +105,10 @@ def mock_obs_operator():
             y.assemble()
             return y
 
+        def forward(self, state, time_index=0):
+            """Alias for apply to match observation operator API."""
+            return self.apply(state, time_index)
+
         def forward_linearized(self, delta_state, state, time_index=0):
             return self.apply(delta_state, time_index)
 
@@ -471,7 +475,11 @@ def test_mpi_determinism_cost_value(setup_cost_function):
     )
 
     m = setup_cost_function["m_b"].copy()
-    m.setRandom(seed=42)
+
+    # Set random seed for deterministic random values
+    rng = PETSc.Random().create(comm=comm)
+    rng.setSeed(42)
+    m.setRandom(rng)
 
     J = cost.value(m)
     all_J = comm.allgather(J)
@@ -497,7 +505,11 @@ def test_mpi_gradient_consistency(setup_cost_function):
     )
 
     m = setup_cost_function["m_b"].copy()
-    m.setRandom(seed=42)
+
+    # Set random seed for deterministic random values
+    rng = PETSc.Random().create(comm=comm)
+    rng.setSeed(42)
+    m.setRandom(rng)
 
     grad = cost.gradient(m)
     grad_norm = grad.norm()
@@ -588,16 +600,24 @@ def test_cost_function_caches_trajectory(setup_cost_function):
 
     m = setup_cost_function["m_b"].copy()
 
+    # Call gradient first (caches trajectory + jacobians)
     solve_count_before = setup_cost_function["forward_model"].solve_count
+    grad1 = cost.gradient(m)
+    solve_count_after_gradient = setup_cost_function["forward_model"].solve_count
+
+    assert solve_count_after_gradient > solve_count_before
+
+    # Call value with same m (should use cached trajectory)
     J1 = cost.value(m)
-    solve_count_after = setup_cost_function["forward_model"].solve_count
+    solve_count_after_value = setup_cost_function["forward_model"].solve_count
 
-    assert solve_count_after > solve_count_before
+    assert solve_count_after_value == solve_count_after_gradient
 
-    grad = cost.gradient(m)
-    solve_count_cached = setup_cost_function["forward_model"].solve_count
+    # Call gradient again with same m (should use cached trajectory + jacobians)
+    grad2 = cost.gradient(m)
+    solve_count_final = setup_cost_function["forward_model"].solve_count
 
-    assert solve_count_cached == solve_count_after
+    assert solve_count_final == solve_count_after_gradient
 
     if rank == 0:
         print(f"✓ Trajectory caching (MPI size={size})")

@@ -168,6 +168,11 @@ class CostFunction(ABC):
             diff = m.duplicate()
             diff.waxpy(-1.0, self._current_control, m)
             if diff.norm() < 1e-14:
+                # If jacobians are requested but not cached, re-run
+                if store_jacobians and self._jacobians is None:
+                    self._trajectory, self._jacobians = self.forward_model.solve(
+                        m, store_jacobians=True
+                    )
                 return self._trajectory, self._jacobians
 
         # Run forward model

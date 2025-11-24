@@ -67,6 +67,10 @@ def mock_forward_model():
                         [self.n_dofs, self.n_dofs], comm=self.comm
                     )
                     J.setUp()
+                    # Create a simple diagonal matrix (identity-like) for mock Jacobian
+                    # This ensures the matrix is non-singular and solvable
+                    for i in range(self.n_dofs):
+                        J.setValue(i, i, 1.0)
                     J.assemblyBegin()
                     J.assemblyEnd()
                     jacobians.append(J)

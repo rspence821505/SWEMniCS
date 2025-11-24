@@ -92,29 +92,33 @@ class ImplicitAdjointSolver:
 
         return lambda_next
 
-    class ImplicitAdjointSolver:
-        def _solve_transpose_system(self, J: PETSc.Mat, rhs: PETSc.Vec):
-            """
-            Solve J^T · λ = rhs using the DISTRIBUTED Jacobian.
+    def _solve_transpose_system(self, n: int, forcing: PETSc.Vec) -> PETSc.Vec:
+        """
+        Solve J^T · λ = rhs using the DISTRIBUTED Jacobian.
 
-            The Jacobian J = ∂R/∂uⁿ⁺¹ from forward Newton solve
-            is reused by transposing it.
+        The Jacobian J = ∂R/∂uⁿ⁺¹ from forward Newton solve
+        is reused by transposing it.
 
-            Args:
-                n: Time index
-                forcing: Right-hand side
+        Args:
+            n: Time index
+            forcing: Right-hand side
 
-            Returns:
-                Solution λⁿ
-            """
+        Returns:
+            Solution λⁿ
+        """
+        J = self.jacobians[n]
 
-            ksp = PETSc.KSP().create(J.getComm())
-            ksp.setOperators(J)
-            ksp.setTransposeMode(True)  # Parallel transpose solve
+        ksp = PETSc.KSP().create(J.getComm())
+        ksp.setOperators(J)
+        ksp.setType(PETSc.KSP.Type.GMRES)
+        ksp.getPC().setType(PETSc.PC.Type.NONE)
+        ksp.setTolerances(rtol=1e-10, atol=1e-12)
 
-            lambda_n = rhs.duplicate()
-            ksp.solve(rhs, lambda_n)
-            return lambda_n
+        # Solve transpose system
+        lambda_n = forcing.duplicate()
+        ksp.solveTranspose(forcing, lambda_n)
+
+        return lambda_n
 
     def _assemble_adjoint_forcing(
         self,
@@ -165,12 +169,32 @@ class ImplicitAdjointSolver:
         For BDF2 time coupling in adjoint equations.
 
         Returns:
-            Mass matrix
+            Mass matrix (identity if not provided by forward model)
         """
         if self._mass_matrix is None:
-            # TODO: Assemble mass matrix from function space
-            # For now, return None and implement in subclass
-            raise NotImplementedError("Mass matrix assembly not implemented")
+            # Try to get mass matrix from forward model
+            if hasattr(self.forward_model, 'get_mass_matrix'):
+                self._mass_matrix = self.forward_model.get_mass_matrix()
+            elif hasattr(self.forward_model, 'mass_matrix'):
+                self._mass_matrix = self.forward_model.mass_matrix
+            else:
+                # Fallback: create identity matrix
+                # Get size from first trajectory vector
+                n_dofs = self.trajectory[0].getSize()
+                comm = self.trajectory[0].getComm()
+
+                M = PETSc.Mat().createAIJ([n_dofs, n_dofs], comm=comm)
+                M.setUp()
+
+                # Set diagonal to 1 (identity)
+                start, end = M.getOwnershipRange()
+                for i in range(start, end):
+                    M.setValue(i, i, 1.0)
+
+                M.assemblyBegin()
+                M.assemblyEnd()
+
+                self._mass_matrix = M
 
         return self._mass_matrix
 

@@ -7,6 +7,7 @@ Defines common interface for all optimizers used in 4D-Var.
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Callable
 from petsc4py import PETSc
+import numpy as np
 
 
 class Optimizer(ABC):
@@ -148,8 +149,37 @@ class LineSearch:
         Returns:
             Step size α
         """
-        # TODO: Implement Armijo backtracking
-        pass
+        # Compute directional derivative: ∇f(x)ᵀ·p
+        directional_derivative = grad.dot(direction)
+
+        # If direction is not a descent direction, return small step
+        if directional_derivative >= 0:
+            return 1e-8
+
+        alpha = alpha_init
+        x_trial = x.duplicate()
+
+        for i in range(self.max_iter):
+            # Compute trial point: x_trial = x + α·p
+            x_trial.waxpy(alpha, direction, x)  # x_trial = x + alpha * direction
+
+            # Evaluate cost at trial point
+            cost_trial = self.cost_function.value(x_trial)
+
+            # Check Armijo condition: f(x+α·p) ≤ f(x) + c₁·α·∇fᵀ·p
+            armijo_threshold = cost_current + self.c1 * alpha * directional_derivative
+
+            if cost_trial <= armijo_threshold:
+                # Sufficient decrease achieved
+                x_trial.destroy()
+                return alpha
+
+            # Reduce step size
+            alpha *= rho
+
+        # If no suitable step found, return minimal step
+        x_trial.destroy()
+        return alpha
 
     def wolfe_conditions(
         self,
@@ -176,8 +206,156 @@ class LineSearch:
         Returns:
             Step size α
         """
-        # TODO: Implement Wolfe line search
-        pass
+        # Compute directional derivative at current point
+        directional_derivative = grad.dot(direction)
+
+        # If not a descent direction, return small step
+        if directional_derivative >= 0:
+            return 1e-8
+
+        # Initialize step size bounds
+        alpha = alpha_init
+        alpha_prev = 0.0
+        cost_prev = cost_current
+
+        x_trial = x.duplicate()
+        grad_trial = grad.duplicate()
+
+        for i in range(self.max_iter):
+            # Compute trial point
+            x_trial.waxpy(alpha, direction, x)
+
+            # Evaluate cost and gradient at trial point
+            cost_trial = self.cost_function.value(x_trial)
+            self.cost_function.gradient(x_trial, grad_trial)
+
+            # Check sufficient decrease (Armijo condition)
+            armijo_threshold = cost_current + self.c1 * alpha * directional_derivative
+
+            # Sufficient decrease violated or cost increased from previous step
+            if cost_trial > armijo_threshold or (i > 0 and cost_trial >= cost_prev):
+                # Zoom in the interval [alpha_prev, alpha]
+                alpha_result = self._zoom(
+                    x,
+                    direction,
+                    grad,
+                    cost_current,
+                    directional_derivative,
+                    alpha_prev,
+                    alpha,
+                )
+                x_trial.destroy()
+                grad_trial.destroy()
+                return alpha_result
+
+            # Check curvature condition
+            directional_derivative_trial = grad_trial.dot(direction)
+
+            # Strong Wolfe curvature condition satisfied
+            if abs(directional_derivative_trial) <= -self.c2 * directional_derivative:
+                x_trial.destroy()
+                grad_trial.destroy()
+                return alpha
+
+            # Directional derivative positive, zoom in [alpha, alpha_prev]
+            if directional_derivative_trial >= 0:
+                alpha_result = self._zoom(
+                    x,
+                    direction,
+                    grad,
+                    cost_current,
+                    directional_derivative,
+                    alpha,
+                    alpha_prev,
+                )
+                x_trial.destroy()
+                grad_trial.destroy()
+                return alpha_result
+
+            # Update for next iteration
+            alpha_prev = alpha
+            cost_prev = cost_trial
+            alpha *= 2.0  # Increase step size
+
+        # Max iterations reached, return current alpha
+        x_trial.destroy()
+        grad_trial.destroy()
+        return alpha
+
+    def _zoom(
+        self,
+        x: PETSc.Vec,
+        direction: PETSc.Vec,
+        grad: PETSc.Vec,
+        cost_current: float,
+        directional_derivative: float,
+        alpha_lo: float,
+        alpha_hi: float,
+    ) -> float:
+        """
+        Zoom phase for Wolfe line search.
+
+        Refines step size within bracket [alpha_lo, alpha_hi].
+
+        Args:
+            x: Current point
+            direction: Search direction
+            grad: Current gradient
+            cost_current: Current cost
+            directional_derivative: ∇f(x)ᵀ·p
+            alpha_lo: Lower bound of bracket
+            alpha_hi: Upper bound of bracket
+
+        Returns:
+            Step size satisfying Wolfe conditions
+        """
+        x_trial = x.duplicate()
+        grad_trial = grad.duplicate()
+
+        for i in range(self.max_iter):
+            # Interpolate to find trial step (bisection for simplicity)
+            alpha = 0.5 * (alpha_lo + alpha_hi)
+
+            # Evaluate at trial point
+            x_trial.waxpy(alpha, direction, x)
+            cost_trial = self.cost_function.value(x_trial)
+            self.cost_function.gradient(x_trial, grad_trial)
+
+            # Evaluate cost at alpha_lo for comparison
+            x_lo = x.duplicate()
+            x_lo.waxpy(alpha_lo, direction, x)
+            cost_lo = self.cost_function.value(x_lo)
+            x_lo.destroy()
+
+            # Check sufficient decrease
+            armijo_threshold = cost_current + self.c1 * alpha * directional_derivative
+
+            if cost_trial > armijo_threshold or cost_trial >= cost_lo:
+                # Sufficient decrease violated, narrow to [alpha_lo, alpha]
+                alpha_hi = alpha
+            else:
+                # Check curvature condition
+                directional_derivative_trial = grad_trial.dot(direction)
+
+                if (
+                    abs(directional_derivative_trial)
+                    <= -self.c2 * directional_derivative
+                ):
+                    # Both conditions satisfied
+                    x_trial.destroy()
+                    grad_trial.destroy()
+                    return alpha
+
+                # Check sign of directional derivative
+                if directional_derivative_trial * (alpha_hi - alpha_lo) >= 0:
+                    alpha_hi = alpha_lo
+
+                alpha_lo = alpha
+
+        # Return best alpha found
+        x_trial.destroy()
+        grad_trial.destroy()
+        return 0.5 * (alpha_lo + alpha_hi)
 
 
 class TrustRegion:

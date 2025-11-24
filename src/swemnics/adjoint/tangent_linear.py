@@ -508,8 +508,10 @@ class ImplicitTLMSolver:
         if self.ksp is None:
             self.ksp = PETSc.KSP().create(self.comm)
             self.ksp.setType(PETSc.KSP.Type.GMRES)
-            self.ksp.getPC().setType(PETSc.PC.Type.ILU)
-            self.ksp.setTolerances(rtol=1e-10, atol=1e-12, max_it=1000)
+            # Use NONE temporarily to debug - no preconditioner
+            self.ksp.getPC().setType(PETSc.PC.Type.NONE)
+            # Increase max iterations and relax tolerances for robustness
+            self.ksp.setTolerances(rtol=1e-8, atol=1e-10, max_it=5000)
 
         self.ksp.setOperators(jacobian)
 
