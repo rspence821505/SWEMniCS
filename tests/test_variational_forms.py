@@ -26,9 +26,10 @@ from petsc4py import PETSc
 
 # Import module under test
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/claude")
-from variational_forms import (
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from swemnics.forward.variational_forms import (
     VariationalForm,
     SWEVariationalForm,
     LinearizedVariationalForm,

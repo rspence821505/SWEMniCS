@@ -26,9 +26,10 @@ from petsc4py import PETSc
 
 # Import modules under test
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/claude")
-from adjoint_operators import (
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from swemnics.adjoint.adjoint_operators import (
     AdjointModel,
     ObservationAdjoint,
     CovarianceAdjoint,

@@ -336,6 +336,7 @@ class SWEVariationalForm(VariationalForm):
             time_deriv = (u_next - u_n) / dt
 
         # Spatial operator F(u^{n+1})
+
         # TODO: Add full SWE spatial terms (advection, pressure, friction)
         spatial_op = 0  # Placeholder
 

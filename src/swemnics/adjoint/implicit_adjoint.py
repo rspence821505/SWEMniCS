@@ -24,6 +24,9 @@ from typing import List, Optional, Tuple
 from petsc4py import PETSc
 import numpy as np
 
+# Import BDF2TimeCoefficients for proper time-coupling
+from swemnics.forward.variational_forms import BDF2TimeCoefficients
+
 
 class ImplicitAdjointSolver:
     """
@@ -82,6 +85,7 @@ class ImplicitAdjointSolver:
         trajectory: List[PETSc.Vec],
         jacobians: List[PETSc.Mat],
         dt: float,
+        variational_form=None,  # NEW: Optional variational form
     ):
         """
         Initialize implicit adjoint solver.
@@ -96,6 +100,9 @@ class ImplicitAdjointSolver:
             Cached Jacobian matrices from forward solve.
         dt : float
             Time step size.
+        variational_form : VariationalForm, optional
+            Variational form providing mass matrix and BDF2 coefficients.
+            If None, will use fallback assembly.
 
         Raises
         ------
@@ -115,6 +122,14 @@ class ImplicitAdjointSolver:
                 f"Expected {self.num_steps} Jacobians for {len(trajectory)} states, "
                 f"got {len(jacobians)}"
             )
+
+        # NEW: Use BDF2TimeCoefficients for correct time-coupling
+        # Always use BDF2 mode (first step uses Backward Euler internally)
+        use_bdf2 = True
+        self.time_coeffs = BDF2TimeCoefficients(dt, use_bdf2=use_bdf2)
+
+        # NEW: Store variational form for mass matrix access
+        self.var_form = variational_form
 
         # Mass matrix for BDF2 time coupling (cached)
         self._mass_matrix = None
@@ -265,10 +280,10 @@ class ImplicitAdjointSolver:
         Assemble RHS for adjoint step.
 
         For BDF2, the adjoint time coupling is:
-            RHS = (4/(2Δt))·M·λ^{n+1} - (1/(2Δt))·M·λ^{n+2} + obs_forcing
+            RHS = c_{n+1}·M·λ^{n+1} + c_{n+2}·M·λ^{n+2} + obs_forcing
 
-        This three-level time coupling arises from the BDF2 stencil in
-        the forward scheme.
+        The coefficients come from BDF2TimeCoefficients and support both
+        BDF2 and Backward Euler schemes, as well as adaptive time-stepping.
 
         Parameters
         ----------
@@ -288,22 +303,26 @@ class ImplicitAdjointSolver:
 
         Notes
         -----
-        The time coupling coefficients (4/(2Δt) and -1/(2Δt)) arise from
-        differentiating the BDF2 stencil with respect to u^n.
+        The time coupling coefficients arise from differentiating the
+        BDF2 stencil with respect to u^n. For BDF2: (4/(2Δt), -1/(2Δt)),
+        for Backward Euler: (1/Δt, 0).
         """
+        # Get time-coupling coefficients from BDF2TimeCoefficients
+        c_next, c_next_next = self.time_coeffs.get_adjoint_coeffs(n)
+
         # Get mass matrix
         M = self._get_mass_matrix()
 
-        # BDF2 time coupling: (4/(2Δt))·M·λ^{n+1}
+        # Time coupling: c_{n+1}·M·λ^{n+1}
         forcing = lambda_next.duplicate()
         M.mult(lambda_next, forcing)
-        forcing.scale(4.0 / (2.0 * self.dt))
+        forcing.scale(c_next)
 
-        # Subtract (1/(2Δt))·M·λ^{n+2}
-        if lambda_next_next is not None:
+        # Add c_{n+2}·M·λ^{n+2}
+        if lambda_next_next is not None and abs(c_next_next) > 1e-14:
             temp = lambda_next.duplicate()
             M.mult(lambda_next_next, temp)
-            forcing.axpy(-1.0 / (2.0 * self.dt), temp)
+            forcing.axpy(c_next_next, temp)
             temp.destroy()
 
         # Add observation forcing
@@ -322,17 +341,26 @@ class ImplicitAdjointSolver:
         Returns
         -------
         PETSc.Mat
-            Mass matrix (identity if not provided by forward model).
+            Mass matrix (identity if not provided by forward model or
+            variational form).
 
         Notes
         -----
         The mass matrix is assumed to be constant throughout the
         simulation. For time-varying mass matrices (e.g., in wetting/drying),
         this would need to be modified.
+
+        Priority order:
+        1. Variational form (if provided)
+        2. Forward model mass matrix
+        3. Identity matrix (fallback)
         """
         if self._mass_matrix is None:
-            # Try to get mass matrix from forward model
-            if hasattr(self.forward_model, "get_mass_matrix"):
+            # First priority: use variational form if available
+            if self.var_form is not None:
+                self._mass_matrix = self.var_form.assemble_mass_matrix()
+            # Second priority: try to get mass matrix from forward model
+            elif hasattr(self.forward_model, "get_mass_matrix"):
                 self._mass_matrix = self.forward_model.get_mass_matrix()
             elif hasattr(self.forward_model, "mass_matrix"):
                 self._mass_matrix = self.forward_model.mass_matrix
@@ -394,7 +422,7 @@ class ImplicitAdjointStepAnalyzer:
     >>> print(f"Adjoint consistency error: {error}")
     """
 
-    def __init__(self, forward_model, dt: float):
+    def __init__(self, forward_model, dt: float, variational_form=None):
         """
         Initialize analyzer.
 
@@ -404,9 +432,16 @@ class ImplicitAdjointStepAnalyzer:
             Forward model instance.
         dt : float
             Time step size.
+        variational_form : VariationalForm, optional
+            Variational form for mass matrix and time coefficients.
         """
         self.forward_model = forward_model
         self.dt = dt
+        self.var_form = variational_form
+
+        # Use BDF2TimeCoefficients for correct time-coupling
+        use_bdf2 = True
+        self.time_coeffs = BDF2TimeCoefficients(dt, use_bdf2=use_bdf2)
 
     def verify_adjoint_step(
         self,
@@ -488,6 +523,7 @@ class ImplicitAdjointStepAnalyzer:
 
     def verify_time_coupling(
         self,
+        n: int,
         lambda_n: PETSc.Vec,
         lambda_next: PETSc.Vec,
         lambda_next_next: Optional[PETSc.Vec],
@@ -496,14 +532,16 @@ class ImplicitAdjointStepAnalyzer:
         """
         Verify BDF2 time coupling in adjoint.
 
-        Computes and returns the time coupling term:
-            (4/(2Δt))·M·λ^{n+1} - (1/(2Δt))·M·λ^{n+2}
+        Computes and returns the time coupling term using BDF2TimeCoefficients:
+            c_{n+1}·M·λ^{n+1} + c_{n+2}·M·λ^{n+2}
 
         This can be used to verify that the time coupling is correctly
         assembled in the full adjoint solver.
 
         Parameters
         ----------
+        n : int
+            Time step index.
         lambda_n : PETSc.Vec
             Adjoint at time n (for reference/validation).
         lambda_next : PETSc.Vec
@@ -521,19 +559,23 @@ class ImplicitAdjointStepAnalyzer:
         Notes
         -----
         This utility is primarily for testing and debugging the
-        adjoint implementation.
+        adjoint implementation. Coefficients are obtained from
+        BDF2TimeCoefficients to support adaptive time-stepping.
         """
+        # Get time-coupling coefficients from BDF2TimeCoefficients
+        c_next, c_next_next = self.time_coeffs.get_adjoint_coeffs(n)
+
         coupling = lambda_next.duplicate()
 
         # Contribution from λ^{n+1}
         mass_matrix.mult(lambda_next, coupling)
-        coupling.scale(4.0 / (2.0 * self.dt))
+        coupling.scale(c_next)
 
         # Contribution from λ^{n+2} (if exists)
-        if lambda_next_next is not None:
+        if lambda_next_next is not None and abs(c_next_next) > 1e-14:
             temp = lambda_next.duplicate()
             mass_matrix.mult(lambda_next_next, temp)
-            coupling.axpy(-1.0 / (2.0 * self.dt), temp)
+            coupling.axpy(c_next_next, temp)
             temp.destroy()
 
         return coupling

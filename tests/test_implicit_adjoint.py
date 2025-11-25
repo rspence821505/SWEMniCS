@@ -497,9 +497,10 @@ class TestAdjointConsistency:
 
         M = mock_forward_model.get_mass_matrix()
 
-        # Compute time coupling
+        # Compute time coupling (n=0 is arbitrary for this test)
         coupling = analyzer.verify_time_coupling(
-            lambda_n, lambda_next, lambda_next_next, M
+            n=0, lambda_n=lambda_n, lambda_next=lambda_next,
+            lambda_next_next=lambda_next_next, mass_matrix=M
         )
 
         # Check result

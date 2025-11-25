@@ -413,8 +413,15 @@ class FourDVarCost(CostFunction):
         # Solve adjoint using implicit adjoint solver
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
 
+        # Check if forward model has a variational form (for BDF2 time coefficients)
+        variational_form = getattr(self.forward_model, 'var_form', None)
+
         adjoint_solver = ImplicitAdjointSolver(
-            self.forward_model, trajectory, jacobians, self.forward_model.dt
+            self.forward_model,
+            trajectory,
+            jacobians,
+            self.forward_model.dt,
+            variational_form=variational_form  # NEW: Pass variational form if available
         )
 
         # Terminal condition (usually zero)
