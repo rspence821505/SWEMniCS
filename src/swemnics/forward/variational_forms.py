@@ -316,19 +316,17 @@ class SWEVariationalForm(VariationalForm):
         PETSc.Vec
             Residual vector.
 
-        Raises
-        ------
-        ValueError
-            If BDF2 is requested but u_nm1 is None.
+        Notes
+        -----
+        For BDF2, if u_nm1 is None (first step), automatically falls back
+        to Backward Euler for that step.
         """
-        if self.use_bdf2 and u_nm1 is None:
-            raise ValueError("BDF2 requires u_nm1, but None was provided")
-
         dt = self.get_dt(step)
         v = TestFunction(self.function_space)
 
         # Time derivative term
-        if self.use_bdf2:
+        # For BDF2, fall back to Backward Euler if u_nm1 is None (first step)
+        if self.use_bdf2 and u_nm1 is not None:
             # BDF2: (3u^{n+1} - 4u^n + u^{n-1})/(2Δt)
             time_deriv = (3.0 * u_next - 4.0 * u_n + u_nm1) / (2.0 * dt)
         else:
@@ -338,7 +336,9 @@ class SWEVariationalForm(VariationalForm):
         # Spatial operator F(u^{n+1})
 
         # TODO: Add full SWE spatial terms (advection, pressure, friction)
-        spatial_op = 0  # Placeholder
+        # For now, use zero spatial operator (pure time evolution)
+        from ufl import zero
+        spatial_op = zero(time_deriv.ufl_shape)  # Placeholder
 
         # Total residual form
         residual_form = inner(time_deriv + spatial_op, v) * dx
@@ -383,7 +383,8 @@ class SWEVariationalForm(VariationalForm):
         M = self.assemble_mass_matrix()
 
         # Time derivative Jacobian
-        if self.use_bdf2:
+        # For BDF2, fall back to Backward Euler if u_nm1 is None (first step)
+        if self.use_bdf2 and u_nm1 is not None:
             # BDF2: J_time = (3/(2Δt))·M
             time_coeff = 3.0 / (2.0 * dt)
         else:
@@ -457,8 +458,8 @@ class LinearizedVariationalForm:
         J = self.base_form.assemble_jacobian(u_base, u_n, u_nm1, step)
 
         # Apply to perturbation
-        result = delta_u.vector.copy()
-        J.mult(delta_u.vector, result)
+        result = delta_u.x.petsc_vec.copy()
+        J.mult(delta_u.x.petsc_vec, result)
 
         return result
 

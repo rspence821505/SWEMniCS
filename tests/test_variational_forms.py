@@ -288,15 +288,15 @@ class TestSWEVariationalForm:
         assert form.h_min == 0.05
 
     def test_residual_requires_unm1_for_bdf2(self, swe_function_space):
-        """Test that BDF2 residual assembly requires u_nm1."""
+        """Test that BDF2 auto-falls back to Backward Euler when u_nm1 is None."""
         form = SWEVariationalForm(swe_function_space, dt=0.1, use_bdf2=True)
 
         u_next = fem.Function(swe_function_space)
         u_n = fem.Function(swe_function_space)
 
-        # Should raise error if u_nm1 is None
-        with pytest.raises(ValueError, match="BDF2 requires u_nm1"):
-            form.assemble_residual(u_next, u_n, u_nm1=None)
+        # Should not raise error - auto-falls back to Backward Euler
+        residual = form.assemble_residual(u_next, u_n, u_nm1=None)
+        assert isinstance(residual, PETSc.Vec)
 
     def test_residual_backward_euler_no_unm1(self, swe_function_space):
         """Test that Backward Euler doesn't require u_nm1."""
@@ -368,9 +368,9 @@ class TestSWEVariationalForm:
         u_nm1 = fem.Function(swe_function_space)
 
         # Set same values on all ranks
-        u_next.vector.set(1.0)
-        u_n.vector.set(0.5)
-        u_nm1.vector.set(0.0)
+        u_next.x.array[:] = 1.0
+        u_n.x.array[:] = 0.5
+        u_nm1.x.array[:] = 0.0
 
         J = form.assemble_jacobian(u_next, u_n, u_nm1)
         norm = J.norm(PETSc.NormType.FROBENIUS)
@@ -408,7 +408,7 @@ class TestLinearizedVariationalForm:
         u_n = fem.Function(swe_function_space)
         u_nm1 = fem.Function(swe_function_space)
 
-        delta_u.vector.set(1.0)
+        delta_u.x.array[:] = 1.0
 
         result = tlm_form.apply_jacobian(u_base, delta_u, u_n, u_nm1)
 
@@ -424,14 +424,14 @@ class TestLinearizedVariationalForm:
         u_n = fem.Function(swe_function_space)
         u_nm1 = fem.Function(swe_function_space)
 
-        delta_u.vector.set(1.0)
+        delta_u.x.array[:] = 1.0
 
         # Compute J(δu)
         result1 = tlm_form.apply_jacobian(u_base, delta_u, u_n, u_nm1)
 
         # Scale input by α
         alpha = 2.5
-        delta_u.vector.scale(alpha)
+        delta_u.x.array[:] *= alpha
 
         # Compute J(α·δu)
         result2 = tlm_form.apply_jacobian(u_base, delta_u, u_n, u_nm1)
