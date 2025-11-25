@@ -132,6 +132,8 @@ class AdjointModel:
         For BDF2 scheme, this is overridden by ImplicitAdjointSolver
         which includes the full three-level time-coupling logic.
 
+        This base implementation provides a simple backward Euler transpose solve.
+
         Parameters
         ----------
         n : int
@@ -145,16 +147,24 @@ class AdjointModel:
         -------
         PETSc.Vec
             λⁿ computed via transpose solve.
-
-        Raises
-        ------
-        NotImplementedError
-            This base class method must be overridden.
         """
-        raise NotImplementedError(
-            "Use ImplicitAdjointSolver for BDF2 time-stepping. "
-            "This base class provides the framework only."
-        )
+        # Simple backward Euler: solve J^T λⁿ = λⁿ⁺¹
+        # Get Jacobian at step n
+        J_n = self.jacobians[n]
+
+        # Create vector for result
+        lambda_n = self.forward_model.create_vec()
+
+        # Solve transpose system: J^T λⁿ = λⁿ⁺¹
+        ksp = PETSc.KSP().create(J_n.getComm())
+        ksp.setOperators(J_n)
+        ksp.setType('preonly')
+        pc = ksp.getPC()
+        pc.setType('lu')
+        ksp.solveTranspose(lambda_next, lambda_n)  # Solve transpose
+        ksp.destroy()
+
+        return lambda_n
 
 
 class ObservationAdjoint:

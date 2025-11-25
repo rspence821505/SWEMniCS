@@ -204,16 +204,18 @@ class TestAdjointModel:
 
         assert isinstance(lambda_0, PETSc.Vec)
 
-    def test_adjoint_step_not_implemented(
+    def test_adjoint_step_basic_implementation(
         self, mock_model, simple_trajectory, simple_jacobians
     ):
-        """Test that _solve_adjoint_step raises NotImplementedError."""
+        """Test that _solve_adjoint_step provides basic backward Euler implementation."""
         adj_model = AdjointModel(mock_model, simple_trajectory, simple_jacobians)
 
         vec = mock_model.create_vec()
+        vec.set(1.0)
 
-        with pytest.raises(NotImplementedError, match="Use ImplicitAdjointSolver"):
-            adj_model._solve_adjoint_step(0, vec, None)
+        # Should not raise, provides basic implementation
+        result = adj_model._solve_adjoint_step(0, vec, None)
+        assert isinstance(result, PETSc.Vec)
 
     @pytest.mark.mpi
     def test_parallel_initialization(

@@ -101,16 +101,24 @@ class TimeStepDataManager:
             self._skipped_count += 1
             return
 
+        # Track if anything was actually saved
+        saved_anything = False
+
         if J is not None and self.store_jacobians:
             self.solver.save_jacobians(J)
+            saved_anything = True
 
         if self.save_adjoints and timestep > 0:
             self.solver.save_adjoints()
+            saved_anything = True
 
         if self.save_state:
             self._save_state_with_wd(local_points)
+            saved_anything = True
 
-        self._saved_count += 1
+        # Only increment saved count if something was actually saved
+        if saved_anything:
+            self._saved_count += 1
 
         if self.verbose and self.solver.mpi_rank == 0 and self._saved_count % 10 == 0:
             elapsed = time.time() - self._start_time
@@ -166,6 +174,13 @@ class TimeStepDataManager:
         if self.save_adjoints:
             adj_mb = (n_saves * n_dofs * nnz_per_row * bytes_per_float) / (1024**2)
             estimates["adjoints"] = adj_mb
+
+        if self.save_bathy:
+            # Estimate bathymetry storage (assuming similar size to states)
+            # This is a rough estimate based on number of observation points
+            n_points = len(getattr(self.solver, 'points_on_proc', []))
+            bathy_mb = (n_saves * n_points * bytes_per_float) / (1024**2)
+            estimates["bathymetry"] = bathy_mb
 
         estimates["total"] = sum(estimates.values())
         return estimates

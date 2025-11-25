@@ -395,15 +395,18 @@ class TestTimeStepDataManagerIntegration:
 
     def test_verbose_logging(self, capsys):
         """Test that verbose mode produces output."""
+        problem = TidalProblem(nx=5, ny=5, nt=10, h_b=5.0, verbose=False)
+        solver = CGImplicit(problem, theta=0.5, verbose=False)
+
         manager = TimeStepDataManager(
-            solver=self.solver,
+            solver=solver,
             save_state=True,
             verbose=True,  # Enable verbose
             observation_times=[0, 5, 10],
         )
 
         # Only rank 0 should print
-        if self.solver.mpi_rank == 0:
+        if solver.mpi_rank == 0:
             captured = capsys.readouterr()
             # Should have printed something during initialization
             assert len(captured.out) > 0 or manager.obs_mode == True

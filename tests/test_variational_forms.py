@@ -23,6 +23,7 @@ import dolfinx
 from dolfinx import mesh, fem
 from ufl import TrialFunction, TestFunction, dx, inner
 from petsc4py import PETSc
+import basix.ufl
 
 # Import module under test
 import sys
@@ -35,6 +36,7 @@ from swemnics.forward.variational_forms import (
     LinearizedVariationalForm,
     BDF2TimeCoefficients,
 )
+from swemnics.utils.fem_utilities import create_mixed_element
 
 
 # ============================================================================
@@ -67,8 +69,9 @@ def swe_function_space(mixed_2d_mesh):
 
     Uses P1 elements for simplicity in testing.
     """
-    P1 = ("Lagrange", 1)
-    element = dolfinx.fem.element.MixedElement([P1, P1, P1])
+    # Create basix elements for H, u, v
+    P1 = basix.ufl.element("Lagrange", mixed_2d_mesh.basix_cell(), 1)
+    element = create_mixed_element([P1, P1, P1])
     return fem.functionspace(mixed_2d_mesh, element)
 
 

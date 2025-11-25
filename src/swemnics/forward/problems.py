@@ -92,8 +92,12 @@ class BaseProblem(abc.ABC):
     def log(self, *msg):
         """Log a message"""
 
-        if self.mesh.comm.Get_rank() == 0 and self.verbose:
-            print(*msg)
+        if self.verbose:
+            if hasattr(self, 'mesh') and self.mesh.comm.Get_rank() == 0:
+                print(*msg)
+            elif not hasattr(self, 'mesh'):
+                # If mesh doesn't exist yet, just print (no MPI rank check)
+                print(*msg)
 
     def init_V(self, V):
         """Initialize the space V in which the problem will be solved.
@@ -885,7 +889,8 @@ class TidalProblem(BaseProblem):
         if self.solution_var == "eta":
             self.u_bc.sub(0).x.array[self.dof_open] = tide
         else:
-            if not hasattr(self, "_hb_boundary"):
+            # Check if cached boundary exists and has correct size
+            if not hasattr(self, "_hb_boundary") or len(self._hb_boundary) != len(self.dof_open):
                 h_bc = self.u_bc.sub(0)
                 h_bc.interpolate(
                     fe.Expression(

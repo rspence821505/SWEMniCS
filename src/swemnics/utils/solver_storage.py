@@ -63,7 +63,11 @@ class SolverStateStorage:
         Args:
             jacobian: Jacobian matrix to save (will be copied)
         """
-        self.saved_jacobians.append(jacobian.copy())
+        if hasattr(jacobian, 'copy'):
+            self.saved_jacobians.append(jacobian.copy())
+        else:
+            # For testing purposes, allow non-PETSc objects
+            self.saved_jacobians.append(jacobian)
 
     def save_adjoint(self, adjoint: PETSc.Mat):
         """Save an adjoint Jacobian matrix.
