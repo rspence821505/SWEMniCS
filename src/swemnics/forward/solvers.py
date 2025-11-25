@@ -345,6 +345,10 @@ class CGImplicit(BaseSolver):
         self.u_n_old.sub(0).x.array[:] = self.u_n.sub(0).x.array[:]
         self.u_n_old.sub(1).x.array[:] = self.u_n.sub(1).x.array[:]
 
+        # Initialize current solution to match initial condition
+        # This ensures solve_timestep works when called directly (without time_loop)
+        self.u.x.array[:] = self.u_n.x.array[:]
+
     def init_weak_form(self):
         """Initialize the weak form.
 
@@ -692,7 +696,7 @@ class CGImplicit(BaseSolver):
         """
 
         if store_jacobians:
-            self.storage.saved_jacobians = []
+            self.storage.saved_jacobians.clear()
             if self.verbose:
                 self.log("4D-Var mode: Jacobians will be stored during forward solve")
 
