@@ -97,7 +97,9 @@ class CustomNewtonProblem:
             if self.pc_type == "bjacobi":
                 # Set options for sub-preconditioner using the solver's prefix
                 opts = PETSc.Options()
-                opts["newton_sub_pc_type"] = "none"  # No preconditioning (robust to BCs)
+                opts["newton_sub_pc_type"] = (
+                    "none"  # No preconditioning (robust to BCs)
+                )
                 opts["newton_sub_ksp_type"] = "gmres"  # Use GMRES on each block
                 opts["newton_sub_ksp_max_it"] = "100"  # Allow more iterations
                 self.solver.setFromOptions()
@@ -215,7 +217,7 @@ class CustomNewtonProblem:
 
         # Handle Jacobian return for 4D-Var
         if return_jacobian:
-            # CRITICAL: If we converged, the Jacobian A was assembled at u_i,
+            # If we converged, the Jacobian A was assembled at u_i,
             # but u was updated to u_{i+1} = u_i + dx. For correct adjoint
             # computation, we need ∂R/∂u evaluated at the CONVERGED solution u_{i+1}.
             # Therefore, we reassemble the Jacobian one final time.
