@@ -39,6 +39,7 @@ from .solvers import (
     DGImplicit,
     DGImplicitNonConservative,
     SUPGImplicit,
+    get_solver,
 )
 from .variational_forms import (
     LinearizedVariationalForm,
@@ -70,6 +71,7 @@ __all__ = [
     "DGCGImplicit",
     "CGImplicit",
     "SUPGImplicit",
+    "get_solver",
     # Newton utilities
     "CustomNewtonProblem",
     "ElementBlockPreconditioner",

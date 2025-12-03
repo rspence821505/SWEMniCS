@@ -1,5 +1,5 @@
-from swemnics.problems import DamProblem
-from swemnics.solvers import get_solver
+from swemnics.forward.problems import DamProblem
+from swemnics.forward.solvers import get_solver
 from swemnics import FrictionLaw
 import numpy as np
 import matplotlib.pyplot as plt
