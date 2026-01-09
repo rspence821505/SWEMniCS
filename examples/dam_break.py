@@ -73,10 +73,7 @@ def run_experiment(name, outdir=None, **kwargs):
         plot_name="dam_test_" + name,
     )
 
-    # solver.solve()
-    # prob.plot_solution(solver.u.sub(0),'Single_time_step')
-    # print(solver.station_data.shape)
-    # save array for post processing
+    # Save array for post processing
     if outdir is not None:
         os.makedirs(outdir, exist_ok=True)
     outdir = "" if outdir is None else outdir + "/"
@@ -87,71 +84,34 @@ def run_experiment(name, outdir=None, **kwargs):
     np.savetxt(
         f"{outdir}{name}_p1_stations_yvel.csv", solver.vals[:, :, 2], delimiter=","
     )
-    if rank == 0:
-        x = np.linspace(0, Lx, nx)
-        plt_nums = [0, 40, nt]
-        # note that station data is array with shape nt x nstattion x 3 (h,u,v)
-        for a in plt_nums:
-            if a > nt:
-                break
-            t = a * dt
-            if a != 0:
-                h_analytic, u_analytic = prob.get_analytic_solution(x, t)
-                plt.plot(
-                    x,
-                    h_analytic,
-                    "-",
-                    linewidth=1,
-                    label="h exact at " + str(int(t * 10) / 10) + "s",
-                )
 
-            plt.plot(
-                np.linspace(0, 1000, nx),
-                solver.vals[a, :, 0] + dam_height,
-                "--",
-                linewidth=2,
-                label="h at " + str(int(t * 10) / 10),
-            )
-        # plt.plot(np.linspace(0,1000,100), solver.vals[1,:,0], linewidth=2, label="h at 100")
-        # plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")
-        plt.grid(True)
-        plt.xlabel("x(m)")
-        plt.ylabel("surface elevation(m)")
-        plt.title(f"Surface Elevation for {name} Scheme")
-        plt.legend()
-        plt.savefig(f"{outdir}dam_height_{name}_order1_dt.png")
-        plt.close()
+    # Plot results using SolverVisualizer (MPI-aware, no rank check needed)
+    from swemnics.utils.visualization import SolverVisualizer
 
-        # also plot x velocity
-        for b in plt_nums:
-            if b > nt:
-                break
-            t = b * dt
+    visualizer = SolverVisualizer(
+        domain=solver.domain,
+        V_scalar=solver.V_scalar,
+        V_vel=solver.V_vel,
+        problem=prob,
+        verbose=False,
+    )
 
-            if b != 0:
-                h_analytic, u_analytic = prob.get_analytic_solution(x, t)
-                plt.plot(
-                    x,
-                    u_analytic,
-                    "-",
-                    linewidth=1,
-                    label="$u_x$ exact at " + str(int(t * 10) / 10),
-                )
+    plt_nums = [0, 40, nt]
+    visualizer.plot_dam_break(
+        solver_vals=solver.vals,
+        dt=dt,
+        nt=nt,
+        Lx=Lx,
+        dam_height=dam_height,
+        timesteps=plt_nums,
+        scheme_name=name.upper(),
+        output_dir=outdir.rstrip("/") if outdir else ".",
+        analytical_solution_func=prob.get_analytic_solution,
+    )
 
-            plt.plot(
-                np.linspace(0, Lx, nx),
-                solver.vals[b, :, 1],
-                "--",
-                linewidth=2,
-                label="$u_x$ at " + str(int(t * 10) / 10) + "s",
-            )
-        plt.grid(True)
-        plt.xlabel("x(m)")
-        plt.ylabel("velocity in x direction (m/s)")
-        plt.title(f"Velocity for {name} Scheme")
-        plt.legend()
-        plt.savefig(f"{outdir}dam_velocity_{name}_order1_dt.png")
-        plt.close()
+    visualizer.print_saved_files(
+        f"\nPlots saved: {outdir}dam_height_{name.upper()}_order1_dt.png, {outdir}dam_velocity_{name.upper()}_order1_dt.png"
+    )
 
     # Your statements here
 

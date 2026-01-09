@@ -63,14 +63,6 @@ class TimeStepDataManager:
         self._skipped_count = 0
         self._start_time = None
 
-        if self.verbose and self.solver.mpi_rank == 0:
-            if self.obs_mode:
-                self.solver.log(
-                    f"DataManager: Observation mode - saving at {len(self.observation_times)} timesteps"
-                )
-            else:
-                self.solver.log("DataManager: Saving at all timesteps")
-
     def should_save_at(self, timestep: int) -> bool:
         """Return True if data should be saved at the given timestep.
 
@@ -120,12 +112,13 @@ class TimeStepDataManager:
         if saved_anything:
             self._saved_count += 1
 
-        if self.verbose and self.solver.mpi_rank == 0 and self._saved_count % 10 == 0:
-            elapsed = time.time() - self._start_time
-            rate = self._saved_count / elapsed if elapsed > 0 else 0.0
-            self.solver.log(
-                f"DataManager: Saved {self._saved_count} timesteps ({rate:.1f} saves/sec)"
-            )
+        # Disabled: This progress message is redundant with tqdm progress bar
+        # if self.verbose and self.solver.mpi_rank == 0 and self._saved_count % 10 == 0:
+        #     elapsed = time.time() - self._start_time
+        #     rate = self._saved_count / elapsed if elapsed > 0 else 0.0
+        #     self.solver.log(
+        #         f"DataManager: Saved {self._saved_count} timesteps ({rate:.1f} saves/sec)"
+        #     )
 
     def _save_state_with_wd(self, local_points):
         """Internal helper to save state with optional wetting/drying handling.
@@ -203,6 +196,28 @@ class TimeStepDataManager:
             "n_adjoints": len(self.solver.saved_adjoints),
             "n_dry_nodes": len(self.solver.dry_nodes),
         }
+
+    def print_summary(self):
+        """Print summary statistics to console (only from rank 0 in MPI)."""
+        # Only print from rank 0 in parallel runs
+        if self.solver.mpi_rank != 0:
+            return
+
+        summary = self.get_summary()
+        print("\n" + "=" * 70)
+        print("TimeStep Data Manager Summary")
+        print("=" * 70)
+        print(f"Mode:                {summary['mode']}")
+        print(f"Timesteps saved:     {summary['saved']}")
+        print(f"Timesteps skipped:   {summary['skipped']}")
+        if summary['observation_times'] is not None:
+            print(f"Observation times:   {len(summary['observation_times'])} timesteps")
+        print(f"\nStored data:")
+        print(f"  States:            {summary['n_states']}")
+        print(f"  Jacobians:         {summary['n_jacobians']}")
+        print(f"  Adjoints:          {summary['n_adjoints']}")
+        print(f"  Dry nodes:         {summary['n_dry_nodes']}")
+        print("=" * 70)
 
     def __repr__(self) -> str:
         summary = self.get_summary()

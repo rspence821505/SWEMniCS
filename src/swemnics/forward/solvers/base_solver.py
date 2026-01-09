@@ -82,16 +82,6 @@ class BaseSolver:
         self.saved_bathy = self.storage.saved_bathy
         self.saved_jacobians = self.storage.saved_jacobians
 
-        if self.verbose:
-            self.log("SWE TYPE", self.swe_type)
-
-        if self.wd:
-            if self.verbose:
-                self.log("Wetting drying activated \n")
-        else:
-            if self.verbose:
-                self.log("Wetting drying NOT activated \n")
-
         self.init_fields()
         self.init_weak_form()
 
@@ -180,3 +170,61 @@ class BaseSolver:
     def log(self, *msg):
         if self.mpi_rank == 0 and self.verbose:
             print(*msg)
+
+    def print_config(self):
+        """Print solver configuration information.
+
+        Prints solver settings including SWE type, wetting/drying status,
+        state vector dimensions, polynomial degrees, and time stepping parameters.
+        Only prints from MPI rank 0.
+        """
+        if self.mpi_rank != 0:
+            return
+
+        print("\n" + "=" * 70)
+        print("Solver Configuration")
+        print("=" * 70)
+
+        # SWE type
+        print(f"SWE type:            {self.swe_type}")
+
+        # Wetting/drying
+        wd_status = "activated" if self.wd else "NOT activated"
+        print(f"Wetting/drying:      {wd_status}")
+
+        # Polynomial degrees
+        print(f"Polynomial degrees:  h={self.p_degree[0]}, vel={self.p_degree[1]}")
+
+        # Element type
+        print(f"Element type:        {self.p_type}")
+
+        # State vector size
+        state_size = self.u.x.array.shape[0]
+        num_components = 3  # h, u, v
+        print(f"State vector size:   {state_size}, {num_components} (h, u, v)")
+
+        # Time stepping info if available
+        if hasattr(self, 'problem') and hasattr(self.problem, 'nt'):
+            print(f"Number of timesteps: {self.problem.nt}")
+        if hasattr(self, 'problem') and hasattr(self.problem, 'dt'):
+            print(f"Time step size:      {self.problem.dt}")
+
+        # Theta parameter
+        theta_schemes = {0: "Implicit Euler", 0.5: "BDF2", 1.0: "Crank-Nicolson"}
+        scheme_name = theta_schemes.get(self.theta, f"Custom (theta={self.theta})")
+        print(f"Time scheme:         {scheme_name}")
+
+        # Data saving configuration (if time_loop has been called)
+        # Check if we have data manager information from a time_loop call
+        if hasattr(self, '_last_data_manager_config'):
+            config = self._last_data_manager_config
+            save_mode = config.get('mode', 'unknown')
+            if save_mode == 'observation':
+                n_obs = config.get('n_observations', 0)
+                print(f"Timesteps saved:     {n_obs} observations")
+            elif save_mode == 'all_timesteps':
+                print(f"Timesteps saved:     All timesteps")
+            else:
+                print(f"Timesteps saved:     None (forward only)")
+
+        print("=" * 70)

@@ -112,11 +112,25 @@ class StationManager:
         self.cells = cells
 
         # Evaluate bathymetry at station locations
-        bathy_func = fe.Function(self.V_scalar)
-        bathy_func.interpolate(
-            fe.Expression(self.h_b, self.V_scalar.element.interpolation_points())
-        )
-        self.station_bathy = bathy_func.eval(points_on_proc, self.cells)
+        # Handle both callable expressions and Function objects
+        if callable(self.h_b):
+            # h_b is a Python callable - interpolate it
+            bathy_func = fe.Function(self.V_scalar)
+            bathy_func.interpolate(self.h_b)
+            self.station_bathy = bathy_func.eval(points_on_proc, self.cells).flatten()
+        elif hasattr(self.h_b, 'eval'):
+            # h_b is already a Function - evaluate it directly
+            self.station_bathy = self.h_b.eval(points_on_proc, self.cells).flatten()
+        else:
+            # h_b might be a Constant or scalar value
+            try:
+                # Try to get scalar value
+                bathy_value = float(self.h_b)
+                self.station_bathy = np.full(len(points_on_proc), bathy_value)
+            except (TypeError, ValueError):
+                raise TypeError(
+                    f"h_b must be callable, a Function, or a scalar value, got {type(self.h_b)}"
+                )
 
         self.points_on_proc = np.array(points_on_proc, dtype=np.float64)
         return self.points_on_proc
@@ -131,26 +145,56 @@ class StationManager:
         Returns:
             Array of shape (n_stations, 3) containing [h, u, v] at each station
         """
-        # Evaluate water depth at stations
-        h_values = u_sol.sub(0).eval(self.points_on_proc, self.cells)
+        # If no stations on this processor, return empty array
+        if len(self.points_on_proc) == 0:
+            return np.zeros((0, 3))
+
+        # Check function space structure - handle both 2 and 3 sub-element cases
+        try:
+            num_sub_elements = u_sol.ufl_element().num_sub_elements
+        except AttributeError:
+            num_sub_elements = 0
+
+        if num_sub_elements < 2:
+            raise ValueError(
+                f"Solution function must have at least 2 sub-elements, "
+                f"but has {num_sub_elements}. Check that u_sol is a mixed function "
+                f"space solution."
+            )
+
+        # Evaluate water depth at stations (always sub(0))
+        h_values = u_sol.sub(0).eval(self.points_on_proc, self.cells).flatten()
 
         # Adjust for free surface elevation if needed
         if solution_var in ["h", "flux"]:
-            h_values -= self.station_bathy
+            h_values = h_values - self.station_bathy
 
-        # Evaluate velocity at stations
-        vel_values = u_sol.sub(1).eval(self.points_on_proc, self.cells)
+        # Handle different function space structures
+        if num_sub_elements == 2:
+            # Mixed space: (scalar, vector) = (h, [u, v])
+            # sub(1) is a vector function with 2 components
+            vel_values = u_sol.sub(1).eval(self.points_on_proc, self.cells)
+            # vel_values has shape (n_stations, 2) or (2*n_stations,)
+            if vel_values.ndim == 1:
+                vel_values = vel_values.reshape(-1, 2)
+            u_values = vel_values[:, 0]
+            v_values = vel_values[:, 1]
+        elif num_sub_elements >= 3:
+            # Mixed space: (scalar, scalar, scalar) = (h, u, v)
+            u_values = u_sol.sub(1).eval(self.points_on_proc, self.cells).flatten()
+            v_values = u_sol.sub(2).eval(self.points_on_proc, self.cells).flatten()
+        else:
+            raise ValueError(
+                f"Unexpected function space structure with {num_sub_elements} sub-elements"
+            )
 
-        # Ensure proper shapes for concatenation
-        # h_values should be (n_stations,) and vel_values should be (n_stations, 2)
-        if h_values.ndim == 1:
-            h_values = h_values.reshape(-1, 1)  # Shape: (n_stations, 1)
-        if vel_values.ndim == 1:
-            # Single station case
-            vel_values = vel_values.reshape(1, -1)  # Shape: (1, 2)
+        # Reshape for concatenation: each should be (n_stations, 1)
+        h_values = h_values.reshape(-1, 1)  # Shape: (n_stations, 1)
+        u_values = u_values.reshape(-1, 1)  # Shape: (n_stations, 1)
+        v_values = v_values.reshape(-1, 1)  # Shape: (n_stations, 1)
 
         # Combine into single array: [h, u, v]
-        result = np.hstack([h_values, vel_values])
+        result = np.hstack([h_values, u_values, v_values])
         return result
 
     def check_dry_nodes(
@@ -179,12 +223,12 @@ class StationManager:
                 - dry_node_indices: Indices of points that are dry
         """
         # Extract water depth values at evaluation points
-        water_height = solution.sub(0).eval(evaluation_points, self.cells)
+        water_height = solution.sub(0).eval(evaluation_points, self.cells).flatten()
 
         # Get bathymetry values
         # If h_b is a Constant, use its value; otherwise evaluate it
         if hasattr(self.h_b, 'eval'):
-            bathy = self.h_b.eval(evaluation_points, self.cells)
+            bathy = self.h_b.eval(evaluation_points, self.cells).flatten()
         else:
             # For Constant objects, use the stored station bathymetry from init_stations
             bathy = self.station_bathy

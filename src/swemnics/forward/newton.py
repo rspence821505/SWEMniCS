@@ -9,6 +9,11 @@ MODIFICATIONS FOR 4D-VAR:
 - Returns final Jacobian matrix for efficient adjoint computation
 - Jacobian is reassembled at converged solution for correctness
 - NewtonSolver.solve() also returns Jacobian when requested
+
+DIAGNOSTICS:
+- Integrated with NewtonDiagnostics for flexible logging/analysis
+- Supports console printing, file logging, and in-memory storage
+- Backward compatible with verbose printing behavior
 """
 
 from dolfinx import fem as fe, nls, log, geometry, io, cpp
@@ -22,6 +27,8 @@ import numpy.linalg as la
 import sys
 import time
 
+from swemnics.utils.newton_diagnostics import NewtonDiagnostics
+
 
 def petsc_to_csr(A):
     indptr, indices, data = A.getValuesCSR()
@@ -31,10 +38,13 @@ def petsc_to_csr(A):
 class CustomNewtonProblem:
     """An all-in-one class that solves a nonlinear problem. . ."""
 
-    def __init__(self, obj1, solver_parameters={}):
+    def __init__(self, obj1, solver_parameters={}, diagnostics=None):
         """initialize the problem
 
-        F -- Ufl form
+        Args:
+            obj1: Problem object with F, u, verbose, problem attributes
+            solver_parameters: Dict of solver configuration parameters
+            diagnostics: Optional NewtonDiagnostics instance for convergence tracking
         """
         self.u = obj1.u
         self.F = obj1.F
@@ -67,6 +77,21 @@ class CustomNewtonProblem:
 
         for k, v in solver_parameters.items():
             setattr(self, k, v)
+
+        # Setup diagnostics for convergence tracking
+        if diagnostics is None:
+            # Default: match current verbose printing behavior
+            self.diagnostics = NewtonDiagnostics(
+                print_to_console=self.verbose,
+                log_file=None,
+                store_history=False,
+                verbose=self.verbose,
+            )
+        else:
+            self.diagnostics = diagnostics
+
+        # Internal counter for tracking solve calls (used as timestep if not externally managed)
+        self._solve_counter = 0
 
         self.A = petsc.create_matrix(self.jacobian)
         self.L = petsc.create_vector(self.residual)
@@ -108,13 +133,15 @@ class CustomNewtonProblem:
         if self.comm.rank == 0:
             print(*msg)
 
-    def solve(self, u, max_it=5, return_jacobian=False):
+    def solve(self, u, max_it=5, return_jacobian=False, timestep=None, time=None):
         """Solve the nonlinear problem at u
 
         Args:
             u: Solution function to update in-place
             max_it: Maximum Newton iterations (default: 5)
             return_jacobian: If True, return final Jacobian for adjoint (default: False)
+            timestep: Optional timestep number for diagnostics tracking
+            time: Optional simulation time for diagnostics tracking
 
         Returns:
             If return_jacobian=False: None (solution stored in u)
@@ -127,6 +154,12 @@ class CustomNewtonProblem:
             evaluated at u_i, then we update u_{i+1} = u_i + dx_i. When we break due
             to convergence, we need J evaluated at u_{i+1}, not u_i.
         """
+
+        # Start diagnostics tracking for this solve
+        if timestep is None:
+            timestep = self._solve_counter
+            self._solve_counter += 1
+        self.diagnostics.start_timestep(timestep, time)
 
         dx = fe.Function(u._V)
         i = 0
@@ -157,8 +190,16 @@ class CustomNewtonProblem:
             L.ghostUpdate(
                 addv=PETSc.InsertMode.INSERT_VALUES, mode=PETSc.ScatterMode.FORWARD
             )
-            if self.verbose:
-                self.log("Residual norm", L.norm(0))
+
+            # Get residual norm for logging
+            residual_norm = L.norm(0)
+
+            # Log iteration 0 (initial residual) on first loop
+            if i == 0:
+                self.diagnostics.log_iteration(
+                    iteration=0,
+                    residual_norm=residual_norm,
+                )
 
             # Solve linear problem
             if self.pc_type == "element_block":
@@ -173,12 +214,13 @@ class CustomNewtonProblem:
                 solver.solve(L, dx.x.petsc_vec)
 
             dx.x.scatter_forward()
-            if self.verbose:
-                self.log(
-                    f"linear solver convergence {solver.getConvergedReason()}"
-                    + f", iterations {solver.getIterationNumber()}, resid norm {solver.getResidualNorm()}"
-                )
-            if solver.getConvergedReason() == -9:
+
+            # Get linear solver diagnostics
+            linear_iterations = solver.getIterationNumber()
+            linear_convergence = solver.getConvergedReason()
+            linear_residual = solver.getResidualNorm()
+
+            if linear_convergence == -9:
                 sys.exit(1)
 
             # Update u_{i+1} = u_i + alpha * dx_i
@@ -188,8 +230,6 @@ class CustomNewtonProblem:
 
             if i == 1:
                 self.dx_0_norm = dx.x.petsc_vec.norm(0)
-                if self.verbose:
-                    self.log("dx_0 norm,", self.dx_0_norm)
 
             # Normalize dx for convergence check (relative to first iteration)
             if self.dx_0_norm > 1e-8:
@@ -198,14 +238,21 @@ class CustomNewtonProblem:
 
             # Compute norm of update
             correction_norm = dx.x.petsc_vec.norm(0)
-            if self.verbose:
-                self.log(f"Newton Iteration {i}: Correction norm {correction_norm}")
+
+            # Log this Newton iteration
+            self.diagnostics.log_iteration(
+                iteration=i,
+                residual_norm=residual_norm,
+                correction_norm=correction_norm,
+                linear_iterations=linear_iterations,
+                linear_convergence=linear_convergence,
+                linear_residual=linear_residual,
+                dx_0_norm=getattr(self, 'dx_0_norm', None),
+            )
 
             # Check convergence
             if correction_norm < self.atol:
                 converged = True
-                if self.verbose:
-                    self.log(f"Newton solver converged in {i} iterations")
                 break
 
             # Optionally reduce relaxation parameter if not converging
@@ -214,6 +261,9 @@ class CustomNewtonProblem:
                     if self.verbose:
                         self.log("Still haven't converged. Reducing relax param")
                     relaxation_parameter /= 2
+
+        # End diagnostics tracking for this timestep
+        self.diagnostics.end_timestep(converged, i)
 
         # Handle Jacobian return for 4D-Var
         if return_jacobian:

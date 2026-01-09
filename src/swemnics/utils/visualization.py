@@ -19,6 +19,13 @@ try:
 except ImportError:
     HAVE_PYVISTA = False
 
+try:
+    import matplotlib.pyplot as plt
+
+    HAVE_MATPLOTLIB = True
+except ImportError:
+    HAVE_MATPLOTLIB = False
+
 
 class SolverVisualizer:
     """Manages visualization output for solver results.
@@ -50,6 +57,9 @@ class SolverVisualizer:
         self.problem = problem
         self.verbose = verbose
 
+        # Get MPI rank for automatic rank checking
+        self.rank = domain.comm.rank
+
         # Writers (initialized by initialize_video)
         self.wse_writer: Optional[io.VTXWriter] = None
         self.h_writer: Optional[io.VTXWriter] = None
@@ -63,6 +73,27 @@ class SolverVisualizer:
         self.bathy_plot: Optional[fe.Function] = None
 
         self.initialized = False
+
+    def _should_plot(self) -> bool:
+        """Return True only on rank 0 for MPI-safe plotting.
+
+        Returns:
+            True if this is rank 0, False otherwise
+        """
+        return self.rank == 0
+
+    def print_saved_files(self, *messages):
+        """Print messages only on rank 0.
+
+        This is a convenience method for printing informational messages
+        about saved files in an MPI-aware way.
+
+        Args:
+            *messages: Messages to print (each message on a new line)
+        """
+        if self._should_plot():
+            for msg in messages:
+                print(msg)
 
     def initialize_video(self, filename: str):
         """Initialize video writers for output.
@@ -225,6 +256,460 @@ class SolverVisualizer:
         plotter.set_focus(bad_point)
         print(f"Focus point: {bad_point}")
         plotter.show()
+
+    def plot_timeseries(
+        self,
+        solver_vals,
+        dt: float,
+        station_idx: int = 0,
+        component: int = 0,
+        component_name: str = "h",
+        title: str = None,
+        xlabel: str = "t (days)",
+        ylabel: str = None,
+        filename: str = None,
+        reference_data: Optional[dict] = None,
+        time_units: str = "days",
+    ):
+        """Plot time series at a station.
+
+        This method is MPI-aware and only creates plots on rank 0.
+
+        Args:
+            solver_vals: Array of shape (nt+1, n_stations, 3) containing h, u, v
+            dt: Time step size in seconds
+            station_idx: Index of station to plot (default: 0)
+            component: Component index (0=h, 1=u, 2=v)
+            component_name: Name of component for legend
+            title: Plot title
+            xlabel: X-axis label
+            ylabel: Y-axis label
+            filename: Output filename (if None, displays interactively)
+            reference_data: Optional dict with 'time' and 'values' arrays for comparison
+            time_units: Units for time axis ('seconds', 'days', 'hours')
+        """
+        # Only plot on rank 0
+        if not self._should_plot():
+            return
+
+        if not HAVE_MATPLOTLIB:
+            raise ValueError("Matplotlib not installed! Cannot create plots.")
+
+        nt = solver_vals.shape[0] - 1
+        t_f = nt * dt
+
+        # Convert time to requested units
+        if time_units == "days":
+            time_array = np.linspace(0, t_f / (60 * 60 * 24), nt + 1)
+        elif time_units == "hours":
+            time_array = np.linspace(0, t_f / (60 * 60), nt + 1)
+        else:  # seconds
+            time_array = np.linspace(0, t_f, nt + 1)
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            time_array,
+            solver_vals[:, station_idx, component],
+            "k-",
+            linewidth=2,
+            label=f"{component_name} (solver)",
+        )
+
+        # Add reference data if provided
+        if reference_data is not None:
+            plt.plot(
+                reference_data["time"],
+                reference_data["values"],
+                "b--",
+                linewidth=2,
+                label=reference_data.get("label", "Reference"),
+            )
+
+        plt.grid(True)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel if ylabel else component_name)
+        if title:
+            plt.title(title)
+        plt.legend()
+
+        if filename:
+            plt.savefig(filename, dpi=150, bbox_inches="tight")
+            plt.close()
+        else:
+            plt.show()
+
+    def plot_spatial_profile(
+        self,
+        solver_vals,
+        x_coords,
+        dt: float,
+        timesteps: list,
+        component: int = 0,
+        component_name: str = "h",
+        title: str = None,
+        xlabel: str = "x (m)",
+        ylabel: str = None,
+        filename: str = None,
+        offset: float = 0.0,
+        analytical_solution_func=None,
+    ):
+        """Plot spatial profile at multiple timesteps.
+
+        This method is MPI-aware and only creates plots on rank 0.
+
+        Args:
+            solver_vals: Array of shape (nt+1, n_stations, 3) containing h, u, v
+            x_coords: X-coordinates of stations
+            dt: Time step size in seconds
+            timesteps: List of timestep indices to plot
+            component: Component index (0=h, 1=u, 2=v)
+            component_name: Name of component for legend
+            title: Plot title
+            xlabel: X-axis label
+            ylabel: Y-axis label
+            filename: Output filename (if None, displays interactively)
+            offset: Offset to add to component values (e.g., for bathymetry)
+            analytical_solution_func: Optional function(x, t) returning (h_analytic, u_analytic)
+        """
+        # Only plot on rank 0
+        if not self._should_plot():
+            return
+
+        if not HAVE_MATPLOTLIB:
+            raise ValueError("Matplotlib not installed! Cannot create plots.")
+
+        plt.figure(figsize=(10, 6))
+
+        for timestep in timesteps:
+            if timestep >= solver_vals.shape[0]:
+                continue
+
+            t = timestep * dt
+
+            # Plot analytical solution first (if available)
+            if analytical_solution_func is not None and timestep != 0:
+                h_analytic, u_analytic = analytical_solution_func(x_coords, t)
+                analytic_values = h_analytic if component == 0 else u_analytic
+                plt.plot(
+                    x_coords,
+                    analytic_values,
+                    "-",
+                    linewidth=1,
+                    label=f"{component_name} exact at {t:.1f}s",
+                )
+
+            # Plot solver results
+            plt.plot(
+                x_coords,
+                solver_vals[timestep, :, component] + offset,
+                "--",
+                linewidth=2,
+                label=f"{component_name} at {t:.1f}s",
+            )
+
+        plt.grid(True)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel if ylabel else component_name)
+        if title:
+            plt.title(title)
+        plt.legend()
+
+        if filename:
+            plt.savefig(filename, dpi=150, bbox_inches="tight")
+            plt.close()
+        else:
+            plt.show()
+
+    def plot_tidal_timeseries(
+        self,
+        solver_vals,
+        dt: float,
+        nt: int,
+        station_idx: int = 0,
+        scheme_name: str = "SUPG",
+        output_dir: str = ".",
+        plot_elevation: bool = True,
+    ):
+        """Plot tidal height, velocities, and elevation time series (tidal.py example).
+
+        This method is MPI-aware and only creates plots on rank 0.
+
+        Args:
+            solver_vals: Array of shape (nt+1, n_stations, 3) containing h, u, v
+            dt: Time step size in seconds
+            nt: Number of timesteps
+            station_idx: Index of station to plot
+            scheme_name: Name of solver scheme for plot title
+            output_dir: Directory for output files
+            plot_elevation: If True, also plot water surface elevation (η = h + bathymetry)
+        """
+        # Only plot on rank 0
+        if not self._should_plot():
+            return
+
+        if not HAVE_MATPLOTLIB:
+            raise ValueError("Matplotlib not installed! Cannot create plots.")
+
+        t_f = nt * dt
+
+        # Plot water height (h)
+        self.plot_timeseries(
+            solver_vals=solver_vals,
+            dt=dt,
+            station_idx=station_idx,
+            component=0,
+            component_name="h",
+            title=f"Tidal Water Depth for {scheme_name} Scheme",
+            xlabel="t (days)",
+            ylabel="Water depth (m)",
+            filename=f"{output_dir}/tidal_height_{scheme_name}.png",
+            time_units="days",
+        )
+
+        # Plot water surface elevation (η = h + bathymetry) if requested
+        if plot_elevation and self.problem is not None:
+            import numpy as np
+
+            # Get bathymetry value at the station
+            # For simple problems with constant bathymetry, evaluate at origin
+            try:
+                if hasattr(self.problem.h_b, 'x'):
+                    # h_b is a Function
+                    bathy_val = float(self.problem.h_b.x.array[0])
+                elif callable(self.problem.h_b):
+                    # h_b is a lambda/function - evaluate at origin
+                    bathy_val = float(self.problem.h_b(np.zeros((1, 3)))[0])
+                else:
+                    # h_b is a constant
+                    bathy_val = float(self.problem.h_b)
+            except:
+                # If we can't determine bathymetry, skip elevation plot
+                bathy_val = None
+
+            if bathy_val is not None:
+                # Create modified solver_vals with elevation instead of depth
+                elevation_vals = solver_vals.copy()
+                elevation_vals[:, :, 0] = solver_vals[:, :, 0] + bathy_val
+
+                self.plot_timeseries(
+                    solver_vals=elevation_vals,
+                    dt=dt,
+                    station_idx=station_idx,
+                    component=0,
+                    component_name="η",
+                    title=f"Tidal Water Surface Elevation for {scheme_name} Scheme",
+                    xlabel="t (days)",
+                    ylabel="Water surface elevation (m)",
+                    filename=f"{output_dir}/tidal_elevation_{scheme_name}.png",
+                    time_units="days",
+                )
+
+        # Plot x-velocity (u)
+        self.plot_timeseries(
+            solver_vals=solver_vals,
+            dt=dt,
+            station_idx=station_idx,
+            component=1,
+            component_name="u",
+            title=f"Tidal X-Velocity for {scheme_name} Scheme",
+            xlabel="t (days)",
+            ylabel="X-velocity (m/s)",
+            filename=f"{output_dir}/tidal_velocity_u_{scheme_name}.png",
+            time_units="days",
+        )
+
+        # Plot y-velocity (v)
+        self.plot_timeseries(
+            solver_vals=solver_vals,
+            dt=dt,
+            station_idx=station_idx,
+            component=2,
+            component_name="v",
+            title=f"Tidal Y-Velocity for {scheme_name} Scheme",
+            xlabel="t (days)",
+            ylabel="Y-velocity (m/s)",
+            filename=f"{output_dir}/tidal_velocity_v_{scheme_name}.png",
+            time_units="days",
+        )
+
+    def plot_dam_break(
+        self,
+        solver_vals,
+        dt: float,
+        nt: int,
+        Lx: float,
+        dam_height: float,
+        timesteps: list,
+        scheme_name: str = "SUPG",
+        output_dir: str = ".",
+        analytical_solution_func=None,
+    ):
+        """Plot dam break surface elevation and velocity profiles (dam_break.py example).
+
+        This method is MPI-aware and only creates plots on rank 0.
+
+        Args:
+            solver_vals: Array of shape (nt+1, n_stations, 3) containing h, u, v
+            dt: Time step size in seconds
+            nt: Number of timesteps
+            Lx: Domain length in x-direction
+            dam_height: Dam height for offset
+            timesteps: List of timestep indices to plot
+            scheme_name: Name of solver scheme for plot title
+            output_dir: Directory for output files
+            analytical_solution_func: Optional function(x, t) returning (h_analytic, u_analytic)
+        """
+        # Only plot on rank 0
+        if not self._should_plot():
+            return
+
+        if not HAVE_MATPLOTLIB:
+            raise ValueError("Matplotlib not installed! Cannot create plots.")
+
+        nx = solver_vals.shape[1]
+        x = np.linspace(0, Lx, nx)
+
+        # Plot surface elevation
+        self.plot_spatial_profile(
+            solver_vals=solver_vals,
+            x_coords=x,
+            dt=dt,
+            timesteps=timesteps,
+            component=0,
+            component_name="h",
+            title=f"Surface Elevation for {scheme_name} Scheme",
+            xlabel="x (m)",
+            ylabel="Surface elevation (m)",
+            filename=f"{output_dir}/dam_height_{scheme_name}_order1_dt.png",
+            offset=dam_height,
+            analytical_solution_func=analytical_solution_func,
+        )
+
+        # Plot x-velocity
+        self.plot_spatial_profile(
+            solver_vals=solver_vals,
+            x_coords=x,
+            dt=dt,
+            timesteps=timesteps,
+            component=1,
+            component_name="$u_x$",
+            title=f"Velocity for {scheme_name} Scheme",
+            xlabel="x (m)",
+            ylabel="Velocity in x direction (m/s)",
+            filename=f"{output_dir}/dam_velocity_{scheme_name}_order1_dt.png",
+            offset=0.0,
+            analytical_solution_func=analytical_solution_func,
+        )
+
+    def plot_inlet_comparison(
+        self,
+        solver_vals,
+        dt: float,
+        nt: int,
+        station_idx: int = 0,
+        adcirc_file: Optional[str] = None,
+        dgswem_file: Optional[str] = None,
+        scheme_name: str = "DG",
+        output_dir: str = ".",
+    ):
+        """Plot idealized inlet results with ADCIRC/DGSWEM comparison (idealized_inlet.py example).
+
+        This method is MPI-aware and only creates plots on rank 0.
+
+        Args:
+            solver_vals: Array of shape (nt+1, n_stations, 3) containing h, u, v
+            dt: Time step size in seconds
+            nt: Number of timesteps
+            station_idx: Index of station to plot
+            adcirc_file: Path to ADCIRC CSV file (columns: time, h, u, v)
+            dgswem_file: Path to DGSWEM CSV file
+            scheme_name: Name of solver scheme for plot title
+            output_dir: Directory for output files
+        """
+        # Only plot on rank 0
+        if not self._should_plot():
+            return
+
+        if not HAVE_MATPLOTLIB:
+            raise ValueError("Matplotlib not installed! Cannot create plots.")
+
+        t_f = nt * dt
+        time_array = np.linspace(0, t_f, nt + 1)
+
+        # Plot height comparison
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            time_array,
+            solver_vals[:nt + 1, station_idx, 0],
+            "k-",
+            linewidth=2,
+            label=f"{scheme_name} solver",
+        )
+
+        if adcirc_file is not None:
+            try:
+                adcirc_dat = np.loadtxt(adcirc_file, delimiter=",", dtype=float)
+                plt.plot(
+                    adcirc_dat[:, 0],
+                    adcirc_dat[:, 1],
+                    "b--",
+                    linewidth=2,
+                    label="ADCIRC",
+                )
+            except FileNotFoundError:
+                if self.verbose:
+                    print(f"Warning: ADCIRC file not found: {adcirc_file}")
+
+        if dgswem_file is not None:
+            try:
+                dgswem_dat = np.loadtxt(dgswem_file, delimiter=",", dtype=float)
+                plt.plot(
+                    dgswem_dat[:, 0],
+                    dgswem_dat[:, 1],
+                    "r--",
+                    linewidth=2,
+                    label="DGSWEM",
+                )
+            except FileNotFoundError:
+                if self.verbose:
+                    print(f"Warning: DGSWEM file not found: {dgswem_file}")
+
+        plt.grid(True)
+        plt.xlabel("t (s)")
+        plt.title("Height for Ideal Inlet Case")
+        plt.legend()
+        plt.savefig(f"{output_dir}/inlet_height_{scheme_name}.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+        # Plot y-velocity comparison
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            time_array,
+            solver_vals[:nt + 1, station_idx, 2],
+            "k-",
+            linewidth=2,
+            label=f"{scheme_name} solver",
+        )
+
+        if adcirc_file is not None:
+            try:
+                adcirc_dat = np.loadtxt(adcirc_file, delimiter=",", dtype=float)
+                plt.plot(
+                    adcirc_dat[:, 0],
+                    adcirc_dat[:, 3],
+                    "b--",
+                    linewidth=2,
+                    label="ADCIRC",
+                )
+            except FileNotFoundError:
+                pass
+
+        plt.grid(True)
+        plt.xlabel("t (s)")
+        plt.title("Velocity in y for Ideal Inlet Case")
+        plt.legend()
+        plt.savefig(f"{output_dir}/inlet_velocity_{scheme_name}.png", dpi=150, bbox_inches="tight")
+        plt.close()
 
     def __repr__(self) -> str:
         status = "initialized" if self.initialized else "not initialized"

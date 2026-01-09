@@ -43,6 +43,10 @@ from .nonblocking_comm import (
     AsyncObservationOperator,
     BatchedCommunication
 )
+from .solver_parameters import (
+    get_default_solver_params,
+    get_solver_params_preset
+)
 
 __all__ = [
     "create_element",
@@ -70,4 +74,6 @@ __all__ = [
     "OverlapComputeComm",
     "AsyncObservationOperator",
     "BatchedCommunication",
+    "get_default_solver_params",
+    "get_solver_params_preset",
 ]

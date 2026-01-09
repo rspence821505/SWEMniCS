@@ -74,51 +74,36 @@ solver.time_loop(
 )
 
 
-if rank == 0:
-    print(f"\n\nSolver DOF: {solver.u.x.array.shape}\n\n")
-    print(f"\n\n Solver vals shape: {solver.vals.shape} \n\n ")
+# Plot results using SolverVisualizer (MPI-aware, no rank check needed)
+from swemnics.utils.visualization import SolverVisualizer
 
+visualizer = SolverVisualizer(
+    domain=solver.domain,
+    V_scalar=solver.V_scalar,
+    V_vel=solver.V_vel,
+    problem=prob,
+    verbose=False,
+)
 
-# 	fout_name = "data/Ideal_inlet_adcirc_openboundary.csv"
-# 	adcirc_dat = np.loadtxt(fout_name,delimiter=",", dtype=float)
+visualizer.print_saved_files(
+    f"\n\nSolver DOF: {solver.u.x.array.shape}\n",
+    f"Solver vals shape: {solver.vals.shape}\n",
+)
 
-# 	fout_DG = "data/DGSWEM_Ideal_inlet_adcirc.csv"
-# 	DG_dat = np.loadtxt(fout_DG,delimiter=",", dtype=float)
-# 	print(np.linspace(0,t_f,nt+1))
-# 	print(solver.vals[:,0,0])
-# 	plt.plot(np.linspace(0,t_f,nt+1), solver.vals[:nt+1,0,0], "k", linewidth=2, label="SUPG solver")
-# 	plt.plot(adcirc_dat[:,0], adcirc_dat[:,1], "b--", linewidth=2, label="ADCIRC")
-# 	plt.plot(DG_dat[:,0], DG_dat[:,1], "r--", linewidth = 2, label="DGSWEM")
-# 	plt.grid(True)
-# 	plt.xlabel("t(s)")
-# 	plt.title('Height for Ideal Inlet Case')
-# 	plt.legend()
-# 	plt.savefig("inlet_height_DG.png")
+visualizer.plot_inlet_comparison(
+    solver_vals=solver.vals,
+    dt=dt,
+    nt=nt,
+    station_idx=0,
+    adcirc_file="data/Ideal_inlet_adcirc_openboundary.csv",
+    dgswem_file="data/DGSWEM_Ideal_inlet_adcirc.csv",
+    scheme_name="DG",
+    output_dir=".",
+)
 
-# 	plt.close()
-
-# 	plt.plot(np.linspace(0,t_f,nt+1), solver.vals[:nt+1,0,2], "k", linewidth=2, label="u at 800 m")
-# 	plt.plot(adcirc_dat[:,0], adcirc_dat[:,3], "b--", linewidth=2, label="ADCIRC")
-# 	#plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")
-# 	plt.grid(True)
-# 	plt.xlabel("t(s)")
-# 	plt.title('Velocity in y for Ideal Inlet Case')
-# 	plt.legend()
-# 	plt.savefig("inlet_velocity_DG.png")
-
-
-# 	plt.close()
-# 	mag=.15
-# 	alpha = 0.00014051891708
-# 	t = np.linspace(0,t_f,nt+1)
-# 	solver.vals[:,1,0]=solver.vals[:,1,0]
-# 	plt.plot(t, solver.vals[:nt+1,1,0], "k", linewidth=2, label="Boundary Condition")
-# 	plt.plot(t, mag*np.cos(t*alpha), "b--",label="reference")
-# 	plt.grid(True)
-# 	plt.xlabel("t(s)")
-# 	plt.legend()
-# 	plt.savefig("inlet_bc.png")
-
+visualizer.print_saved_files(
+    f"\nPlots saved: inlet_height_DG.png, inlet_velocity_DG.png"
+)
 
 # Your statements here
 

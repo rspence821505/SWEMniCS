@@ -24,6 +24,13 @@ from petsc4py import PETSc
 from petsc4py.PETSc import ScalarType
 import numpy as np
 
+try:
+    from tqdm import tqdm
+
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
 from swemnics.forward.newton import CustomNewtonProblem
 from swemnics.utils.timestep_manager import TimeStepDataManager
 from swemnics.utils.observation_stations import StationManager
@@ -63,8 +70,6 @@ class CGImplicit(BaseSolver):
         n = FacetNormal(self.domain)
 
         if self.p_type == "CG":
-            if self.verbose:
-                self.log("Adding CG boundary conditions weakly")
             # loop through boundary conditions
             for condition in boundary_conditions:
                 if condition.type == "Open":
@@ -83,8 +88,6 @@ class CGImplicit(BaseSolver):
         If the Problem doesn't specify a velocity initial condition, it is assumed to be zero.
         """
         if self.problem.solution_var == "h" or self.problem.solution_var == "flux":
-            if self.verbose:
-                self.log("setting initial condition")
             # if the initial condition is specified set this, if not assume level starting condition
             if self.problem.h_init is None:
                 self.u_n.sub(0).interpolate(
@@ -222,17 +225,40 @@ class CGImplicit(BaseSolver):
         self.add_bcs_to_weak_form()
         self.F += inner(self.dQdt, self.p) * dx
 
-    def solve_init(self, solver_parameters={}):
-        """Initialize the Newton solver"""
-        Newton_obj = CustomNewtonProblem(self, solver_parameters=solver_parameters)
+    def solve_init(self, solver_parameters={}, newton_diagnostics_config=None):
+        """Initialize the Newton solver with optional diagnostics configuration.
+
+        Args:
+            solver_parameters: Parameters for the Newton solver
+            newton_diagnostics_config: Optional dict with diagnostics configuration.
+                Keys: 'print_to_console', 'log_file', 'store_history', 'verbose'
+                If None, uses default diagnostics based on self.verbose
+
+        Returns:
+            CustomNewtonProblem instance
+        """
+        from swemnics.utils.newton_diagnostics import NewtonDiagnostics
+
+        # Create diagnostics instance if config provided
+        diagnostics = None
+        if newton_diagnostics_config is not None:
+            diagnostics = NewtonDiagnostics(**newton_diagnostics_config)
+            # Print configuration message (MPI-aware)
+            diagnostics.print_config()
+
+        Newton_obj = CustomNewtonProblem(
+            self, solver_parameters=solver_parameters, diagnostics=diagnostics
+        )
         return Newton_obj
 
-    def solve_timestep(self, solver, store_jacobian=False):
+    def solve_timestep(self, solver, store_jacobian=False, timestep=None, time=None):
         """Solve the nonlinear problem at the current time step.
 
         Args:
         solver: Newton solver (CustomNewtonProblem instance).
         store_jacobian: If True, request Jacobian from Newton solver (for 4D-Var).
+        timestep: Optional timestep number for diagnostics tracking.
+        time: Optional simulation time for diagnostics tracking.
 
         Returns:
         J: Jacobian matrix if store_jacobian=True, else None.
@@ -248,7 +274,9 @@ class CGImplicit(BaseSolver):
         """
         try:
             if store_jacobian:
-                _, J = solver.solve(self.u, return_jacobian=True)
+                _, J = solver.solve(
+                    self.u, return_jacobian=True, timestep=timestep, time=time
+                )
 
                 # Validate Jacobian was successfully extracted
                 if J is None:
@@ -298,7 +326,9 @@ class CGImplicit(BaseSolver):
 
                 return J
             else:
-                solver.solve(self.u, return_jacobian=False)
+                solver.solve(
+                    self.u, return_jacobian=False, timestep=timestep, time=time
+                )
                 return None
 
         except RuntimeError as e:
@@ -469,7 +499,7 @@ class CGImplicit(BaseSolver):
         self,
         solver_parameters,
         stations=[],
-        plot_every=999999,
+        plot_every=1,
         plot_name="debug_tide",
         u_0=None,
         save_state=False,
@@ -479,13 +509,16 @@ class CGImplicit(BaseSolver):
         make_wet=False,
         store_jacobians=False,
         observation_times=None,
+        monitor_progress=False,
+        newton_diagnostics_config=None,
+        enable_video=True,
     ):
         """Time-stepping loop with optional Jacobian storage for 4D-Var.
 
         Args:
             solver_parameters: Parameters passed to the nonlinear solver.
             stations: Monitoring station coordinates.
-            plot_every: Plotting cadence.
+            plot_every: Plotting cadence (only used if enable_video=True).
             plot_name: Base name for visualization output.
             u_0: Optional initial condition override.
             save_state: Save every state (legacy mode).
@@ -495,15 +528,17 @@ class CGImplicit(BaseSolver):
             make_wet: Apply wetting/drying adjustments before saving.
             store_jacobians: Store Jacobians for 4D-Var adjoint computation.
             observation_times: Optional iterable of timestep indices to save.
+            monitor_progress: Use tqdm progress bar instead of logging progress (default: False).
+            newton_diagnostics_config: Optional dict with Newton diagnostics configuration.
+                Keys: 'print_to_console', 'log_file', 'store_history', 'verbose'.
+                Example: {'print_to_console': True, 'log_file': 'newton.log'}
+            enable_video: Enable video/animation output (default: True).
         """
 
         if store_jacobians:
             self.storage.saved_jacobians.clear()
             if self.verbose:
                 self.log("4D-Var mode: Jacobians will be stored during forward solve")
-
-        if self.verbose:
-            self.log("calling time loop")
 
         self.points_on_proc = local_points = self.init_stations(stations)
         self.station_data = np.zeros((self.problem.nt + 1, local_points.shape[0], 3))
@@ -515,17 +550,18 @@ class CGImplicit(BaseSolver):
             self.u_n.x.array[:] = u_0.x.array[:]
             self.u.x.array[:] = self.u_n.x.array[:]
 
-        self.solver = solver = self.solve_init(solver_parameters=solver_parameters)
+        self.solver = solver = self.solve_init(
+            solver_parameters=solver_parameters,
+            newton_diagnostics_config=newton_diagnostics_config,
+        )
 
-        if self.verbose:
-            self.log("plot every", plot_every)
-            self.log("nt", self.problem.nt)
-
-        if plot_every <= self.problem.nt:
-            if self.verbose:
-                self.log("creating video")
+        if enable_video:
             self.initialize_video(plot_name)
             self.plot_frame()
+            if self.verbose:
+                self.log(f"Video output enabled (plot every {plot_every} timesteps)")
+        elif self.verbose:
+            self.log("Video output disabled")
 
         effective_save_state = save_state or (observation_times is not None)
         data_manager = TimeStepDataManager(
@@ -540,20 +576,68 @@ class CGImplicit(BaseSolver):
             verbose=self.verbose,
         )
 
+        # Store data manager config for print_config()
+        if observation_times is not None:
+            self._last_data_manager_config = {
+                'mode': 'observation',
+                'n_observations': len(observation_times)
+            }
+        elif effective_save_state or store_jacobians or adjoint_method:
+            self._last_data_manager_config = {
+                'mode': 'all_timesteps'
+            }
+        else:
+            self._last_data_manager_config = {
+                'mode': 'none'
+            }
+
+        # Record initial state at stations
+        if len(local_points) > 0:
+            recorded_data = self.record_stations(self.u_n, local_points)
+            if recorded_data.shape[0] > 0:
+                self.station_data[0, :, :] = recorded_data
+
         data_manager.save_timestep(timestep=0, local_points=local_points)
+
+        # Initialize progress bar if requested
+        pbar = None
+        if (
+            monitor_progress
+            and TQDM_AVAILABLE
+            and (not self.verbose or self.mpi_rank == 0)
+        ):
+            pbar = tqdm(total=self.problem.nt, desc="Time steps", unit="step")
+        elif monitor_progress and not TQDM_AVAILABLE:
+            if self.verbose and self.mpi_rank == 0:
+                self.log("Warning: tqdm not available, falling back to verbose logging")
 
         # take first 2 steps with implicit Euler
         self.theta1.value = 0
         for a in range(min(2, self.problem.nt)):
-            if self.verbose:
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix({"method": "Euler"})
+            elif self.verbose:
                 self.log("Time Step Number", a, "Out of", self.problem.nt)
                 self.log(a / self.problem.nt * 100, "% Complete")
+
             self.update_solution()
 
             should_get_jacobian = store_jacobians and data_manager.should_save_at(a + 1)
-            J = self.solve_timestep(solver, store_jacobian=should_get_jacobian)
+            J = self.solve_timestep(
+                solver,
+                store_jacobian=should_get_jacobian,
+                timestep=a + 1,
+                time=(a + 1) * self.problem.dt,
+            )
 
-            if a % plot_every == 0 and plot_every <= self.problem.nt:
+            # Record station data after solving
+            if len(local_points) > 0:
+                recorded_data = self.record_stations(self.u, local_points)
+                if recorded_data.shape[0] > 0:
+                    self.station_data[a + 1, :, :] = recorded_data
+
+            if enable_video and a % plot_every == 0:
                 self.plot_frame()
 
             data_manager.save_timestep(
@@ -565,12 +649,27 @@ class CGImplicit(BaseSolver):
         # switch to high order time stepping (BDF2)
         self.theta1.value = self.theta
         for a in range(2, self.problem.nt):
-            if self.verbose:
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix({"method": "BDF2"})
+            elif self.verbose:
                 self.log("Time Step Number", a, "Out of", self.problem.nt)
                 self.log(a / self.problem.nt * 100, "% Complete")
+
             self.update_solution()
             should_get_jacobian = store_jacobians and data_manager.should_save_at(a + 1)
-            J = self.solve_timestep(solver, store_jacobian=should_get_jacobian)
+            J = self.solve_timestep(
+                solver,
+                store_jacobian=should_get_jacobian,
+                timestep=a + 1,
+                time=(a + 1) * self.problem.dt,
+            )
+
+            # Record station data after solving
+            if len(local_points) > 0:
+                recorded_data = self.record_stations(self.u, local_points)
+                if recorded_data.shape[0] > 0:
+                    self.station_data[a + 1, :, :] = recorded_data
 
             data_manager.save_timestep(
                 timestep=a + 1,
@@ -578,23 +677,23 @@ class CGImplicit(BaseSolver):
                 local_points=local_points,
             )
 
-            if a % plot_every == 0:
+            if enable_video and a % plot_every == 0:
                 self.plot_frame()
 
-        if plot_every <= self.problem.nt:
+        # Close progress bar if it was created
+        if pbar is not None:
+            pbar.close()
+
+        if enable_video:
             self.finalize_video()
 
-        inds, vals = None, None
+        # Gather station data from all MPI processes
+        inds, vals = self.gather_station(0, self.points_on_proc, self.station_data)
         self.vals = vals
         self.inds = inds
 
         if self.verbose:
-            summary = data_manager.get_summary()
-            self.log(f"Time loop complete: {summary}")
-            if store_jacobians:
-                self.log(
-                    f"Stored {len(self.storage.saved_jacobians)} Jacobians for 4D-Var"
-                )
+            data_manager.print_summary()
 
         # Optionally evaluate and print L2 error
         if self.problem.check_solution_def is not None:

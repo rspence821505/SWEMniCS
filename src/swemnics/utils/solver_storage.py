@@ -41,13 +41,36 @@ class SolverStateStorage:
         """List of true bathymetry values (before wetting/drying adjustments)"""
 
     def clear(self):
-        """Clear all stored data to free memory."""
+        """Clear all stored data to free memory.
+
+        For PETSc matrices (Jacobians and adjoints), this properly destroys
+        them before clearing the list to avoid memory leaks.
+        """
+        # Clear numpy arrays - no special handling needed
         self.saved_states.clear()
-        self.saved_jacobians.clear()
-        self.saved_adjoints.clear()
         self.dry_nodes.clear()
         self.saved_bathy.clear()
         self.saved_true_bathy.clear()
+
+        # Destroy PETSc matrices before clearing
+        # Use defensive programming to avoid crashes
+        for J in self.saved_jacobians:
+            try:
+                if hasattr(J, 'destroy') and callable(J.destroy):
+                    J.destroy()
+            except:
+                # Ignore errors - matrix may already be destroyed
+                pass
+        self.saved_jacobians.clear()
+
+        for A in self.saved_adjoints:
+            try:
+                if hasattr(A, 'destroy') and callable(A.destroy):
+                    A.destroy()
+            except:
+                # Ignore errors - matrix may already be destroyed
+                pass
+        self.saved_adjoints.clear()
 
     def save_state(self, state: np.ndarray):
         """Save a state vector.
@@ -101,27 +124,29 @@ class SolverStateStorage:
         """Retrieve a saved state by index.
 
         Args:
-            index: Index of the state to retrieve
+            index: Index of the state to retrieve (supports negative indexing)
 
         Returns:
             State vector or None if index out of bounds
         """
-        if 0 <= index < len(self.saved_states):
+        try:
             return self.saved_states[index]
-        return None
+        except IndexError:
+            return None
 
     def get_jacobian(self, index: int) -> Optional[PETSc.Mat]:
         """Retrieve a saved Jacobian by index.
 
         Args:
-            index: Index of the Jacobian to retrieve
+            index: Index of the Jacobian to retrieve (supports negative indexing)
 
         Returns:
             Jacobian matrix or None if index out of bounds
         """
-        if 0 <= index < len(self.saved_jacobians):
+        try:
             return self.saved_jacobians[index]
-        return None
+        except IndexError:
+            return None
 
     def num_states(self) -> int:
         """Get number of saved states."""
