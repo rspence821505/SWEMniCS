@@ -290,6 +290,37 @@ class DiagonalCovariance(CovarianceMatrix):
         sqrt_diag.destroy()
         return out
 
+    def apply_sqrt_inverse(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """Apply inverse square root: out = C^(-1/2)·v = diag(1/σ₁, 1/σ₂, ...)·v.
+
+        For diagonal covariance C = diag(σ₁², σ₂², ..., σₙ²),
+        C^(-1/2) = diag(1/σ₁, 1/σ₂, ..., 1/σₙ).
+
+        Parameters
+        ----------
+        v : PETSc.Vec
+            Input vector
+        out : PETSc.Vec, optional
+            Output vector (created if None)
+
+        Returns
+        -------
+        PETSc.Vec
+            Result of C^(-1/2)·v
+        """
+        if out is None:
+            out = self.create_vec()
+
+        # Compute 1/sqrt(diagonal)
+        inv_sqrt_diag = self.diagonal.duplicate()
+        self.diagonal.copy(inv_sqrt_diag)
+        inv_sqrt_diag.sqrtabs()  # Element-wise sqrt
+        inv_sqrt_diag.reciprocal()  # Element-wise 1/x
+
+        out.pointwiseMult(inv_sqrt_diag, v)
+        inv_sqrt_diag.destroy()
+        return out
+
     def inner_product_inv(self, u: PETSc.Vec, v: PETSc.Vec) -> float:
         """Optimized ⟨u, C⁻¹·v⟩ for diagonal case."""
         # ⟨u, diag(1/σ²)·v⟩ = Σᵢ uᵢ·vᵢ/σᵢ²
@@ -298,6 +329,34 @@ class DiagonalCovariance(CovarianceMatrix):
         result = u.dot(temp)
         temp.destroy()
         return result
+
+    def min_eigenvalue(self) -> float:
+        """Return minimum eigenvalue (minimum diagonal entry).
+
+        For a diagonal matrix, eigenvalues are the diagonal entries.
+
+        Returns
+        -------
+        float
+            Minimum eigenvalue across all MPI ranks.
+        """
+        local_min = self.diagonal.min()[1]  # [0] is location, [1] is value
+        global_min = self.comm.allreduce(local_min, op=MPI.MIN)
+        return global_min
+
+    def max_eigenvalue(self) -> float:
+        """Return maximum eigenvalue (maximum diagonal entry).
+
+        For a diagonal matrix, eigenvalues are the diagonal entries.
+
+        Returns
+        -------
+        float
+            Maximum eigenvalue across all MPI ranks.
+        """
+        local_max = self.diagonal.max()[1]  # [0] is location, [1] is value
+        global_max = self.comm.allreduce(local_max, op=MPI.MAX)
+        return global_max
 
     def __del__(self):
         """Clean up PETSc resources."""
@@ -607,7 +666,9 @@ class FullCovariance(CovarianceMatrix):
             matrix: Covariance matrix (must be SPD)
             comm: MPI communicator
         """
-        super().__init__(matrix.size[0], comm)
+        if comm is None:
+            comm = matrix.getComm()
+        super().__init__(comm, matrix.size[0])
         self.matrix = matrix
 
         # KSP solver for inverse operations
@@ -649,7 +710,9 @@ class ImplicitCovariance(CovarianceMatrix):
             size: Dimension
             comm: MPI communicator
         """
-        super().__init__(size, comm)
+        if comm is None:
+            comm = MPI.COMM_WORLD
+        super().__init__(comm, size)
         self._operator = operator
         self._inverse_operator = inverse_operator
 
@@ -794,11 +857,23 @@ class MaternCovariance(ImplicitCovariance):
 
         return result
 
-    def apply_sqrt(self, v: PETSc.Vec) -> PETSc.Vec:
+    def sqrt_apply(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
         """
         Sample from Matérn field: u = sqrt(C)·ξ where ξ ~ N(0,I).
 
         Solves (κ²M + K)u = M^{1/2}·ξ
+
+        Parameters
+        ----------
+        v : PETSc.Vec
+            Input vector (typically standard normal)
+        out : PETSc.Vec, optional
+            Output vector (created if None)
+
+        Returns
+        -------
+        PETSc.Vec
+            Result of C^{1/2}·v
         """
         # For Matérn covariance: C = (κ²M + K)⁻¹
         # We need C^{1/2}·v
@@ -817,8 +892,9 @@ class MaternCovariance(ImplicitCovariance):
         b.pointwiseMult(mass_sqrt, v)
 
         # Solve (κ²M + K)·u = b
-        u = v.duplicate()
-        self.ksp_cov.solve(b, u)
+        if out is None:
+            out = v.duplicate()
+        self.ksp_cov.solve(b, out)
 
         if self.ksp_cov.getConvergedReason() < 0:
             raise RuntimeError(
@@ -830,7 +906,7 @@ class MaternCovariance(ImplicitCovariance):
         mass_sqrt.destroy()
         b.destroy()
 
-        return u
+        return out
 
 
 class BlockDiagonalCovariance(CovarianceMatrix):
@@ -851,8 +927,10 @@ class BlockDiagonalCovariance(CovarianceMatrix):
             blocks: List of covariance matrices for each block
             comm: MPI communicator
         """
+        if comm is None:
+            comm = blocks[0].comm if blocks else MPI.COMM_WORLD
         total_size = sum(block.size for block in blocks)
-        super().__init__(total_size, comm)
+        super().__init__(comm, total_size)
         self.blocks = blocks
 
         # Block offsets
@@ -865,8 +943,8 @@ class BlockDiagonalCovariance(CovarianceMatrix):
         if out is None:
             out = self.create_vec()
 
-        # Get arrays for input and output
-        v_array = v.getArray()
+        # Get arrays for input and output (read-only for v, writable for out)
+        v_array = v.getArray(readonly=True)
         out_array = out.getArray()
 
         # Apply each block covariance to its corresponding sub-vector
@@ -876,21 +954,22 @@ class BlockDiagonalCovariance(CovarianceMatrix):
 
             # Extract sub-vector for this block
             v_sub = block.create_vec()
-            v_sub.setArray(v_array[start:end])
+            v_sub_array = v_sub.getArray()
+            v_sub_array[:] = v_array[start:end]
+            v_sub.assemble()
 
             # Apply block covariance
             out_sub = block.apply(v_sub)
 
             # Copy result back to output
-            out_array[start:end] = out_sub.getArray()
+            out_sub_array = out_sub.getArray(readonly=True)
+            out_array[start:end] = out_sub_array
 
             # Clean up
             v_sub.destroy()
             out_sub.destroy()
 
-        # Restore arrays
-        v.restoreArray(v_array)
-        out.restoreArray(out_array)
+        # Assemble output (no need to restore arrays in petsc4py)
         out.assemble()
 
         return out
@@ -900,8 +979,8 @@ class BlockDiagonalCovariance(CovarianceMatrix):
         if out is None:
             out = self.create_vec()
 
-        # Get arrays for input and output
-        v_array = v.getArray()
+        # Get arrays for input and output (read-only for v, writable for out)
+        v_array = v.getArray(readonly=True)
         out_array = out.getArray()
 
         # Apply inverse of each block covariance to its corresponding sub-vector
@@ -911,24 +990,189 @@ class BlockDiagonalCovariance(CovarianceMatrix):
 
             # Extract sub-vector for this block
             v_sub = block.create_vec()
-            v_sub.setArray(v_array[start:end])
+            v_sub_array = v_sub.getArray()
+            v_sub_array[:] = v_array[start:end]
+            v_sub.assemble()
 
             # Apply block inverse covariance
             out_sub = block.apply_inverse(v_sub)
 
             # Copy result back to output
-            out_array[start:end] = out_sub.getArray()
+            out_sub_array = out_sub.getArray(readonly=True)
+            out_array[start:end] = out_sub_array
 
             # Clean up
             v_sub.destroy()
             out_sub.destroy()
 
-        # Restore arrays
-        v.restoreArray(v_array)
-        out.restoreArray(out_array)
+        # Assemble output (no need to restore arrays in petsc4py)
         out.assemble()
 
         return out
+
+
+class EnsembleCovariance(CovarianceMatrix):
+    """
+    Covariance matrix represented by ensemble of samples.
+
+    C = (1/(N-1)) Σᵢ (xᵢ - x̄)(xᵢ - x̄)^T
+
+    This is an efficient representation for covariance when you have
+    ensemble samples but don't want to store the full dense matrix.
+
+    Attributes
+    ----------
+    samples : List[PETSc.Vec]
+        Ensemble members.
+    mean : PETSc.Vec
+        Ensemble mean.
+    anomalies : List[PETSc.Vec]
+        Centered ensemble (xᵢ - x̄).
+    """
+
+    def __init__(self, samples: List[PETSc.Vec], comm: MPI.Comm = None):
+        """
+        Initialize from ensemble samples.
+
+        Parameters
+        ----------
+        samples : List[PETSc.Vec]
+            Ensemble members.
+        comm : MPI.Comm, optional
+            MPI communicator (inferred from samples if not provided).
+        """
+        if not samples:
+            raise ValueError("Cannot create EnsembleCovariance with empty samples")
+
+        size = samples[0].getSize()
+        if comm is None:
+            comm = samples[0].getComm()
+
+        super().__init__(comm, size)
+
+        self.samples = samples
+        self.n_samples = len(samples)
+
+        # Compute ensemble mean
+        self.mean = samples[0].duplicate()
+        self.mean.zeroEntries()
+        for s in samples:
+            self.mean.axpy(1.0, s)
+        self.mean.scale(1.0 / self.n_samples)
+
+        # Compute anomalies
+        self.anomalies = []
+        for s in samples:
+            a = s.duplicate()
+            s.copy(a)
+            a.axpy(-1.0, self.mean)
+            self.anomalies.append(a)
+
+    def apply(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """
+        Apply covariance: C·v = (1/(N-1)) Σᵢ aᵢ(aᵢ^T·v).
+
+        Parameters
+        ----------
+        v : PETSc.Vec
+            Input vector.
+        out : PETSc.Vec, optional
+            Output vector (created if None).
+
+        Returns
+        -------
+        PETSc.Vec
+            C·v.
+        """
+        if out is None:
+            out = self.create_vec()
+
+        out.zeroEntries()
+
+        for a in self.anomalies:
+            coeff = a.dot(v)
+            out.axpy(coeff, a)
+
+        out.scale(1.0 / (self.n_samples - 1))
+        return out
+
+    def apply_inverse(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """
+        Apply inverse covariance using pseudo-inverse.
+
+        Uses regularized inverse: (C + εI)^{-1}.
+
+        Parameters
+        ----------
+        v : PETSc.Vec
+            Input vector.
+        out : PETSc.Vec, optional
+            Output vector (created if None).
+
+        Returns
+        -------
+        PETSc.Vec
+            C^{-1}·v (regularized).
+        """
+        if out is None:
+            out = self.create_vec()
+
+        # For ensemble covariance, use iterative solver or pseudo-inverse
+        # Here we use a simple regularized approach
+
+        epsilon = 1e-6  # Regularization
+
+        # Build the system matrix in ensemble space
+        n = self.n_samples
+        A = np.zeros((n, n))
+
+        for i, ai in enumerate(self.anomalies):
+            for j, aj in enumerate(self.anomalies):
+                A[i, j] = ai.dot(aj) / (n - 1)
+
+        # Regularize
+        A += epsilon * np.eye(n)
+
+        # Project v onto anomaly space
+        b = np.array([a.dot(v) for a in self.anomalies])
+
+        # Solve
+        try:
+            c = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            c = np.linalg.lstsq(A, b, rcond=None)[0]
+
+        # Reconstruct
+        out.zeroEntries()
+        for i, a in enumerate(self.anomalies):
+            out.axpy(c[i] / (n - 1), a)
+
+        return out
+
+    def min_eigenvalue(self) -> float:
+        """Estimate minimum eigenvalue."""
+        n = self.n_samples
+
+        # Build covariance in ensemble space
+        A = np.zeros((n, n))
+        for i, ai in enumerate(self.anomalies):
+            for j, aj in enumerate(self.anomalies):
+                A[i, j] = ai.dot(aj) / (n - 1)
+
+        eigvals = np.linalg.eigvalsh(A)
+        return max(eigvals.min(), 1e-12)
+
+    def max_eigenvalue(self) -> float:
+        """Estimate maximum eigenvalue."""
+        n = self.n_samples
+
+        A = np.zeros((n, n))
+        for i, ai in enumerate(self.anomalies):
+            for j, aj in enumerate(self.anomalies):
+                A[i, j] = ai.dot(aj) / (n - 1)
+
+        eigvals = np.linalg.eigvalsh(A)
+        return eigvals.max()
 
 
 # Utility functions for constructing common covariance types

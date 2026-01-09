@@ -101,6 +101,7 @@ from .covariance import (
     DiagonalCovariance,
     DenseCovariance,
     ImplicitCovariance,
+    EnsembleCovariance,
     create_observation_covariance,
     create_background_covariance_from_ensemble,
     check_covariance_symmetry,
@@ -126,7 +127,6 @@ from .qoi_maps import (
     WeightedMeanErrorQoI,
     LinearizedWMEQoI,
     QoICovarianceEstimator,
-    EnsembleCovariance,
 )
 
 # Import observation operators (when available)
