@@ -78,12 +78,22 @@ class GriddedForcing:
             t_ind = len(self.time) - 1
         t_pos = (t - self.time[last_ind]) / (time_resolution)
 
+        # Linear temporal interpolation: windx(t) = α·windx[i₀] + (1-α)·windx[i₁]
+        # where α = (t - t[i₀])/(t[i₁] - t[i₀]) is the normalized time position
         windx = t_pos * self._windx[last_ind] + (1 - t_pos) * self._windx[t_ind]
+
+        # Linear temporal interpolation: windy(t) = α·windy[i₀] + (1-α)·windy[i₁]
+        # where α = (t - t[i₀])/(t[i₁] - t[i₀]) is the normalized time position
         windy = t_pos * self._windy[last_ind] + (1 - t_pos) * self._windy[t_ind]
+
+        # Linear temporal interpolation: pressure(t) = α·pressure[i₀] + (1-α)·pressure[i₁]
+        # where α = (t - t[i₀])/(t[i₁] - t[i₀]) is the normalized time position
         pressure = (
             t_pos * self._pressure[last_ind] + (1 - t_pos) * self._pressure[t_ind]
         )
 
+        # Bilinear spatial interpolation: windx(x,y) = Σᵢⱼ wᵢⱼ·windx[i,j]
+        # where wᵢⱼ are the bilinear weights based on lon_pos and lat_pos
         self.windx.x.array[:] = (
             self.lon_pos
             * self.lat_pos
@@ -99,6 +109,8 @@ class GriddedForcing:
             * windx[self.lat_inds, self.lon_inds]
         )
 
+        # Bilinear spatial interpolation: windy(x,y) = Σᵢⱼ wᵢⱼ·windy[i,j]
+        # where wᵢⱼ are the bilinear weights based on lon_pos and lat_pos
         self.windy.x.array[:] = (
             self.lon_pos
             * self.lat_pos
@@ -114,7 +126,9 @@ class GriddedForcing:
             * windy[self.lat_inds, self.lon_inds]
         )
 
-        # convert from mBar to pascals
+        # Bilinear spatial interpolation: pressure(x,y) = Σᵢⱼ wᵢⱼ·pressure[i,j]
+        # where wᵢⱼ are the bilinear weights based on lon_pos and lat_pos
+        # Convert from mBar to pascals (multiply by 100)
         self.pressure.x.array[:] = 100 * (
             self.lon_pos
             * self.lat_pos

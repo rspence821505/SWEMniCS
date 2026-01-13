@@ -60,7 +60,9 @@ MANIFEST
 *.pkl
 *.h5
 *hdf5
+*.pdf
 
 refactoring_docs/
 examples/data/
 notebooks/
+paper/
