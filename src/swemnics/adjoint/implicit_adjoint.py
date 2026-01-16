@@ -193,8 +193,10 @@ class ImplicitAdjointSolver:
         if observation_forcings[-1] is not None:
             lambda_next.axpy(1.0, observation_forcings[-1])
 
-        # Backward sweep: n = N-1, N-2, ..., 0
-        for n in range(self.num_steps - 1, -1, -1):
+        # Backward sweep: n = N-1, N-2, ..., 1
+        # Note: We stop at n=1, not n=0, because n=0 (initial condition)
+        # requires special handling - gradient comes from time-coupling only
+        for n in range(self.num_steps - 1, 0, -1):
             # Assemble forcing from observations and time coupling
             forcing = self._assemble_adjoint_forcing(
                 n, lambda_next, lambda_next_next, observation_forcings[n]
@@ -208,23 +210,29 @@ class ImplicitAdjointSolver:
             lambda_next = lambda_n
 
             # Clean up intermediate vectors (except final result)
-            if n > 0:
+            if n > 1:
                 forcing.destroy()
 
-        return lambda_next
+        # Special handling for n=0 (initial condition)
+        # The gradient w.r.t. initial condition comes from time-coupling only
+        gradient_u0 = self._compute_initial_gradient(
+            lambda_next, lambda_next_next, observation_forcings[0]
+        )
+
+        return gradient_u0
 
     def _solve_transpose_system(self, n: int, forcing: PETSc.Vec) -> PETSc.Vec:
         """
         Solve J^T·λ = rhs using the DISTRIBUTED Jacobian.
 
-        The Jacobian J = ∂R/∂u^{n+1} from forward Newton solve
+        The Jacobian J = ∂R^n/∂u^n from forward Newton solve
         is reused by transposing it. This is the key computational
         savings of the implicit adjoint approach.
 
         Parameters
         ----------
         n : int
-            Time index.
+            Time index (must be >= 1, as n=0 is handled separately).
         forcing : PETSc.Vec
             Right-hand side vector.
 
@@ -239,8 +247,19 @@ class ImplicitAdjointSolver:
         - Tolerances set to 1e-10 (rtol) and 1e-12 (atol)
         - The transpose solve is handled automatically by PETSc
         - All operations maintain distributed parallelism
+        - Jacobian indexing: jacobians[k] stores ∂R^(k+1)/∂u^(k+1),
+          so for λ^n we need jacobians[n-1] to get ∂R^n/∂u^n
         """
-        J = self.jacobians[n]
+        if n == 0:
+            raise RuntimeError(
+                "Cannot solve transpose system for n=0. "
+                "Initial condition gradient should be computed via time-coupling."
+            )
+
+        # CRITICAL FIX: jacobians[k] stores Jacobian from timestep k+1
+        # To solve for λ^n, we need J_n = ∂R^n/∂u^n
+        # This is stored in jacobians[n-1]
+        J = self.jacobians[n - 1]
 
         # Create KSP solver on the Jacobian's communicator
         ksp = PETSc.KSP().create(J.getComm())
@@ -268,6 +287,57 @@ class ImplicitAdjointSolver:
         ksp.destroy()
 
         return lambda_n
+
+    def _compute_initial_gradient(
+        self,
+        lambda_1: PETSc.Vec,
+        lambda_2: Optional[PETSc.Vec],
+        obs_forcing: Optional[PETSc.Vec],
+    ) -> PETSc.Vec:
+        """
+        Compute gradient w.r.t. initial condition u^0.
+
+        For the initial condition, there is no residual R^0 to linearize.
+        The gradient comes purely from time-coupling terms:
+
+            ∂L/∂u^0 = obs_forcing + (4/(2Δt))·M·λ^1 - (1/(2Δt))·M·λ^2
+
+        Parameters
+        ----------
+        lambda_1 : PETSc.Vec
+            Adjoint variable at time 1.
+        lambda_2 : Optional[PETSc.Vec]
+            Adjoint variable at time 2 (None for Backward Euler).
+        obs_forcing : Optional[PETSc.Vec]
+            Observation forcing at time 0 (if any).
+
+        Returns
+        -------
+        PETSc.Vec
+            Gradient ∂L/∂u^0.
+        """
+        # Get time-coupling coefficients for initial condition
+        # For BDF2: c_1 = 4/(2Δt), c_2 = -1/(2Δt)
+        c_1, c_2 = self.time_coeffs.get_adjoint_coeffs(0)
+        M = self._get_mass_matrix()
+
+        # Compute c_1·M·λ^1
+        result = lambda_1.duplicate()
+        M.mult(lambda_1, result)
+        result.scale(c_1)
+
+        # Add c_2·M·λ^2 (if BDF2 and λ^2 exists)
+        if lambda_2 is not None and abs(c_2) > 1e-14:
+            temp = lambda_1.duplicate()
+            M.mult(lambda_2, temp)
+            result.axpy(c_2, temp)
+            temp.destroy()
+
+        # Add observation forcing (if present)
+        if obs_forcing is not None:
+            result.axpy(1.0, obs_forcing)
+
+        return result
 
     def _assemble_adjoint_forcing(
         self,

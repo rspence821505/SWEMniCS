@@ -150,7 +150,13 @@ class AdjointModel:
         """
         # Simple backward Euler: solve J^T λⁿ = λⁿ⁺¹
         # Get Jacobian at step n
-        J_n = self.jacobians[n]
+        # Note: jacobians[k] stores Jacobian from timestep k+1
+        # So for λⁿ we need jacobians[n-1]
+        if n == 0:
+            # For initial condition, should not solve transpose system
+            # Return lambda_next directly (no Jacobian at t=0)
+            return lambda_next.copy()
+        J_n = self.jacobians[n - 1]
 
         # Create vector for result
         lambda_n = self.forward_model.create_vec()

@@ -510,7 +510,7 @@ class BDF2TimeCoefficients:
         tuple of float
             (c_{n+1}, c_n, c_{n-1})
         """
-        dt = self.dt if isinstance(self.dt, float) else self.dt[step]
+        dt = self.dt if isinstance(self.dt, (float, int)) else self.dt[step]
 
         if self.use_bdf2:
             return (3.0 / (2.0 * dt), -4.0 / (2.0 * dt), 1.0 / (2.0 * dt))
@@ -537,7 +537,7 @@ class BDF2TimeCoefficients:
         tuple of float
             (c_{n+1}, c_{n+2})
         """
-        dt = self.dt if isinstance(self.dt, float) else self.dt[step]
+        dt = self.dt if isinstance(self.dt, (float, int)) else self.dt[step]
 
         if self.use_bdf2:
             return (4.0 / (2.0 * dt), -1.0 / (2.0 * dt))
@@ -564,7 +564,7 @@ class BDF2TimeCoefficients:
         float
             Coefficient multiplying mass matrix in Jacobian.
         """
-        dt = self.dt if isinstance(self.dt, float) else self.dt[step]
+        dt = self.dt if isinstance(self.dt, (float, int)) else self.dt[step]
 
         if self.use_bdf2:
             return 3.0 / (2.0 * dt)
