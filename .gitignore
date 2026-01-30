@@ -1,75 +1,223 @@
-# Temporary and binary files
-*~
+# =============================================================================
+# SWE4DVar .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
 *.py[cod]
+*$py.class
+
+# C extensions
 *.so
-*.cfg
-!.isort.cfg
-!setup.cfg
-*.orig
-*.log
-*.pot
-__pycache__/*
-.cache/*
-.*.swp
-*/.ipynb_checkpoints/*
-.DS_Store
 
-# Project files
-.ropeproject
-.project
-.pydevproject
-.settings
-.idea
-.vscode
-tags
-
-# Package files
-*.egg
-*.eggs/
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
 .installed.cfg
-*.egg-info
-
-# Unittest and coverage
-htmlcov/*
-.coverage
-.coverage.*
-.tox
-junit*.xml
-coverage.xml
-.pytest_cache/
-
-# Build and docs folder/files
-build/*
-dist/*
-sdist/*
-docs/api/*
-docs/_rst/*
-docs/_build/*
-cover/*
+*.egg
 MANIFEST
 
-# Per-project virtualenvs
-.venv*/
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+junit*.xml
+
+# Translations
+*.mo
+*.pot
+
+# -----------------------------------------------------------------------------
+# IDE / Editors
+# -----------------------------------------------------------------------------
+# VS Code
+.vscode/
+
+# PyCharm / IntelliJ
+.idea/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Eclipse
+.project
+.pydevproject
+.settings/
+
+# Vim
+*.swp
+*.swo
+*~
+tags
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+
+# Rope
+.ropeproject/
+
+# -----------------------------------------------------------------------------
+# OS-specific
+# -----------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+# -----------------------------------------------------------------------------
+# Environments
+# -----------------------------------------------------------------------------
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.conda/
 .conda*/
 
+# -----------------------------------------------------------------------------
+# Project-specific
+# -----------------------------------------------------------------------------
+# Configuration files (keep setup.cfg and .isort.cfg)
+*.cfg
+!setup.cfg
+!.isort.cfg
 
+# Log files
+*.log
+
+# Data files (typically large)
 *.bp
-*.png
 *.csv
- 
 *.pkl
+*.pickle
 *.h5
-*hdf5
+*.hdf5
+*.nc
+*.xdmf
+*.vtk
+*.vtu
+*.pvd
+
+# Image files (generated)
+*.png
+*.jpg
+*.jpeg
+*.gif
 *.pdf
+*.svg
 
-refactoring_docs/
-examples/data/
-notebooks/
-paper/
+# Backup files
+*.orig
+*.bak
 
+# Jupyter notebooks (keep in notebooks/, but ignore checkpoints)
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Mesh files (can be large)
+*.msh
+*.14
+*.grd
+
+# -----------------------------------------------------------------------------
 # Output directories (keep structure via .gitkeep)
+# -----------------------------------------------------------------------------
 outputs/logs/*
 outputs/figures/*
 outputs/checkpoints/*
 outputs/data/*
 !outputs/**/.gitkeep
+
+# -----------------------------------------------------------------------------
+# Documentation build
+# -----------------------------------------------------------------------------
+docs/api/
+docs/_rst/
+docs/_build/
+site/
+
+# Sphinx
+docs/_autosummary/
+
+# -----------------------------------------------------------------------------
+# Directories to exclude from version control
+# -----------------------------------------------------------------------------
+# These contain generated or external data
+refactoring_docs/
+examples/data/
+
+# Paper directory (LaTeX outputs)
+paper/
+!paper/.gitkeep
+
+# Notebooks (development only)
+notebooks/
+!notebooks/.gitkeep
+
+# -----------------------------------------------------------------------------
+# MPI / HPC
+# -----------------------------------------------------------------------------
+*.out
+*.err
+slurm-*.out
+*.hostfile
+core.*
+
+# PETSc
+petsc_options.yaml
+
+# ADIOS2
+*.sst
+*.bp/
