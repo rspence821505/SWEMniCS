@@ -30,13 +30,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from swemnics.forward.variational_forms import (
+from swe4dvar.forward.variational_forms import (
     VariationalForm,
     SWEVariationalForm,
     LinearizedVariationalForm,
     BDF2TimeCoefficients,
 )
-from swemnics.utils.fem_utilities import create_mixed_element
+from swe4dvar.utils.fem_utilities import create_mixed_element
 
 
 # ============================================================================

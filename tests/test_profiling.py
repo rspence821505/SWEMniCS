@@ -10,7 +10,7 @@ import numpy as np
 import time
 from mpi4py import MPI
 
-from swemnics.utils.profiling import (
+from swe4dvar.utils.profiling import (
     HierarchicalTimer,
     MemoryProfiler,
     ScalabilityAnalyzer,

@@ -10,8 +10,8 @@ Run with: pytest test_time_loop_refactored.py -v
 
 import pytest
 import numpy as np
-from swemnics.forward.solvers import CGImplicit, DGImplicit
-from swemnics.forward.problems import TidalProblem, WellBalancedProblem
+from swe4dvar.forward.solvers import CGImplicit, DGImplicit
+from swe4dvar.forward.problems import TidalProblem, WellBalancedProblem
 
 
 class TestTimeLoopBackwardCompatibility:

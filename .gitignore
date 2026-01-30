@@ -66,3 +66,10 @@ refactoring_docs/
 examples/data/
 notebooks/
 paper/
+
+# Output directories (keep structure via .gitkeep)
+outputs/logs/*
+outputs/figures/*
+outputs/checkpoints/*
+outputs/data/*
+!outputs/**/.gitkeep

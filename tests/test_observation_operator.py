@@ -27,7 +27,7 @@ import ufl
 
 # Import from the module we're testing
 try:
-    from swemnics.data_assimilation.observation_operator import (
+    from swe4dvar.data_assimilation.observation_operator import (
         PointObservationOperator,
         is_discontinuous_space,
     )
@@ -37,7 +37,7 @@ except ImportError:
     import os
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-    from swemnics.data_assimilation.observation_operator import (
+    from swe4dvar.data_assimilation.observation_operator import (
         PointObservationOperator,
         is_discontinuous_space,
     )
@@ -469,11 +469,11 @@ class TestCGvsDGComparison:
 
 
 class TestMixedDGCGSpace:
-    """Tests for mixed DG-CG spaces (like SWEMniCS)."""
+    """Tests for mixed DG-CG spaces (like SWE4DVar)."""
 
     def test_mixed_space_subspace_extraction(self, simple_mesh_2d, comm):
         """Test observation on subspaces of mixed DG-CG formulation."""
-        # Create mixed space like SWEMniCS: (H_dg, u_cg, v_cg)
+        # Create mixed space like SWE4DVar: (H_dg, u_cg, v_cg)
         from dolfinx.fem import functionspace
 
         # H: DG scalar

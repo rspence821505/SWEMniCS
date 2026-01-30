@@ -195,7 +195,7 @@ def setup_qoi(mock_forward_model, mock_obs_operator, mock_covariance):
 
 def test_standard_qoi_creation(setup_qoi):
     """Test StandardQoI instantiation."""
-    from swemnics.data_assimilation.qoi_maps import StandardQoI
+    from swe4dvar.data_assimilation.qoi_maps import StandardQoI
 
     qoi = StandardQoI(setup_qoi["forward_model"], setup_qoi["obs_op"])
     assert qoi is not None
@@ -206,7 +206,7 @@ def test_standard_qoi_creation(setup_qoi):
 
 def test_adjoint_consistency_standard_qoi(setup_qoi):
     """Test adjoint consistency: <DQ·δm, δq> = <δm, DQ^T·δq>."""
-    from swemnics.data_assimilation.qoi_maps import StandardQoI
+    from swe4dvar.data_assimilation.qoi_maps import StandardQoI
 
     qoi = StandardQoI(setup_qoi["forward_model"], setup_qoi["obs_op"])
     lin_qoi = qoi.linearize(setup_qoi["m"], time_index=setup_qoi["time_index"])
@@ -246,7 +246,7 @@ def test_adjoint_consistency_standard_qoi(setup_qoi):
 @requires_mpi
 def test_mpi_determinism(setup_qoi):
     """Test that results are deterministic across ranks."""
-    from swemnics.data_assimilation.qoi_maps import StandardQoI
+    from swe4dvar.data_assimilation.qoi_maps import StandardQoI
 
     qoi = StandardQoI(setup_qoi["forward_model"], setup_qoi["obs_op"])
     q = qoi.evaluate(setup_qoi["m"], time_index=setup_qoi["time_index"])
@@ -262,7 +262,7 @@ def test_mpi_determinism(setup_qoi):
 @requires_mpi
 def test_mpi_parallel_consistency(setup_qoi):
     """Test parallel dot products are consistent."""
-    from swemnics.data_assimilation.qoi_maps import StandardQoI
+    from swe4dvar.data_assimilation.qoi_maps import StandardQoI
 
     qoi = StandardQoI(setup_qoi["forward_model"], setup_qoi["obs_op"])
     lin_qoi = qoi.linearize(setup_qoi["m"], time_index=setup_qoi["time_index"])

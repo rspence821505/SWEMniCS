@@ -1,9 +1,9 @@
-from swemnics.forward.solvers import get_solver
-from swemnics.forward.adcirc_problem import ADCIRCProblem
-from swemnics import FrictionLaw
+from swe4dvar.forward.solvers import get_solver
+from swe4dvar.forward.adcirc_problem import ADCIRCProblem
+from swe4dvar import FrictionLaw
 from mpi4py import MPI
 import numpy as np
-from swemnics.physics.constants import R
+from swe4dvar.physics.constants import R
 import time
 import argparse as ap
 

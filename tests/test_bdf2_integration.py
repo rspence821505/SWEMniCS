@@ -15,9 +15,9 @@ from petsc4py import PETSc
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from swemnics.adjoint.implicit_adjoint import ImplicitAdjointSolver
-from swemnics.forward.variational_forms import BDF2TimeCoefficients
-from swemnics.data_assimilation.cost_functions import FourDVarCost
+from swe4dvar.adjoint.implicit_adjoint import ImplicitAdjointSolver
+from swe4dvar.forward.variational_forms import BDF2TimeCoefficients
+from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()

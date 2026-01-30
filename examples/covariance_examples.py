@@ -11,7 +11,7 @@ import sys
 from typing import Optional
 
 
-from swemnics.data_assimilation.covariance import (
+from swe4dvar.data_assimilation.covariance import (
     DiagonalCovariance,
     DenseCovariance,
     ImplicitCovariance,

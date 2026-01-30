@@ -12,7 +12,7 @@ from mpi4py import MPI
 import dolfinx
 from dolfinx import mesh, fem
 
-from swemnics.utils.nonblocking_comm import (
+from swe4dvar.utils.nonblocking_comm import (
     NonBlockingScatter,
     AsyncVectorOps,
     OverlapComputeComm,

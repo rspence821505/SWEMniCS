@@ -26,8 +26,8 @@ from unittest.mock import Mock, patch, MagicMock
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from swemnics.forward.solvers import CGImplicit, DGImplicit
-from swemnics.forward.problems import TidalProblem
+from swe4dvar.forward.solvers import CGImplicit, DGImplicit
+from swe4dvar.forward.problems import TidalProblem
 
 # ============================================================================
 # MPI DETECTION AND MARKERS

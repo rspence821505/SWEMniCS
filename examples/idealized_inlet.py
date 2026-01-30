@@ -37,12 +37,13 @@
 
 
 import argparse
-from swemnics.forward.problems import IdealizedInlet
-from swemnics.forward.solvers import get_solver
-from swemnics.forward import solvers as Solvers
-from swemnics.utils.visualization import SolverVisualizer
-from swemnics.utils.timing import Timer
-from swemnics.utils import get_default_solver_params
+from swe4dvar.forward.problems import IdealizedInlet
+from swe4dvar.forward.solvers import get_solver
+from swe4dvar.forward import solvers as Solvers
+from swe4dvar.utils.visualization import SolverVisualizer
+from swe4dvar.utils.timing import Timer
+from swe4dvar.utils import get_default_solver_params
+from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -132,6 +133,9 @@ args = parser.parse_args()
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
+# Ensure output directories exist
+ensure_output_dirs()
+
 with Timer("Total Runtime", verbose=False, track_key="total"):
     with Timer("Problem Setup", verbose=False, track_key="setup"):
         initial_time = 0
@@ -207,7 +211,7 @@ with Timer("Total Runtime", verbose=False, track_key="total"):
             diagnostics.print_summary()
 
             # Save to JSON for offline analysis (MPI-aware)
-            json_file = "newton_convergence_inlet.json"
+            json_file = str(DATA_DIR / "newton_convergence_inlet.json")
             diagnostics.save_json(json_file)
 
         visualizer = SolverVisualizer(
@@ -226,13 +230,13 @@ with Timer("Total Runtime", verbose=False, track_key="total"):
             adcirc_file="data/Ideal_inlet_adcirc_openboundary.csv",
             dgswem_file="data/DGSWEM_Ideal_inlet_adcirc.csv",
             scheme_name=args.solver.upper(),
-            output_dir=".",
+            output_dir=str(FIGURES_DIR),
         )
 
         visualizer.print_saved_files(
             f"\nPlots saved:",
-            f"  - inlet_height_{args.solver.upper()}.png",
-            f"  - inlet_velocity_{args.solver.upper()}.png",
+            f"  - {FIGURES_DIR}/inlet_height_{args.solver.upper()}.png",
+            f"  - {FIGURES_DIR}/inlet_velocity_{args.solver.upper()}.png",
         )
 
 # Print timing summary

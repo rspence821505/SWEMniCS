@@ -128,7 +128,7 @@ def mock_forward_model():
 @pytest.fixture
 def setup_tlm(mock_forward_model):
     """Setup TLM test configuration."""
-    from swemnics.adjoint.tangent_linear import TangentLinearModel
+    from swe4dvar.adjoint.tangent_linear import TangentLinearModel
 
     m = PETSc.Vec().createMPI(mock_forward_model.n_dofs, comm=comm)
     m.setUp()
@@ -218,7 +218,7 @@ def test_tlm_linearity(setup_tlm):
 
 def test_taylor_test_convergence(setup_tlm):
     """Test that Taylor remainders converge at O(ε²) rate."""
-    from swemnics.adjoint.tangent_linear import TLMValidator
+    from swe4dvar.adjoint.tangent_linear import TLMValidator
 
     validator = TLMValidator(setup_tlm["forward_model"], setup_tlm["tlm"])
 
@@ -307,7 +307,7 @@ def test_jacobian_distribution(setup_tlm):
 @requires_mpi
 def test_parallel_vs_serial_consistency(mock_forward_model):
     """Test that parallel TLM matches expected behavior."""
-    from swemnics.adjoint.tangent_linear import TangentLinearModel
+    from swe4dvar.adjoint.tangent_linear import TangentLinearModel
 
     m = PETSc.Vec().createMPI(mock_forward_model.n_dofs, comm=comm)
     m.setUp()
@@ -344,7 +344,7 @@ def test_parallel_vs_serial_consistency(mock_forward_model):
 
 def test_finite_difference_tlm_creation(mock_forward_model):
     """Test FiniteDifferenceTLM instantiation."""
-    from swemnics.adjoint.tangent_linear import FiniteDifferenceTLM
+    from swe4dvar.adjoint.tangent_linear import FiniteDifferenceTLM
 
     fd_tlm = FiniteDifferenceTLM(mock_forward_model, epsilon=1e-6)
 
@@ -357,7 +357,7 @@ def test_finite_difference_tlm_creation(mock_forward_model):
 
 def test_finite_difference_tlm_apply(mock_forward_model):
     """Test finite difference TLM application."""
-    from swemnics.adjoint.tangent_linear import FiniteDifferenceTLM
+    from swe4dvar.adjoint.tangent_linear import FiniteDifferenceTLM
 
     fd_tlm = FiniteDifferenceTLM(mock_forward_model, epsilon=1e-6)
 
@@ -386,7 +386,7 @@ def test_finite_difference_tlm_apply(mock_forward_model):
 
 def test_tlm_validator_creation(setup_tlm):
     """Test TLMValidator instantiation."""
-    from swemnics.adjoint.tangent_linear import TLMValidator
+    from swe4dvar.adjoint.tangent_linear import TLMValidator
 
     validator = TLMValidator(setup_tlm["forward_model"], setup_tlm["tlm"])
 
@@ -398,7 +398,7 @@ def test_tlm_validator_creation(setup_tlm):
 
 def test_compare_with_finite_difference(setup_tlm):
     """Test comparison between analytical TLM and FD approximation."""
-    from swemnics.adjoint.tangent_linear import TLMValidator
+    from swe4dvar.adjoint.tangent_linear import TLMValidator
 
     validator = TLMValidator(setup_tlm["forward_model"], setup_tlm["tlm"])
 

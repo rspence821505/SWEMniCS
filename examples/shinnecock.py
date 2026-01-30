@@ -1,11 +1,11 @@
-from swemnics.forward import solvers as Solvers
-from swemnics.forward.adcirc_problem import ADCIRCProblem
+from swe4dvar.forward import solvers as Solvers
+from swe4dvar.forward.adcirc_problem import ADCIRCProblem
 from mpi4py import MPI
 import numpy as np
 import matplotlib.pyplot as plt
 
-# from swemnics.forcing import GriddedForcing
-from swemnics.physics.constants import R
+# from swe4dvar.forcing import GriddedForcing
+from swe4dvar.physics.constants import R
 import time
 import argparse as ap
 

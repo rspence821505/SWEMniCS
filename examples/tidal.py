@@ -36,14 +36,15 @@
 
 
 import argparse
-from swemnics.forward.problems import TidalProblem
-from swemnics.forward.solvers import get_solver
-from swemnics.forward import solvers as Solvers
-from swemnics.utils.visualization import SolverVisualizer
-from swemnics.utils.timing import Timer
-from swemnics.utils import get_default_solver_params
+from swe4dvar.forward.problems import TidalProblem
+from swe4dvar.forward.solvers import get_solver
+from swe4dvar.forward import solvers as Solvers
+from swe4dvar.utils.visualization import SolverVisualizer
+from swe4dvar.utils.timing import Timer
+from swe4dvar.utils import get_default_solver_params
+from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, LOGS_DIR, ensure_output_dirs
 
-# from swemnics import FrictionLaw
+# from swe4dvar import FrictionLaw
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
@@ -131,6 +132,9 @@ args = parser.parse_args()
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 
+# Ensure output directories exist
+ensure_output_dirs()
+
 with Timer("Total Runtime", verbose=False, track_key="total"):
     with Timer("Problem Setup", verbose=False, track_key="setup"):
         initial_time = 0
@@ -206,7 +210,7 @@ with Timer("Total Runtime", verbose=False, track_key="total"):
             diagnostics.print_summary()
 
             # Save to JSON for offline analysis (MPI-aware)
-            json_file = "newton_convergence.json"
+            json_file = str(DATA_DIR / "newton_convergence.json")
             diagnostics.save_json(json_file)
 
         visualizer = SolverVisualizer(
@@ -223,15 +227,15 @@ with Timer("Total Runtime", verbose=False, track_key="total"):
             nt=num_time_steps,
             station_idx=0,
             scheme_name=args.solver.upper(),
-            output_dir=".",
+            output_dir=str(FIGURES_DIR),
         )
 
         visualizer.print_saved_files(
             f"\nPlots saved:",
-            f"  - tidal_height_{args.solver.upper()}.png (water depth)",
-            f"  - tidal_elevation_{args.solver.upper()}.png (water surface elevation)",
-            f"  - tidal_velocity_u_{args.solver.upper()}.png (x-velocity)",
-            f"  - tidal_velocity_v_{args.solver.upper()}.png (y-velocity)",
+            f"  - {FIGURES_DIR}/tidal_height_{args.solver.upper()}.png (water depth)",
+            f"  - {FIGURES_DIR}/tidal_elevation_{args.solver.upper()}.png (water surface elevation)",
+            f"  - {FIGURES_DIR}/tidal_velocity_u_{args.solver.upper()}.png (x-velocity)",
+            f"  - {FIGURES_DIR}/tidal_velocity_v_{args.solver.upper()}.png (y-velocity)",
         )
 
 # Print timing summary

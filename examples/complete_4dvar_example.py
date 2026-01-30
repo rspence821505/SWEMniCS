@@ -15,7 +15,7 @@ The key integration points are:
 - FourDVarCost passes variational_form to adjoint solver if available
 - Support for adaptive time-stepping via BDF2TimeCoefficients
 
-Author: SWEMniCS Development Team
+Author: SWE4DVar Development Team
 Date: 2025
 """
 
@@ -28,8 +28,8 @@ from petsc4py import PETSc
 # Add src to path if running from examples directory
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from swemnics.forward.variational_forms import BDF2TimeCoefficients
-from swemnics.data_assimilation.cost_functions import FourDVarCost
+from swe4dvar.forward.variational_forms import BDF2TimeCoefficients
+from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
 
 def create_simple_forward_model(n_dofs=100, dt=0.1, num_steps=20):

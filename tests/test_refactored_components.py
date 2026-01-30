@@ -20,10 +20,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Import refactored modules
-from swemnics.utils.solver_storage import SolverStateStorage
-from swemnics.utils.timestep_manager import TimeStepDataManager
-from swemnics.utils.observation_stations import StationManager
-from swemnics.utils.fem_utilities import create_element, create_mixed_element
+from swe4dvar.utils.solver_storage import SolverStateStorage
+from swe4dvar.utils.timestep_manager import TimeStepDataManager
+from swe4dvar.utils.observation_stations import StationManager
+from swe4dvar.utils.fem_utilities import create_element, create_mixed_element
 
 
 class TestSolverStateStorage:

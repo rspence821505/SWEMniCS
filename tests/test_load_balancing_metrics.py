@@ -11,7 +11,7 @@ from mpi4py import MPI
 import dolfinx
 from dolfinx import mesh, fem
 
-from swemnics.utils.load_balancing_metrics import (
+from swe4dvar.utils.load_balancing_metrics import (
     LoadBalancingMetrics,
     CommunicationTracker
 )

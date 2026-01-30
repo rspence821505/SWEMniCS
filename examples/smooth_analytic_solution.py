@@ -1,5 +1,5 @@
-from swemnics.forward.problems import ConvergenceProblem
-from swemnics.forward.solvers import get_solver
+from swe4dvar.forward.problems import ConvergenceProblem
+from swe4dvar.forward.solvers import get_solver
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI

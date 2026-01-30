@@ -6,7 +6,7 @@ Demonstrates:
 2. Forward operator evaluation for both discretizations
 3. Adjoint consistency verification for both CG and DG
 4. Direct comparison between CG and DG results
-5. Mixed DG-CG spaces (SWEMniCS formulation)
+5. Mixed DG-CG spaces (SWE4DVar formulation)
 6. Integration with covariance matrices
 7. Full 4D-Var gradient computation example
 
@@ -23,16 +23,16 @@ import ufl
 
 # Import observation operator and covariance
 try:
-    from swemnics.data_assimilation.observation_operator import PointObservationOperator
-    from swemnics.data_assimilation.covariance import DiagonalCovariance
+    from swe4dvar.data_assimilation.observation_operator import PointObservationOperator
+    from swe4dvar.data_assimilation.covariance import DiagonalCovariance
 except ImportError:
     # If running from examples directory
     import sys
     import os
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-    from swemnics.data_assimilation.observation_operator import PointObservationOperator
-    from swemnics.data_assimilation.covariance import DiagonalCovariance
+    from swe4dvar.data_assimilation.observation_operator import PointObservationOperator
+    from swe4dvar.data_assimilation.covariance import DiagonalCovariance
 
 
 def print_section(title):
@@ -352,8 +352,8 @@ def example_3_discontinuous_fields():
 
 
 def example_4_mixed_dgcg_space():
-    """Example 4: Mixed DG-CG space (SWEMniCS formulation)."""
-    print_section("Example 4: Mixed DG-CG Space (SWEMniCS)")
+    """Example 4: Mixed DG-CG space (SWE4DVar formulation)."""
+    print_section("Example 4: Mixed DG-CG Space (SWE4DVar)")
 
     comm = MPI.COMM_WORLD
     mesh = create_test_mesh(comm, nx=25, ny=25)
@@ -364,7 +364,7 @@ def example_4_mixed_dgcg_space():
     V_vel = fem.functionspace(mesh, ("Lagrange", 1, (2,)))
 
     if comm.rank == 0:
-        print("\n--- SWEMniCS DG-CG Mixed Formulation ---")
+        print("\n--- SWE4DVar DG-CG Mixed Formulation ---")
         print(f"H (water depth):  DG space, {V_H.dofmap.index_map.size_global} DOFs")
         print(f"u,v (velocity):   CG space, {V_vel.dofmap.index_map.size_global} DOFs")
 
@@ -462,7 +462,7 @@ def example_6_4dvar_gradient():
     mesh = create_test_mesh(comm, nx=30, ny=30)
     obs_points = setup_observation_points(n_points=12)
 
-    # Use DG space (for SWEMniCS water depth)
+    # Use DG space (for SWE4DVar water depth)
     V = fem.functionspace(mesh, ("Discontinuous Lagrange", 1))
     obs_op = PointObservationOperator(V, obs_points, comm=comm)
 
@@ -600,7 +600,7 @@ def main():
         )
         print("✅ Example 2: Adjoint consistency verified for both CG and DG")
         print("✅ Example 3: DG handles discontinuities better than CG")
-        print("✅ Example 4: Mixed DG-CG space works (SWEMniCS formulation)")
+        print("✅ Example 4: Mixed DG-CG space works (SWE4DVar formulation)")
         print("✅ Example 5: Gradients verified with finite differences")
         print("✅ Example 6: Full 4D-Var gradient computation demonstrated")
         print("\n" + "=" * 70)

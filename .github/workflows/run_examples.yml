@@ -1,4 +1,4 @@
-name: Test SWEMniCS
+name: Test SWE4DVar
 
 on:
   # Trigger tests on push

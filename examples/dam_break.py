@@ -37,12 +37,13 @@
 
 
 import argparse
-from swemnics.forward.problems import DamProblem
-from swemnics.forward.solvers import get_solver
-from swemnics.utils.visualization import SolverVisualizer
-from swemnics.utils.timing import Timer
-from swemnics.utils import get_default_solver_params
-from swemnics import FrictionLaw
+from swe4dvar.forward.problems import DamProblem
+from swe4dvar.forward.solvers import get_solver
+from swe4dvar.utils.visualization import SolverVisualizer
+from swe4dvar.utils.timing import Timer
+from swe4dvar.utils import get_default_solver_params
+from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
+from swe4dvar import FrictionLaw
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
@@ -129,6 +130,9 @@ args = parser.parse_args()
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
+
+# Ensure output directories exist
+ensure_output_dirs()
 
 with Timer("Total Runtime", verbose=False, track_key="total"):
     with Timer("Problem Setup", verbose=False, track_key="setup"):
@@ -217,13 +221,16 @@ with Timer("Total Runtime", verbose=False, track_key="total"):
             diagnostics.print_summary()
 
             # Save to JSON for offline analysis (MPI-aware)
-            json_file = "newton_convergence.json"
+            json_file = str(DATA_DIR / "newton_convergence.json")
             diagnostics.save_json(json_file)
 
         # Save array for post processing
+        # Use centralized DATA_DIR unless user explicitly specifies --outdir
         if args.outdir is not None:
             os.makedirs(args.outdir, exist_ok=True)
-        outdir = "" if args.outdir is None else args.outdir + "/"
+            outdir = args.outdir + "/"
+        else:
+            outdir = str(DATA_DIR) + "/"
 
         np.savetxt(
             f"{outdir}{args.solver.upper()}_p1_stations_h.csv",
@@ -251,6 +258,8 @@ with Timer("Total Runtime", verbose=False, track_key="total"):
         )
 
         plt_nums = [0, 40, num_time_steps]
+        # Use FIGURES_DIR for plots unless user explicitly specifies --outdir
+        figures_outdir = args.outdir if args.outdir is not None else str(FIGURES_DIR)
         visualizer.plot_dam_break(
             solver_vals=solver.vals,
             dt=args.dt,
@@ -259,14 +268,14 @@ with Timer("Total Runtime", verbose=False, track_key="total"):
             dam_height=dam_height,
             timesteps=plt_nums,
             scheme_name=args.solver.upper(),
-            output_dir=outdir.rstrip("/") if outdir else ".",
+            output_dir=figures_outdir,
             analytical_solution_func=problem.get_analytic_solution,
         )
 
         visualizer.print_saved_files(
             f"\nPlots saved:",
-            f"  - {outdir}dam_height_{args.solver.upper()}_order1_dt.png",
-            f"  - {outdir}dam_velocity_{args.solver.upper()}_order1_dt.png",
+            f"  - {figures_outdir}/dam_height_{args.solver.upper()}_order1_dt.png",
+            f"  - {figures_outdir}/dam_velocity_{args.solver.upper()}_order1_dt.png",
         )
 
 # Print timing summary

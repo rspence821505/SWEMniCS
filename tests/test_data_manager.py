@@ -9,9 +9,9 @@ Run with: pytest test_data_manager.py -v
 
 import pytest
 import numpy as np
-from swemnics.forward.solvers import CGImplicit
-from swemnics.utils.timestep_manager import TimeStepDataManager
-from swemnics.forward.problems import TidalProblem
+from swe4dvar.forward.solvers import CGImplicit
+from swe4dvar.utils.timestep_manager import TimeStepDataManager
+from swe4dvar.forward.problems import TidalProblem
 
 
 class TestTimeStepDataManager:

@@ -169,7 +169,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from swemnics.adjoint.checkpointing import (
+from swe4dvar.adjoint.checkpointing import (
     CheckpointingStrategy,
     CheckpointerBase,
     FullTrajectoryCheckpointer,

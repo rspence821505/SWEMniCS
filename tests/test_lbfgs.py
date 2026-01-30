@@ -21,7 +21,7 @@ from pathlib import Path
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from swemnics.optimization.lbfgs import LBFGSOptimizer, PreconditionedLBFGS
+from swe4dvar.optimization.lbfgs import LBFGSOptimizer, PreconditionedLBFGS
 
 
 # ============================================================================

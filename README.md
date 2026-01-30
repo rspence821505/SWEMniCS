@@ -1,4 +1,4 @@
-# SWEMniCS
+# SWE4DVar
 
 **Shallow Water Equations with Modern Numerical Methods for Coastal Systems**
 
@@ -22,8 +22,8 @@ A comprehensive Python framework for solving the shallow water equations using F
 First, clone or download this repository:
 
 ```bash
-git clone https://github.com/your-username/SWEMniCS.git
-cd SWEMniCS
+git clone https://github.com/your-username/SWE4DVar.git
+cd SWE4DVar
 ```
 
 ### Conda (Recommended)
@@ -57,8 +57,8 @@ python3 -m pip install --no-build-isolation -e .
 ### Tidal Flow Simulation
 
 ```python
-from swemnics.forward.problems import TidalProblem
-from swemnics.forward.solvers import get_solver
+from swe4dvar.forward.problems import TidalProblem
+from swe4dvar.forward.solvers import get_solver
 
 # Define problem
 prob = TidalProblem(
@@ -101,8 +101,8 @@ mpirun -np 4 python examples/tidal.py --nx 100 --ny 25
 ## Project Structure
 
 ```
-SWEMniCS/
-├── src/swemnics/
+SWE4DVar/
+├── src/swe4dvar/
 │   ├── forward/              # Forward model solvers
 │   │   ├── problems.py       # Problem definitions (Tidal, DamBreak, etc.)
 │   │   ├── solvers.py        # CG, DG, SUPG solvers
@@ -128,11 +128,11 @@ SWEMniCS/
 
 ## Data Assimilation (4D-Var)
 
-SWEMniCS provides a complete 4D-Var framework for parameter estimation and state reconstruction:
+SWE4DVar provides a complete 4D-Var framework for parameter estimation and state reconstruction:
 
 ```python
-from swemnics.data_assimilation.cost_functions import FourDVarCost
-from swemnics.optimization.lbfgs import LBFGSOptimizer
+from swe4dvar.data_assimilation.cost_functions import FourDVarCost
+from swe4dvar.optimization.lbfgs import LBFGSOptimizer
 
 # Setup cost function
 cost = FourDVarCost(
@@ -207,14 +207,14 @@ This project is licensed under the MIT License - see the [LICENSE.txt](LICENSE.t
 <!--
 ## Citation
 
-If you use SWEMniCS or Data-Consistent Variational methods in your research, please cite:
+If you use SWE4DVar or Data-Consistent Variational methods in your research, please cite:
 
 ```bibtex
-@software{swemnics2024,
-  title = {SWEMniCS: Shallow Water Equations with Modern Numerical Methods for Coastal Systems},
+@software{swe4dvar2024,
+  title = {SWE4DVar: Shallow Water Equations with Modern Numerical Methods for Coastal Systems},
   author = {Pachev, Benjamin},
   year = {2024},
-  url = {https://github.com/your-username/SWEMniCS}
+  url = {https://github.com/your-username/SWE4DVar}
 }
 ``` -->
 

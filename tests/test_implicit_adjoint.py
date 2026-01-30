@@ -256,7 +256,7 @@ from pathlib import Path
 # Add src directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from swemnics.adjoint.implicit_adjoint import (
+from swe4dvar.adjoint.implicit_adjoint import (
     ImplicitAdjointSolver,
     ImplicitAdjointStepAnalyzer,
     CheckpointedImplicitAdjoint,

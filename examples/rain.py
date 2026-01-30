@@ -1,5 +1,5 @@
-from swemnics.forward.problems import RainProblem
-from swemnics.forward import solvers as Solvers
+from swe4dvar.forward.problems import RainProblem
+from swe4dvar.forward import solvers as Solvers
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI

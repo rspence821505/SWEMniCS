@@ -206,7 +206,7 @@ def setup_cost_function(mock_forward_model, mock_obs_operator, mock_covariance):
 
 def test_four_dvar_creation(setup_cost_function):
     """Test FourDVarCost instantiation."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
@@ -226,7 +226,7 @@ def test_four_dvar_creation(setup_cost_function):
 
 def test_four_dvar_value(setup_cost_function):
     """Test standard 4D-Var cost function value computation."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
@@ -253,7 +253,7 @@ def test_four_dvar_value(setup_cost_function):
 
 def test_four_dvar_gradient(setup_cost_function):
     """Test gradient computation."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
@@ -284,7 +284,7 @@ def test_four_dvar_gradient(setup_cost_function):
 
 def test_four_dvar_taylor_remainder(setup_cost_function):
     """Test gradient correctness via Taylor remainder."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
@@ -339,8 +339,8 @@ def test_four_dvar_taylor_remainder(setup_cost_function):
 
 def test_dc_four_dvar_creation(setup_cost_function):
     """Test DCFourDVarCost instantiation."""
-    from swemnics.data_assimilation.cost_functions import DCFourDVarCost
-    from swemnics.data_assimilation.qoi_maps import StandardQoI
+    from swe4dvar.data_assimilation.cost_functions import DCFourDVarCost
+    from swe4dvar.data_assimilation.qoi_maps import StandardQoI
 
     qoi = StandardQoI(
         setup_cost_function["forward_model"], setup_cost_function["obs_op"]
@@ -367,8 +367,8 @@ def test_dc_four_dvar_creation(setup_cost_function):
 
 def test_dc_four_dvar_value(setup_cost_function):
     """Test DC-4DVar cost function value."""
-    from swemnics.data_assimilation.cost_functions import DCFourDVarCost
-    from swemnics.data_assimilation.qoi_maps import StandardQoI
+    from swe4dvar.data_assimilation.cost_functions import DCFourDVarCost
+    from swe4dvar.data_assimilation.qoi_maps import StandardQoI
 
     qoi = StandardQoI(
         setup_cost_function["forward_model"], setup_cost_function["obs_op"]
@@ -405,7 +405,7 @@ def test_dc_four_dvar_value(setup_cost_function):
 
 def test_dc_wme_creation(setup_cost_function):
     """Test DCWMEFourDVarCost instantiation."""
-    from swemnics.data_assimilation.cost_functions import DCWMEFourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import DCWMEFourDVarCost
 
     L_wme = setup_cost_function["R"]
 
@@ -428,7 +428,7 @@ def test_dc_wme_creation(setup_cost_function):
 
 def test_dc_wme_value(setup_cost_function):
     """Test DC-WME cost function value."""
-    from swemnics.data_assimilation.cost_functions import DCWMEFourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import DCWMEFourDVarCost
 
     L_wme = setup_cost_function["R"]
 
@@ -462,7 +462,7 @@ def test_dc_wme_value(setup_cost_function):
 @requires_mpi
 def test_mpi_determinism_cost_value(setup_cost_function):
     """Test that cost values are deterministic across ranks."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
@@ -492,7 +492,7 @@ def test_mpi_determinism_cost_value(setup_cost_function):
 @requires_mpi
 def test_mpi_gradient_consistency(setup_cost_function):
     """Test that gradients are consistent across ranks."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
@@ -524,7 +524,7 @@ def test_mpi_gradient_consistency(setup_cost_function):
 @requires_mpi
 def test_parallel_scaling(setup_cost_function):
     """Test that cost function scales with MPI ranks."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
@@ -557,7 +557,7 @@ def test_parallel_scaling(setup_cost_function):
 
 def test_create_cost_function_standard(setup_cost_function):
     """Test create_cost_function factory for standard 4D-Var."""
-    from swemnics.data_assimilation.cost_functions import (
+    from swe4dvar.data_assimilation.cost_functions import (
         create_cost_function,
         FourDVarCost,
     )
@@ -586,7 +586,7 @@ def test_create_cost_function_standard(setup_cost_function):
 
 def test_cost_function_caches_trajectory(setup_cost_function):
     """Test that cost function caches forward trajectories."""
-    from swemnics.data_assimilation.cost_functions import FourDVarCost
+    from swe4dvar.data_assimilation.cost_functions import FourDVarCost
 
     cost = FourDVarCost(
         forward_model=setup_cost_function["forward_model"],
