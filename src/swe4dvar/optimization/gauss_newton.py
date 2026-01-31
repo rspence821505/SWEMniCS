@@ -3,8 +3,13 @@ Gauss-Newton optimizer for nonlinear least-squares problems.
 
 Exploits special structure of 4D-Var cost function for
 efficient Hessian approximation and Newton steps.
+
+WARNING: This module is EXPERIMENTAL. The TLM/Adjoint integration
+required for Hessian-vector products is not yet implemented.
+Use LBFGSOptimizer for production 4D-Var optimization.
 """
 
+import warnings
 from typing import Optional
 from petsc4py import PETSc
 
@@ -20,6 +25,11 @@ class GaussNewtonOptimizer(Optimizer):
 
     This is exact for linear least-squares and a good
     approximation when residuals are small.
+
+    .. warning::
+        EXPERIMENTAL: This optimizer is incomplete. The TLM and adjoint
+        methods required for Hessian-vector products are not implemented.
+        Use :class:`LBFGSOptimizer` instead for production use.
     """
 
     def __init__(self, cost_function, options: Optional[dict] = None):
