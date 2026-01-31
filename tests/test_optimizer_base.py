@@ -44,10 +44,21 @@ class QuadraticCostFunction:
         Ax.destroy()
         return cost
 
-    def gradient(self, x: PETSc.Vec, grad: PETSc.Vec):
-        """Compute gradient: A * x - b"""
+    def gradient(self, x: PETSc.Vec, grad: PETSc.Vec = None) -> PETSc.Vec:
+        """Compute gradient: A * x - b
+
+        Args:
+            x: Point at which to compute gradient
+            grad: Optional output vector (for backward compatibility with tests)
+
+        Returns:
+            Gradient vector
+        """
+        if grad is None:
+            grad = x.duplicate()
         self.A.mult(x, grad)
         grad.axpy(-1.0, self.b)
+        return grad
 
 
 class RosenbrockCostFunction:
@@ -68,8 +79,18 @@ class RosenbrockCostFunction:
         y_val = x_array[1]
         return (self.a - x_val) ** 2 + self.b * (y_val - x_val**2) ** 2
 
-    def gradient(self, x: PETSc.Vec, grad: PETSc.Vec):
-        """Compute Rosenbrock gradient"""
+    def gradient(self, x: PETSc.Vec, grad: PETSc.Vec = None) -> PETSc.Vec:
+        """Compute Rosenbrock gradient
+
+        Args:
+            x: Point at which to compute gradient
+            grad: Optional output vector (for backward compatibility with tests)
+
+        Returns:
+            Gradient vector
+        """
+        if grad is None:
+            grad = x.duplicate()
         x_array = x.getArray()
         x_val = x_array[0]
         y_val = x_array[1]
@@ -77,6 +98,7 @@ class RosenbrockCostFunction:
         grad_array = grad.getArray()
         grad_array[0] = -2 * (self.a - x_val) - 4 * self.b * x_val * (y_val - x_val**2)
         grad_array[1] = 2 * self.b * (y_val - x_val**2)
+        return grad
 
 
 class SimpleOptimizer(Optimizer):

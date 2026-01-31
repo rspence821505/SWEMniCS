@@ -112,24 +112,28 @@ class StationManager:
         self.cells = cells
 
         # Evaluate bathymetry at station locations
-        # Handle both callable expressions and Function objects
-        if callable(self.h_b):
-            # h_b is a Python callable - interpolate it
+        # Handle Constant, Function, callable expressions, and scalar values
+        if isinstance(self.h_b, fe.Constant):
+            # h_b is a DOLFINx Constant - extract its value
+            bathy_value = float(self.h_b.value)
+            self.station_bathy = np.full(len(points_on_proc), bathy_value)
+        elif hasattr(self.h_b, 'eval') and hasattr(self.h_b, 'function_space'):
+            # h_b is a Function - evaluate it directly
+            self.station_bathy = self.h_b.eval(points_on_proc, self.cells).flatten()
+        elif callable(self.h_b):
+            # h_b is a Python callable - interpolate it to a Function first
             bathy_func = fe.Function(self.V_scalar)
             bathy_func.interpolate(self.h_b)
             self.station_bathy = bathy_func.eval(points_on_proc, self.cells).flatten()
-        elif hasattr(self.h_b, 'eval'):
-            # h_b is already a Function - evaluate it directly
-            self.station_bathy = self.h_b.eval(points_on_proc, self.cells).flatten()
         else:
-            # h_b might be a Constant or scalar value
+            # h_b might be a scalar value
             try:
-                # Try to get scalar value
                 bathy_value = float(self.h_b)
                 self.station_bathy = np.full(len(points_on_proc), bathy_value)
             except (TypeError, ValueError):
                 raise TypeError(
-                    f"h_b must be callable, a Function, or a scalar value, got {type(self.h_b)}"
+                    f"h_b must be a Constant, Function, callable, or scalar value, "
+                    f"got {type(self.h_b)}"
                 )
 
         self.points_on_proc = np.array(points_on_proc, dtype=np.float64)

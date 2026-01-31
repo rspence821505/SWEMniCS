@@ -209,7 +209,7 @@ class TestJacobianErrorHandling:
 
         # Mock Newton solver to return None
         class MockNewton:
-            def solve(self, u, return_jacobian=False):
+            def solve(self, u, return_jacobian=False, **kwargs):
                 if return_jacobian:
                     return None, None
                 return None
@@ -225,7 +225,7 @@ class TestJacobianErrorHandling:
 
         # Mock Newton solver to return wrong type
         class MockNewton:
-            def solve(self, u, return_jacobian=False):
+            def solve(self, u, return_jacobian=False, **kwargs):
                 if return_jacobian:
                     return None, "not_a_matrix"
                 return None
@@ -241,7 +241,7 @@ class TestJacobianErrorHandling:
 
         # Create unassembled matrix
         class MockNewton:
-            def solve(self, u, return_jacobian=False):
+            def solve(self, u, return_jacobian=False, **kwargs):
                 if return_jacobian:
                     # Create matrix but don't assemble
                     J = PETSc.Mat().create(comm=comm)
@@ -262,7 +262,7 @@ class TestJacobianErrorHandling:
         solver = cg_solver
 
         class MockNewton:
-            def solve(self, u, return_jacobian=False):
+            def solve(self, u, return_jacobian=False, **kwargs):
                 if return_jacobian:
                     # Create zero-size matrix
                     J = PETSc.Mat().create(comm=comm)

@@ -141,8 +141,11 @@ class TestSolverStateStorage:
         retrieved = storage.get_state(1)
         np.testing.assert_array_equal(retrieved, states[1])
 
-        # Test invalid indices
-        assert storage.get_state(-1) is None
+        # Test negative indexing (Python-style, returns last element)
+        retrieved_last = storage.get_state(-1)
+        np.testing.assert_array_equal(retrieved_last, states[-1])
+
+        # Test out-of-bounds index
         assert storage.get_state(10) is None
 
     def test_get_jacobian(self):
@@ -164,8 +167,11 @@ class TestSolverStateStorage:
         retrieved = storage.get_jacobian(0)
         assert retrieved is not None
 
-        # Test invalid indices
-        assert storage.get_jacobian(-1) is None
+        # Test negative indexing (Python-style, returns last element)
+        retrieved_last = storage.get_jacobian(-1)
+        assert retrieved_last is not None
+
+        # Test out-of-bounds index
         assert storage.get_jacobian(10) is None
 
     def test_clear(self):
