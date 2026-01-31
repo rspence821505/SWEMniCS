@@ -16,7 +16,8 @@ The linearized QoI (Jacobian) is:
 where TLM is the tangent linear model.
 
 For DC-WME, the Weighted Mean Error QoI is:
-    Q_wme(m) = (1/√N) Σ_{k=1}^{N} R_k^{-1/2} [H_k(M_{k:0}(m)) - y_k]
+    Q_wme,k(m) = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2} [H_j(M_{j:0}(m)) - y_j],
+where I_k := { j ∈ I : j ≤ k } for an observation index set I.
 """
 
 from abc import ABC, abstractmethod
@@ -182,7 +183,7 @@ class WeightedMeanErrorQoI(QoIMap):
     """
     Weighted Mean Error QoI for DC-WME.
 
-    Q_wme,k(m) = (1/√k) Σ_{j=0}^{k-1} R_j^{-1/2}(H_j(M_{j:0}(m)) - y_j)
+    Q_wme,k(m) = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2}(H_j(M_{j:0}(m)) - y_j)
 
     Accumulates time-averaged, precision-weighted innovation up to time k.
 
@@ -195,8 +196,11 @@ class WeightedMeanErrorQoI(QoIMap):
     ----------
     y_obs : List[PETSc.Vec]
         True observation vectors.
+    obs_times : List[int]
+        Observation time indices (the set I). Must match y_obs ordering.
     R_cov : CovarianceMatrix
-        Observation error covariance (for R^{-1/2}).
+        Observation error covariance (for R^{-1/2}). Can be time-varying if it
+        supports time-indexed lookup via `get(time_index, default)` or is a dict.
     """
 
     def __init__(
@@ -205,6 +209,7 @@ class WeightedMeanErrorQoI(QoIMap):
         observation_operator,
         observations: List[PETSc.Vec],
         observation_cov,
+        obs_times: Optional[List[int]] = None,
     ):
         """
         Initialize WME QoI.
@@ -219,19 +224,39 @@ class WeightedMeanErrorQoI(QoIMap):
             True observation vectors y_j.
         observation_cov : CovarianceMatrix
             Observation error covariance R.
+        obs_times : List[int], optional
+            Observation time indices I corresponding to `observations`.
+            If None, assumes observations are provided for every model time
+            step in order: I = [0, 1, ..., len(observations)-1].
         """
         super().__init__(forward_model, observation_operator)
         self.y_obs = observations
         self.R_cov = observation_cov
+        self.obs_times = (
+            list(obs_times)
+            if obs_times is not None
+            else list(range(len(observations)))
+        )
+
+        if len(self.obs_times) != len(self.y_obs):
+            raise ValueError(
+                f"obs_times length ({len(self.obs_times)}) must match "
+                f"observations length ({len(self.y_obs)})"
+            )
+
+        # Map time index -> observation vector
+        self._obs_by_time: Dict[int, PETSc.Vec] = {
+            t: y for t, y in zip(self.obs_times, self.y_obs)
+        }
 
         # Cache for R^{-1/2} application
         self._R_sqrt_inv_cache: Dict = {}
 
     def evaluate(self, m: PETSc.Vec, time_index: int) -> PETSc.Vec:
         """
-        Evaluate WME QoI up to time k.
+        Evaluate WME QoI up to (and including) time index k.
 
-        Computes: Q_wme,k = (1/√k) Σ_{j=0}^{k-1} R_j^{-1/2}(H_j(u_j) - y_j)
+        Computes: Q_wme,k = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2}(H_j(u_j) - y_j)
 
         Parameters
         ----------
@@ -245,45 +270,55 @@ class WeightedMeanErrorQoI(QoIMap):
         PETSc.Vec
             WME vector at time k.
         """
-        if time_index <= 0:
-            raise ValueError("time_index must be positive for WME")
+        if time_index < 0:
+            raise ValueError("time_index must be non-negative for WME")
 
         # Run forward model
         trajectory, _ = self._get_trajectory(m, store_jacobians=False)
 
+        # Observation indices up to (and including) time_index
+        I_k = [t for t in self.obs_times if t <= time_index]
+
         # Initialize accumulator
         wme = None
-        num_obs = min(time_index, len(self.y_obs))
+        num_obs = 0
 
-        for j in range(num_obs):
-            # Get state at time j
-            if j >= len(trajectory):
-                break
-            u_j = trajectory[j]
+        for t_j in I_k:
+            if t_j >= len(trajectory):
+                continue
+
+            y_j = self._obs_by_time.get(t_j)
+            if y_j is None:
+                continue
+
+            u_j = trajectory[t_j]
 
             # Apply observation operator: H_j(u_j)
-            Hu_j = self.obs_op.forward(u_j, time_index=j)
+            Hu_j = self.obs_op.forward(u_j, time_index=t_j)
 
             # Innovation: d_j = H_j(u_j) - y_j
             d_j = Hu_j.duplicate()
-            d_j.waxpy(-1.0, self.y_obs[j], Hu_j)
+            d_j.waxpy(-1.0, y_j, Hu_j)
 
             # Apply R_j^{-1/2}
-            R_sqrt_inv_d = self._apply_R_sqrt_inv(d_j, j)
+            R_sqrt_inv_d = self._apply_R_sqrt_inv(d_j, t_j)
 
             # Accumulate
             if wme is None:
                 wme = R_sqrt_inv_d.copy()
             else:
                 wme.axpy(1.0, R_sqrt_inv_d)
+            num_obs += 1
 
-        # Scale by 1/√k
-        if wme is not None and num_obs > 0:
-            wme.scale(1.0 / np.sqrt(num_obs))
-        elif wme is None:
-            # Return zero vector if no observations
+        # Scale by 1/√|I_k|
+        if wme is None:
+            # Return zero vector if no observations (size from any y if available)
+            if len(self.y_obs) == 0:
+                raise ValueError("WME QoI requires at least one observation vector")
             wme = self.y_obs[0].duplicate()
             wme.zeroEntries()
+        elif num_obs > 0:
+            wme.scale(1.0 / np.sqrt(num_obs))
 
         return wme
 
@@ -305,13 +340,17 @@ class WeightedMeanErrorQoI(QoIMap):
         PETSc.Vec
             R^{-1/2} · v.
         """
-        # Get observation covariance for this time
-        if hasattr(self.R_cov, "apply_sqrt_inverse"):
-            return self.R_cov.apply_sqrt_inverse(v)
+        # Get observation covariance for this time (supports dict or single object)
+        R_cov = self.R_cov
+        if isinstance(R_cov, dict):
+            R_cov = R_cov.get(time_index, R_cov.get(0, list(R_cov.values())[0]))
+
+        if hasattr(R_cov, "apply_sqrt_inverse"):
+            return R_cov.apply_sqrt_inverse(v)
         else:
             # Fallback: use apply_inverse and estimate sqrt
             # For diagonal covariance, sqrt(R^{-1}) = R^{-1/2}
-            R_inv_v = self.R_cov.apply_inverse(v)
+            R_inv_v = R_cov.apply_inverse(v)
 
             # Approximate sqrt via scaling (accurate for diagonal)
             result = v.duplicate()
@@ -350,6 +389,7 @@ class WeightedMeanErrorQoI(QoIMap):
             time_index,
             self.y_obs,
             self.R_cov,
+            self.obs_times,
         )
 
 
@@ -535,7 +575,7 @@ class LinearizedStandardQoI(LinearizedQoI):
 
 class LinearizedWMEQoI(LinearizedQoI):
     """
-    Linearized WME QoI: DQ_wme,k = (1/√k) Σ_{j=0}^{k-1} R_j^{-1/2} · H_j · TLM_{j:0}.
+    Linearized WME QoI: DQ_wme,k = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2} · H_j · TLM_{j:0}.
 
     For the WME QoI, the linearization requires accumulating contributions
     from all observation times up to k.
@@ -564,6 +604,7 @@ class LinearizedWMEQoI(LinearizedQoI):
         time_index: int,
         observations: List[PETSc.Vec],
         observation_cov,
+        obs_times: Optional[List[int]] = None,
     ):
         """
         Initialize linearized WME QoI.
@@ -582,6 +623,10 @@ class LinearizedWMEQoI(LinearizedQoI):
             True observations (not used in linearization).
         observation_cov : CovarianceMatrix
             Observation covariance R.
+        obs_times : List[int], optional
+            Observation time indices I corresponding to `observations`.
+            If None, assumes observations are provided for every time step
+            in order: I = [0, 1, ..., len(observations)-1].
         """
         self.forward_model = forward_model
         self.obs_op = observation_operator
@@ -589,6 +634,19 @@ class LinearizedWMEQoI(LinearizedQoI):
         self.k = time_index
         self.y_obs = observations
         self.R_cov = observation_cov
+        self.obs_times = (
+            list(obs_times)
+            if obs_times is not None
+            else list(range(len(observations)))
+        )
+        if len(self.obs_times) != len(self.y_obs):
+            raise ValueError(
+                f"obs_times length ({len(self.obs_times)}) must match "
+                f"observations length ({len(self.y_obs)})"
+            )
+        self._obs_by_time: Dict[int, PETSc.Vec] = {
+            t: y for t, y in zip(self.obs_times, self.y_obs)
+        }
 
         # Cache trajectory
         self._trajectory: Optional[List[PETSc.Vec]] = None
@@ -606,7 +664,7 @@ class LinearizedWMEQoI(LinearizedQoI):
         """
         Apply linearized WME via TLM.
 
-        δq_wme = (1/√k) Σ_{j=0}^{k-1} R_j^{-1/2} · H_j · (TLM_{j:0}·δm)
+        δq_wme = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2} · H_j · (TLM_{j:0}·δm)
 
         Requires running TLM to each observation time and accumulating.
 
@@ -625,34 +683,40 @@ class LinearizedWMEQoI(LinearizedQoI):
         tlm = TangentLinearModel(self.forward_model, self._trajectory, self._jacobians)
 
         # Accumulate contributions
-        num_obs = min(self.k, len(self.y_obs))
+        I_k = [t for t in self.obs_times if t <= self.k]
         result = None
 
-        for j in range(num_obs):
-            # Propagate perturbation to time j
-            delta_u_j = tlm.propagate(delta_m, target_time=j)
+        num_obs = 0
+        for t_j in I_k:
+            if t_j >= len(self._trajectory):
+                continue
+            if t_j not in self._obs_by_time:
+                continue
+
+            # Propagate perturbation to time t_j
+            delta_u_j = tlm.propagate(delta_m, target_time=t_j)
 
             # Apply linearized observation operator
             delta_Hu_j = self.obs_op.forward_linearized(
-                delta_u_j, self._trajectory[j], time_index=j
+                delta_u_j, self._trajectory[t_j], time_index=t_j
             )
 
             # Apply R^{-1/2}
-            scaled = self._apply_R_sqrt_inv(delta_Hu_j, j)
+            scaled = self._apply_R_sqrt_inv(delta_Hu_j, t_j)
 
             # Accumulate
             if result is None:
                 result = scaled.copy()
             else:
                 result.axpy(1.0, scaled)
+            num_obs += 1
 
-        # Scale by 1/√k
-        if result is not None and num_obs > 0:
-            result.scale(1.0 / np.sqrt(num_obs))
-        else:
-            # Return zero if no observations
-            result = delta_m.duplicate()
+        # Scale by 1/√|I_k|
+        if result is None:
+            result = self.y_obs[0].duplicate() if len(self.y_obs) else delta_m.duplicate()
             result.zeroEntries()
+        elif num_obs > 0:
+            result.scale(1.0 / np.sqrt(num_obs))
 
         return result
 
@@ -660,7 +724,7 @@ class LinearizedWMEQoI(LinearizedQoI):
         """
         Apply adjoint of linearized WME.
 
-        δm = (1/√k) Σ_{j=0}^{k-1} ADJ_{j:0} · H_j^T · R_j^{-1/2} · δq_wme
+        δm = (1/√|I_k|) Σ_{j∈I_k} ADJ_{j:0} · H_j^T · R_j^{-1/2} · δq_wme
 
         Requires running adjoint from each observation time and accumulating.
 
@@ -676,9 +740,10 @@ class LinearizedWMEQoI(LinearizedQoI):
         """
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
 
-        num_obs = min(self.k, len(self.y_obs))
+        I_k = [t for t in self.obs_times if t <= self.k]
+        num_obs = len(I_k)
 
-        # Scale input by 1/√k
+        # Scale input by 1/√|I_k|
         delta_q_scaled = delta_q.duplicate()
         delta_q.copy(delta_q_scaled)
         if num_obs > 0:
@@ -688,24 +753,27 @@ class LinearizedWMEQoI(LinearizedQoI):
         result = self.m_bar.duplicate()
         result.zeroEntries()
 
-        for j in range(num_obs):
+        for t_j in I_k:
+            if t_j >= len(self._trajectory):
+                continue
+
             # Apply R^{-1/2}^T = R^{-1/2} (symmetric)
-            scaled = self._apply_R_sqrt_inv(delta_q_scaled, j)
+            scaled = self._apply_R_sqrt_inv(delta_q_scaled, t_j)
 
             # Apply adjoint observation operator
-            delta_u_j = self.obs_op.adjoint(scaled, time_index=j)
+            delta_u_j = self.obs_op.adjoint(scaled, time_index=t_j)
 
             # Run adjoint from time j to 0
-            if j > 0:
+            if t_j > 0:
                 adjoint_solver = ImplicitAdjointSolver(
                     self.forward_model,
-                    self._trajectory[: j + 1],
-                    self._jacobians[:j] if self._jacobians else None,
+                    self._trajectory[: t_j + 1],
+                    self._jacobians[:t_j] if self._jacobians else None,
                     self.forward_model.dt,
                 )
 
-                forcings = [None] * (j + 1)
-                forcings[j] = delta_u_j
+                forcings = [None] * (t_j + 1)
+                forcings[t_j] = delta_u_j
 
                 terminal = delta_u_j.duplicate()
                 terminal.zeroEntries()
@@ -722,11 +790,15 @@ class LinearizedWMEQoI(LinearizedQoI):
 
     def _apply_R_sqrt_inv(self, v: PETSc.Vec, time_index: int) -> PETSc.Vec:
         """Apply R^{-1/2} to vector."""
-        if hasattr(self.R_cov, "apply_sqrt_inverse"):
-            return self.R_cov.apply_sqrt_inverse(v)
+        R_cov = self.R_cov
+        if isinstance(R_cov, dict):
+            R_cov = R_cov.get(time_index, R_cov.get(0, list(R_cov.values())[0]))
+
+        if hasattr(R_cov, "apply_sqrt_inverse"):
+            return R_cov.apply_sqrt_inverse(v)
         else:
             # Fallback for diagonal covariance
-            R_inv_v = self.R_cov.apply_inverse(v)
+            R_inv_v = R_cov.apply_inverse(v)
             result = v.duplicate()
             result.pointwiseMult(R_inv_v, v)
             result.sqrtabs()

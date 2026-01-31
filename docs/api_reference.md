@@ -465,7 +465,8 @@ class DCWMEFourDVarCost(CostFunction):
     Data-Consistent 4D-Var with Weighted Mean Error.
 
     Uses the weighted mean error QoI:
-        Q_wme(m) = (1/sqrt(N)) * sum_k R_k^{-1/2}(H_k(u_k) - y_k)
+        Q_wme,K(m) = (1/sqrt(|I|)) * sum_{j in I} R_j^{-1/2}(H_j(u_j) - y_j),
+        where I is the observation index set and K := max(I).
 
     This formulation provides better conditioning and
     natural handling of observation correlations.
@@ -497,7 +498,7 @@ def create_cost_function(
     Parameters
     ----------
     method : str
-        One of: '4dvar', 'dc', 'dc-wme'
+        One of: '4dvar', 'dc', 'dc_wme' (also accepts 'wme')
     **kwargs : dict
         Additional arguments (e.g., predictability_cov for DC methods).
 
@@ -576,15 +577,15 @@ class EnsembleCovariance(CovarianceMatrix):
 class QoIMap(ABC):
     """Abstract base class for Quantity of Interest maps."""
 
-    def evaluate(self, m: PETSc.Vec) -> np.ndarray:
-        """Evaluate Q(m)."""
+    def evaluate(self, m: PETSc.Vec, time_index: int) -> PETSc.Vec:
+        """Evaluate Q_k(m) at a time index k."""
 
 
 class StandardQoI(QoIMap):
     """
-    Standard QoI: observation misfit at each time.
+    Standard QoI: observed model state at time k.
 
-    Q_k(m) = H_k(M_{k:0}(m)) - y_k
+    Q_k(m) = H_k(M_{k:0}(m))
     """
 
 
@@ -592,30 +593,32 @@ class WeightedMeanErrorQoI(QoIMap):
     """
     Weighted Mean Error QoI.
 
-    Q_wme(m) = (1/sqrt(N)) * sum_k R_k^{-1/2}(H_k(u_k) - y_k)
+    Q_wme,k(m) = (1/sqrt(|I_k|)) * sum_{j in I_k} R_j^{-1/2}(H_j(u_j) - y_j),
+    where I_k := { j ∈ I : j ≤ k } and I is the observation index set.
     """
 
 
 class LinearizedQoI(ABC):
     """Base class for linearized QoI maps."""
 
-    def apply_jacobian(self, delta_m: PETSc.Vec) -> np.ndarray:
-        """Apply Jacobian: dQ/dm * delta_m"""
+    def apply(self, delta_m: PETSc.Vec) -> PETSc.Vec:
+        """Apply Jacobian: DQ * delta_m"""
 
-    def apply_adjoint(self, delta_q: np.ndarray) -> PETSc.Vec:
-        """Apply adjoint: (dQ/dm)^T * delta_q"""
+    def apply_adjoint(self, delta_q: PETSc.Vec) -> PETSc.Vec:
+        """Apply adjoint: (DQ)^T * delta_q"""
 
 
 class QoICovarianceEstimator:
     """
-    Estimates predictability covariance L from ensemble.
+    Estimates predictability covariance L_k ≈ DQ_k B DQ_k^T.
 
-    L = Cov(Q(m)) where m ~ prior
+    Uses Monte Carlo directions sampled from N(0, B) and pushed through
+    the linearized QoI.
 
     Methods
     -------
-    estimate(ensemble, qoi_map) -> CovarianceMatrix
-        Estimate L from ensemble of prior samples.
+    estimate(m_bar, time_index) -> CovarianceMatrix
+        Estimate L_k at linearization point m_bar.
     """
 ```
 

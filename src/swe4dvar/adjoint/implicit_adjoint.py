@@ -64,9 +64,10 @@ class ImplicitAdjointSolver:
 
     Notes
     -----
-    This implementation follows the optimize-then-discretize approach
-    for adjoint computation, which is more practical than
-    discretize-then-optimize for implicit schemes.
+    This implementation follows a discretize-then-optimize (DTO) approach
+    for the time-discrete residual: it reuses the Jacobians assembled during
+    the forward Newton solves and applies their transpose during the backward
+    sweep.
 
     See Also
     --------

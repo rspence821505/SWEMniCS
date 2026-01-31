@@ -14,7 +14,8 @@ DC-4DVar (Data-Consistent):
     J_DC(m) = J(m) - ½ Σ_k ⟨Q_k(m) - Q_k(m_b), L_k⁻¹(Q_k(m) - Q_k(m_b))⟩
 
 DC-WME (Weighted Mean Error):
-    Q_wme,k(m) = (1/√N) Σ_{j=0}^{k-1} R_j^{-1/2}(H_j(M_{j:0}(m)) - y_j)
+    Q_wme,k(m) = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2}(H_j(M_{j:0}(m)) - y_j)
+        where I_k := { j ∈ I : j ≤ k } and I is the observation index set.
     J_WME(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
              + ½ ‖Q_wme(m)‖²
              - ½ ⟨Q_wme(m) - Q_wme(m_b), L_wme⁻¹(Q_wme(m) - Q_wme(m_b))⟩
@@ -856,7 +857,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
     """
     DC-4DVar with Weighted Mean Error QoI.
 
-    Q_wme(m) = (1/√N) Σ_{k=1}^{N} R_k^{-1/2} [H_k(M_{k:0}(m)) - y_k]
+    Q_wme,k(m) = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2} [H_j(M_{j:0}(m)) - y_j]
 
     J_WME(m) = ½⟨m - m_b, B⁻¹(m - m_b)⟩
              + ½ ‖Q_wme(m)‖²
@@ -915,7 +916,11 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         from .qoi_maps import WeightedMeanErrorQoI
 
         wme_qoi = WeightedMeanErrorQoI(
-            forward_model, observation_operator, observations, observation_cov
+            forward_model,
+            observation_operator,
+            observations,
+            observation_cov,
+            obs_times=obs_times,
         )
 
         super().__init__(
@@ -981,8 +986,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         PETSc.Vec
             WME vector.
         """
-        # Use final observation time for WME evaluation
-        k_final = self.obs_times[-1]
+        # Use final observation index K := max(I) for WME evaluation
+        k_final = max(self.obs_times)
         return self.qoi_map.evaluate(m, k_final)
 
     def _compute_wme_predictability(self, m: PETSc.Vec, Q_wme_m: PETSc.Vec) -> float:
@@ -1016,7 +1021,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
             estimator = QoICovarianceEstimator(self.qoi_map, self.B, num_samples=100)
             # Use final time for WME covariance
-            self._L_wme = estimator.estimate(self.m_b, self.obs_times[-1])
+            self._L_wme = estimator.estimate(self.m_b, max(self.obs_times))
 
     def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
         """
@@ -1063,7 +1068,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         forcing.axpy(-1.0, L_inv_delta)
 
         # Apply adjoint of WME Jacobian
-        linearized_wme = self.qoi_map.linearize(m, self.obs_times[-1])
+        linearized_wme = self.qoi_map.linearize(m, max(self.obs_times))
         grad_wme = linearized_wme.apply_adjoint(forcing)
 
         # Accumulate

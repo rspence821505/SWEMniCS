@@ -221,3 +221,5 @@ petsc_options.yaml
 # ADIOS2
 *.sst
 *.bp/
+
+paper/

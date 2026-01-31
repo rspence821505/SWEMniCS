@@ -109,6 +109,7 @@ class TangentLinearModel:
         delta_u0: PETSc.Vec,
         start_time: int = 0,
         end_time: Optional[int] = None,
+        startup: str = "copy",
     ) -> List[PETSc.Vec]:
         """
         Propagate initial perturbation forward in time.
@@ -153,8 +154,15 @@ class TangentLinearModel:
         perturbations = [delta_u0.copy()]
 
         # For BDF2, we need two previous perturbations
-        # At n=0: δu^{-1} doesn't exist, so we use δu^{-1} = 0
-        delta_u_nm1: Optional[PETSc.Vec] = None  # δu^{n-1}
+        # Startup choice should mirror the forward scheme's initialization.
+        # Two common choices (see paper/dci_4dvar_adjoint.tex):
+        #   - "copy": set δu^{-1} = δu^0  (equivalently u^{-1}=u^0)
+        #   - "zero": set δu^{-1} = 0
+        if startup not in {"copy", "zero"}:
+            raise ValueError(f"Unknown startup mode: {startup!r}")
+        delta_u_nm1: Optional[PETSc.Vec] = (
+            delta_u0.copy() if startup == "copy" else None
+        )  # δu^{n-1}
         delta_u_n = delta_u0.copy()  # δu^n
 
         # Forward propagation through time steps

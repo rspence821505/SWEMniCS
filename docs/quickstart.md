@@ -239,51 +239,39 @@ from swe4dvar.data_assimilation import (
     DCWMEFourDVarCost,
     WeightedMeanErrorQoI,
     QoICovarianceEstimator,
-    EnsembleCovariance
 )
 
-# Generate ensemble from prior
-n_ensemble = 50
-prior_ensemble = []
-
-for i in range(n_ensemble):
-    # Sample friction from prior
-    friction_sample = np.random.normal(0.030, 0.005)
-
-    # Run forward model
-    sample_problem = TidalProblem(nx=40, ny=10, dt=3600, nt=48)
-    sample_problem.TAU = friction_sample
-    sample_solver = get_solver("SUPG")(sample_problem, theta=1.0, p_degree=[1, 1])
-    sample_solver.time_loop(solver_params, save_state=True)
-
-    prior_ensemble.append(sample_solver)
-
-print(f"Generated {n_ensemble} ensemble members")
+# Assumes you already have:
+# - forward_model `solver` (background run configuration)
+# - background vector `m_b`
+# - observations `observations` at indices `obs_times`
+# - background covariance `B` and observation covariance `R`
 ```
 
 ### Step 2: Create DC-WME Cost Function
 
 ```python
-# Create QoI map
+# Create QoI map (uses I := obs_times, and K := max(I))
 qoi_map = WeightedMeanErrorQoI(
+    forward_model=solver,
     observation_operator=obs_op,
-    observation_cov=R,
     observations=observations,
-    obs_times=obs_times
+    observation_cov=R,
+    obs_times=obs_times,
 )
 
-# Estimate predictability covariance from ensemble
-estimator = QoICovarianceEstimator()
-L = estimator.estimate(prior_ensemble, qoi_map)
+# Estimate predictability covariance L_wme = DQ_wme,K B DQ_wme,K^T
+estimator = QoICovarianceEstimator(qoi_map=qoi_map, background_cov=B, num_samples=100)
+L_wme = estimator.estimate(m_bar=m_b, time_index=max(obs_times))
 
 # Create DC-WME cost function
 dc_cost = DCWMEFourDVarCost(
-    forward_model=background_solver,
+    forward_model=solver,
     observation_operator=obs_op,
     background_cov=B,
     observation_cov=R,
-    predictability_cov=L,
-    m_background=np.array([0.030]),
+    predicted_cov_wme=L_wme,
+    m_background=m_b,
     observations=observations,
     obs_times=obs_times
 )

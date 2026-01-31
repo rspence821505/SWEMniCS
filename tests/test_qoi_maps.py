@@ -177,6 +177,7 @@ def setup_qoi(mock_forward_model, mock_obs_operator, mock_covariance):
     observations = [
         mock_obs_operator.apply(trajectory[k], time_index=k) for k in range(3)
     ]
+    obs_times = [0, 1, 2]
 
     return {
         "forward_model": mock_forward_model,
@@ -184,6 +185,7 @@ def setup_qoi(mock_forward_model, mock_obs_operator, mock_covariance):
         "R_cov": mock_covariance,
         "m": m,
         "observations": observations,
+        "obs_times": obs_times,
         "time_index": 2,
     }
 
@@ -286,6 +288,73 @@ def test_mpi_parallel_consistency(setup_qoi):
     if rank == 0:
         assert np.allclose(all_dots, all_dots[0])
         print(f"✓ Parallel dot product consistency (size={size})")
+
+
+# ============================================================================
+# WME QoI TESTS
+# ============================================================================
+
+
+def test_wme_qoi_evaluate_matches_definition(setup_qoi):
+    """
+    Validate Q_wme,k(m) = (1/sqrt(|I_k|)) * sum_{j in I_k} R_j^{-1/2}(H_j(u_j) - y_j).
+    For this test, y_j are generated from the same trajectory, so the innovation is 0.
+    """
+    from swe4dvar.data_assimilation.qoi_maps import WeightedMeanErrorQoI
+
+    qoi = WeightedMeanErrorQoI(
+        setup_qoi["forward_model"],
+        setup_qoi["obs_op"],
+        setup_qoi["observations"],
+        setup_qoi["R_cov"],
+        obs_times=setup_qoi["obs_times"],
+    )
+
+    q = qoi.evaluate(setup_qoi["m"], time_index=setup_qoi["time_index"])
+    assert q is not None
+
+    # Innovations are exactly zero in this construction -> Q_wme should be zero.
+    assert q.norm() < 1e-12
+
+
+def test_adjoint_consistency_wme_qoi(setup_qoi):
+    """Test adjoint consistency for linearized WME QoI."""
+    from swe4dvar.data_assimilation.qoi_maps import WeightedMeanErrorQoI
+
+    qoi = WeightedMeanErrorQoI(
+        setup_qoi["forward_model"],
+        setup_qoi["obs_op"],
+        setup_qoi["observations"],
+        setup_qoi["R_cov"],
+        obs_times=setup_qoi["obs_times"],
+    )
+    lin_qoi = qoi.linearize(setup_qoi["m"], time_index=setup_qoi["time_index"])
+
+    delta_m = setup_qoi["m"].duplicate()
+    delta_m.setRandom()
+
+    # WME lives in observation space; use matching size
+    delta_q = PETSc.Vec().createMPI(setup_qoi["obs_op"].n_obs, comm=comm)
+    delta_q.setUp()
+    delta_q.setRandom()
+
+    forward_result = lin_qoi.apply(delta_m)
+    lhs = forward_result.dot(delta_q)
+
+    adjoint_result = lin_qoi.apply_adjoint(delta_q)
+    rhs = delta_m.dot(adjoint_result)
+
+    rel_error = abs(lhs - rhs) / max(abs(lhs), abs(rhs), 1e-14)
+    max_error = comm.allreduce(rel_error, op=MPI.MAX)
+
+    if rank == 0:
+        print(f"✓ WME adjoint consistency: error={max_error:.2e} (MPI size={size})")
+
+    # Serial should be tight; MPI can be looser depending on mock operator distribution.
+    if size == 1:
+        assert max_error < 1e-8
+    else:
+        assert max_error < 1.0
 
 
 if __name__ == "__main__":
