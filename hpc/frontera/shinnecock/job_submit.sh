@@ -102,7 +102,7 @@ for file in "${REQUIRED_FILES[@]}"; do
         echo ""
         echo "Shinnecock data files not found!"
         echo "Please ensure the ADCIRC-to-ADIOS conversion has been run."
-        echo "See: https://github.com/your-repo/swe4dvar/docs/data_preparation.md"
+        echo "See: https://github.com/UT-CHG/SWE4DVar/docs/data_preparation.md"
         exit 1
     fi
 done

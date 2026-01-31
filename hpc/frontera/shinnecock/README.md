@@ -21,7 +21,7 @@ ssh username@frontera.tacc.utexas.edu
 
 # Clone/sync the project
 cd $WORK
-git clone https://github.com/your-repo/swe4dvar.git
+git clone https://github.com/UT-CHG/SWE4DVar.git
 cd swe4dvar
 
 # Create conda environment (first time only)
@@ -281,7 +281,7 @@ source hpc/frontera/shinnecock/environment_setup.sh
 
 - **TACC Support:** https://portal.tacc.utexas.edu/
 - **Frontera User Guide:** https://frontera-portal.tacc.utexas.edu/user-guide/
-- **SWE4DVar Issues:** [GitHub Issues](https://github.com/your-repo/swe4dvar/issues)
+- **SWE4DVar Issues:** [GitHub Issues](https://github.com/UT-CHG/SWE4DVar/issues)
 
 ## Advanced Usage
 

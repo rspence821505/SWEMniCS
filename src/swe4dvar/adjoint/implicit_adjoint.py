@@ -87,6 +87,7 @@ class ImplicitAdjointSolver:
         jacobians: List[PETSc.Mat],
         dt: float,
         variational_form=None,  # NEW: Optional variational form
+        use_bdf2: Optional[bool] = None,  # NEW: Explicit time scheme control
     ):
         """
         Initialize implicit adjoint solver.
@@ -104,6 +105,10 @@ class ImplicitAdjointSolver:
         variational_form : VariationalForm, optional
             Variational form providing mass matrix and BDF2 coefficients.
             If None, will use fallback assembly.
+        use_bdf2 : bool, optional
+            Whether to use BDF2 time stepping coefficients (True) or
+            Backward Euler (False). If None, will attempt to detect from
+            forward_model or default to True (BDF2).
 
         Raises
         ------
@@ -124,9 +129,19 @@ class ImplicitAdjointSolver:
                 f"got {len(jacobians)}"
             )
 
-        # NEW: Use BDF2TimeCoefficients for correct time-coupling
-        # Always use BDF2 mode (first step uses Backward Euler internally)
-        use_bdf2 = True
+        # Determine time stepping scheme
+        # Priority: explicit parameter > forward_model attribute > default (BDF2)
+        if use_bdf2 is None:
+            # Try to detect from forward model
+            if hasattr(forward_model, 'use_bdf2'):
+                use_bdf2 = forward_model.use_bdf2
+            elif hasattr(forward_model, 'problem') and hasattr(forward_model.problem, 'use_bdf2'):
+                use_bdf2 = forward_model.problem.use_bdf2
+            else:
+                # Default to BDF2 (most common for accuracy)
+                use_bdf2 = True
+
+        self.use_bdf2 = use_bdf2
         self.time_coeffs = BDF2TimeCoefficients(dt, use_bdf2=use_bdf2)
 
         # NEW: Store variational form for mass matrix access

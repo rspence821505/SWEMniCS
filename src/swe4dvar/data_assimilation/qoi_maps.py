@@ -348,21 +348,34 @@ class WeightedMeanErrorQoI(QoIMap):
         if hasattr(R_cov, "apply_sqrt_inverse"):
             return R_cov.apply_sqrt_inverse(v)
         else:
-            # Fallback: use apply_inverse and estimate sqrt
-            # For diagonal covariance, sqrt(R^{-1}) = R^{-1/2}
-            R_inv_v = R_cov.apply_inverse(v)
+            # Fallback for covariance matrices without apply_sqrt_inverse
+            import warnings
 
-            # Approximate sqrt via scaling (accurate for diagonal)
-            result = v.duplicate()
-            result.pointwiseMult(R_inv_v, v)
-            result.sqrtabs()
-            # Sign correction
-            signs = v.duplicate()
-            v.copy(signs)
-            signs.sign()
-            result.pointwiseMult(result, signs)
+            # Check if covariance is diagonal (has diagonal property or get_diagonal method)
+            if hasattr(R_cov, "is_diagonal") and R_cov.is_diagonal:
+                # For diagonal R, R^{-1/2} = diag(1/sqrt(r_ii))
+                # R^{-1/2} * v = v / sqrt(diag(R))
+                if hasattr(R_cov, "get_diagonal"):
+                    diag = R_cov.get_diagonal()
+                    result = v.copy()
+                    # Compute element-wise: result[i] = v[i] / sqrt(diag[i])
+                    diag_array = diag.getArray()
+                    result_array = result.getArray()
+                    result_array[:] = result_array / np.sqrt(diag_array)
+                    result.setArray(result_array)
+                    return result
 
-            return result
+            # For general non-diagonal covariance, warn and use identity as fallback
+            # This is a limitation - proper implementation would require Cholesky
+            warnings.warn(
+                "R^{-1/2} computation: covariance matrix does not have apply_sqrt_inverse "
+                "method and is not diagonal. Using identity matrix as fallback. "
+                "This may produce incorrect results for DC-WME cost function. "
+                "Consider implementing apply_sqrt_inverse in your covariance class.",
+                UserWarning,
+                stacklevel=2
+            )
+            return v.copy()
 
     def linearize(self, m: PETSc.Vec, time_index: int) -> "LinearizedQoI":
         """
@@ -788,6 +801,8 @@ class LinearizedWMEQoI(LinearizedQoI):
 
     def _apply_R_sqrt_inv(self, v: PETSc.Vec, time_index: int) -> PETSc.Vec:
         """Apply R^{-1/2} to vector."""
+        import warnings
+
         R_cov = self.R_cov
         if isinstance(R_cov, dict):
             R_cov = R_cov.get(time_index, R_cov.get(0, list(R_cov.values())[0]))
@@ -795,16 +810,27 @@ class LinearizedWMEQoI(LinearizedQoI):
         if hasattr(R_cov, "apply_sqrt_inverse"):
             return R_cov.apply_sqrt_inverse(v)
         else:
-            # Fallback for diagonal covariance
-            R_inv_v = R_cov.apply_inverse(v)
-            result = v.duplicate()
-            result.pointwiseMult(R_inv_v, v)
-            result.sqrtabs()
-            signs = v.duplicate()
-            v.copy(signs)
-            signs.sign()
-            result.pointwiseMult(result, signs)
-            return result
+            # Fallback for covariance matrices without apply_sqrt_inverse
+            # Check if covariance is diagonal
+            if hasattr(R_cov, "is_diagonal") and R_cov.is_diagonal:
+                if hasattr(R_cov, "get_diagonal"):
+                    diag = R_cov.get_diagonal()
+                    result = v.copy()
+                    diag_array = diag.getArray()
+                    result_array = result.getArray()
+                    result_array[:] = result_array / np.sqrt(diag_array)
+                    result.setArray(result_array)
+                    return result
+
+            # For general non-diagonal covariance, warn and use identity as fallback
+            warnings.warn(
+                "R^{-1/2} computation: covariance matrix does not have apply_sqrt_inverse "
+                "method and is not diagonal. Using identity matrix as fallback. "
+                "This may produce incorrect results for DC-WME adjoint.",
+                UserWarning,
+                stacklevel=2
+            )
+            return v.copy()
 
 
 class QoICovarianceEstimator:

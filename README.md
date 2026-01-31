@@ -145,7 +145,7 @@ dc_cost = DCWMEFourDVarCost(
 
 # Optimize
 optimizer = LBFGSOptimizer(cost, max_iter=50, gtol=1e-6)
-m_analysis = optimizer.minimize(m_b)
+m_analysis = optimizer.solve(m_b)
 ```
 
 ### MPI Parallel Execution

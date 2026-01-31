@@ -182,6 +182,18 @@ class CostFunction(ABC):
         )
         self._current_control = m.copy()
 
+        # Warn if Jacobians were requested but not stored
+        if store_jacobians and (self._jacobians is None or len(self._jacobians) == 0):
+            import warnings
+            warnings.warn(
+                "Jacobian caching was requested but no Jacobians were stored. "
+                "This will cause gradient computation to fail or produce incorrect results. "
+                "Ensure your forward model's time_loop is called with store_jacobians=True "
+                "and that observation_times are correctly specified.",
+                UserWarning,
+                stacklevel=3
+            )
+
         return self._trajectory, self._jacobians
 
     def _get_observation_covariance(self, k: int):

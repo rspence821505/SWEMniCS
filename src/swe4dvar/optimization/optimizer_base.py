@@ -227,7 +227,9 @@ class LineSearch:
 
             # Evaluate cost and gradient at trial point
             cost_trial = self.cost_function.value(x_trial)
-            self.cost_function.gradient(x_trial, grad_trial)
+            grad_trial_new = self.cost_function.gradient(x_trial)
+            grad_trial.copy(grad_trial_new)
+            grad_trial_new.destroy()
 
             # Check sufficient decrease (Armijo condition)
             armijo_threshold = cost_current + self.c1 * alpha * directional_derivative
@@ -319,7 +321,9 @@ class LineSearch:
             # Evaluate at trial point
             x_trial.waxpy(alpha, direction, x)
             cost_trial = self.cost_function.value(x_trial)
-            self.cost_function.gradient(x_trial, grad_trial)
+            grad_trial_new = self.cost_function.gradient(x_trial)
+            grad_trial.copy(grad_trial_new)
+            grad_trial_new.destroy()
 
             # Evaluate cost at alpha_lo for comparison
             x_lo = x.duplicate()

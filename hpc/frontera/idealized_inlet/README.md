@@ -392,7 +392,7 @@ sbatch --wrap="ibrun python run_experiment.py --restart"
 
 1. **TACC Support:** https://portal.tacc.utexas.edu/user-support
 2. **Frontera User Guide:** https://frontera-portal.tacc.utexas.edu/user-guide/
-3. **SWE4DVar Issues:** https://github.com/your-org/swe4dvar/issues
+3. **SWE4DVar Issues:** https://github.com/UT-CHG/SWE4DVar/issues
 
 ### Useful Commands
 

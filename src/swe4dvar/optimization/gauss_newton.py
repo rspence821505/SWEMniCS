@@ -39,10 +39,22 @@ class GaussNewtonOptimizer(Optimizer):
         Args:
             cost_function: 4D-Var cost function
             options: Optimizer options
+
+        Raises:
+            UserWarning: This optimizer is experimental and incomplete.
         """
+        warnings.warn(
+            "GaussNewtonOptimizer is EXPERIMENTAL and incomplete. "
+            "The TLM/Adjoint methods for Hessian-vector products are not implemented. "
+            "Use LBFGSOptimizer for production 4D-Var optimization.",
+            UserWarning,
+            stacklevel=2
+        )
         super().__init__(cost_function, options)
 
         # Trust region for globalization
+        if options is None:
+            options = {}
         self.trust_region = TrustRegion(radius_init=options.get("trust_radius", 1.0))
 
         # CG solver for inner iterations
