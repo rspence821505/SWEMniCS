@@ -252,12 +252,13 @@ class TangentLinearModel:
         delta_u_obs = perturbations[obs_time]
 
         # Apply observation operator (linearized if available)
+        # For linear observation operators like point interpolation, forward == forward_linearized
         if hasattr(observation_operator, "forward_linearized"):
             return observation_operator.forward_linearized(
-                delta_u_obs, self.trajectory[obs_time], time_index=obs_time
+                delta_u_obs, self.trajectory[obs_time]
             )
         else:
-            return observation_operator.forward(delta_u_obs, time_index=obs_time)
+            return observation_operator.forward(delta_u_obs)
 
     def _get_jacobian(self, n: int) -> PETSc.Mat:
         """

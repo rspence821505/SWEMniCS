@@ -237,6 +237,29 @@ SWE4DVar/
 - **[API Reference](docs/api_reference.md)** - Detailed API documentation
 - **[Notebooks](notebooks/)** - Interactive tutorials and examples
 
+## Known Issues
+
+The following issues have been identified and are being addressed:
+
+| Issue | Severity | Workaround |
+|-------|----------|------------|
+| Jacobian caching disabled by default | Critical | Pass `store_jacobians=True` to adjoint solver |
+| Gauss-Newton Hessian incomplete | Critical | Use L-BFGS optimizer instead |
+| R^{-1/2} fallback to identity | Critical | Ensure observation covariance is well-conditioned |
+
+**Important:** For reliable optimization results, always enable Jacobian caching:
+
+```python
+from swe4dvar.adjoint import ImplicitAdjointSolver
+
+adjoint = ImplicitAdjointSolver(
+    forward_model=solver,
+    store_jacobians=True  # Required for consistent gradients
+)
+```
+
+See [`outputs/reports/bug_hunt_report.md`](outputs/reports/bug_hunt_report.md) for the complete list of known issues.
+
 ## Testing
 
 ```bash

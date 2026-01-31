@@ -372,11 +372,15 @@ def main():
 
     total_time = time.time() - start_time
 
+    # Extract cost and gradient histories from convergence_history
+    cost_history = [h["cost"] for h in optimizer.convergence_history]
+    gradient_history = [h["grad_norm"] for h in optimizer.convergence_history]
+
     results = DAExperimentResults(
         method="4dvar",
         test_case="dam_break",
-        cost_history=optimizer.cost_history,
-        gradient_norm_history=optimizer.gradient_history,
+        cost_history=cost_history,
+        gradient_norm_history=gradient_history,
         background_error=background_error,
         analysis_error=analysis_error,
         error_reduction=error_reduction,

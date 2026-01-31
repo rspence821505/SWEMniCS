@@ -30,7 +30,21 @@ def is_discontinuous_space(function_space) -> bool:
         True if space uses DG (discontinuous) elements
     """
     element = function_space.element
-    basix_element = element.basix_element
+
+    # Try to get the basix_element - this may fail for mixed elements
+    try:
+        basix_element = element.basix_element
+    except RuntimeError:
+        # For mixed elements, basix_element raises RuntimeError
+        # Check if this is a mixed element with sub-elements
+        try:
+            if hasattr(element, "num_sub_elements") and element.num_sub_elements > 0:
+                # For mixed elements, return False - treat as CG
+                # This is safe because CG point evaluation works for both
+                return False
+        except:
+            pass
+        return False
 
     # Check if element has discontinuous property (newer Basix API)
     if hasattr(basix_element, "discontinuous"):
@@ -151,6 +165,14 @@ class PointObservationOperator(ObservationOperator):
         # Determine spatial dimension from mesh
         self.mesh = function_space.mesh
         self.gdim = self.mesh.geometry.dim
+
+        # Check if this is a mixed element space
+        element = function_space.element
+        try:
+            _ = element.basix_element
+            self.is_mixed = False
+        except RuntimeError:
+            self.is_mixed = True
 
         # Check if this is a DG space
         self.is_dg = is_discontinuous_space(function_space)
@@ -292,6 +314,16 @@ class PointObservationOperator(ObservationOperator):
 
         u.x.scatter_forward()
 
+        # For mixed spaces, extract subfunction for evaluation
+        if self.is_mixed:
+            # Default to first component (h) if no component specified
+            comp_idx = self.components[0] if self.components else 0
+            u_sub = u.sub(comp_idx)
+            # Need to collapse to get evaluable function
+            u_eval = u_sub.collapse()
+        else:
+            u_eval = u
+
         # Evaluate at local points
         n_local = len(self._local_points)
         local_values = np.zeros(n_local)
@@ -309,17 +341,10 @@ class PointObservationOperator(ObservationOperator):
                 weights = []
 
                 for cell in cells:
-                    value = u.eval(point.reshape(1, -1), cell)
+                    value = u_eval.eval(point.reshape(1, -1), cell)
 
-                    # Handle component selection
-                    if self.components is not None:
-                        # Handle both 1D and 2D arrays from eval
-                        if value.ndim > 1:
-                            val = value[0, self.components[0]]
-                        else:
-                            val = value[self.components[0]]
-                    else:
-                        val = value[0, 0] if value.ndim > 1 else value[0]
+                    # For collapsed mixed space, result is scalar
+                    val = value[0, 0] if value.ndim > 1 else value[0]
 
                     values.append(val)
 
@@ -342,10 +367,12 @@ class PointObservationOperator(ObservationOperator):
                 zip(self._local_points, self._local_cells)
             ):
                 # Evaluate at point in cell
-                value = u.eval(point.reshape(1, -1), cell)
+                value = u_eval.eval(point.reshape(1, -1), cell)
 
-                # Handle component selection for mixed spaces
-                if self.components is not None:
+                # For collapsed mixed space or scalar space, result is scalar
+                if self.is_mixed:
+                    local_values[i] = value[0, 0] if value.ndim > 1 else value[0]
+                elif self.components is not None:
                     # Handle both 1D and 2D arrays from eval
                     if value.ndim > 1:
                         local_values[i] = value[0, self.components[0]]
@@ -416,6 +443,15 @@ class PointObservationOperator(ObservationOperator):
         # Get innovation values
         innov_array = innovation.getArray()
 
+        # For mixed spaces, we need to get the sub-function space for adjoint
+        if self.is_mixed:
+            comp_idx = self.components[0] if self.components else 0
+            sub_space = self.function_space.sub(comp_idx)
+            sub_dofmap = sub_space.dofmap
+        else:
+            sub_space = None
+            sub_dofmap = None
+
         if self.is_dg:
             # DG: Distribute to ALL cells containing each point
             for local_idx, global_idx in enumerate(self._local_indices):
@@ -436,36 +472,40 @@ class PointObservationOperator(ObservationOperator):
                     cells_to_use = cells
 
                 for cell in cells_to_use:
-                    # Get cell DOFs
-                    cell_dofs = self.function_space.dofmap.cell_dofs(cell)
-
-                    # Evaluate basis functions at point
-                    basis_values = self._evaluate_basis_at_point(point, cell)
-
-                    # Add weighted contribution to state DOFs
-                    # For scalar spaces, add to all DOFs
-                    # For vector spaces with component selection, only add to selected component
-                    if self.components is not None:
-                        # Vector space - distribute only to selected component
-                        bs = self.function_space.dofmap.bs  # Block size
-                        for j in range(len(cell_dofs)):
-                            # Determine which component this DOF corresponds to
-                            dof_component = j % bs
-                            if dof_component == self.components[0]:
-                                basis_idx = j // bs  # Index into basis function array
-                                adj_state.setValue(
-                                    cell_dofs[j],
-                                    value * basis_values[basis_idx] * weight,
-                                    addv=PETSc.InsertMode.ADD,
-                                )
-                    else:
-                        # Scalar space - distribute to all DOFs
+                    if self.is_mixed:
+                        # For mixed spaces, only modify the observed component
+                        cell_dofs = sub_dofmap.cell_dofs(cell)
+                        basis_values = self._evaluate_basis_at_point_mixed(point, cell, sub_space)
                         for j, dof in enumerate(cell_dofs):
                             adj_state.setValue(
                                 dof,
                                 value * basis_values[j] * weight,
                                 addv=PETSc.InsertMode.ADD,
                             )
+                    else:
+                        # Get cell DOFs
+                        cell_dofs = self.function_space.dofmap.cell_dofs(cell)
+                        basis_values = self._evaluate_basis_at_point(point, cell)
+
+                        # Add weighted contribution to state DOFs
+                        if self.components is not None:
+                            bs = self.function_space.dofmap.bs
+                            for j in range(len(cell_dofs)):
+                                dof_component = j % bs
+                                if dof_component == self.components[0]:
+                                    basis_idx = j // bs
+                                    adj_state.setValue(
+                                        cell_dofs[j],
+                                        value * basis_values[basis_idx] * weight,
+                                        addv=PETSc.InsertMode.ADD,
+                                    )
+                        else:
+                            for j, dof in enumerate(cell_dofs):
+                                adj_state.setValue(
+                                    dof,
+                                    value * basis_values[j] * weight,
+                                    addv=PETSc.InsertMode.ADD,
+                                )
         else:
             # CG: Single cell per point (standard adjoint)
             for local_idx, global_idx in enumerate(self._local_indices):
@@ -473,32 +513,39 @@ class PointObservationOperator(ObservationOperator):
                 cell = self._local_cells[local_idx]
                 value = innov_array[global_idx]
 
-                # Get cell DOFs
-                cell_dofs = self.function_space.dofmap.cell_dofs(cell)
-
-                # Evaluate basis functions at point
-                basis_values = self._evaluate_basis_at_point(point, cell)
-
-                # Add contribution to state DOFs
-                if self.components is not None:
-                    # Vector space - distribute only to selected component
-                    bs = self.function_space.dofmap.bs  # Block size
-                    for j in range(len(cell_dofs)):
-                        # Determine which component this DOF corresponds to
-                        dof_component = j % bs
-                        if dof_component == self.components[0]:
-                            basis_idx = j // bs  # Index into basis function array
-                            adj_state.setValue(
-                                cell_dofs[j],
-                                value * basis_values[basis_idx],
-                                addv=PETSc.InsertMode.ADD,
-                            )
-                else:
-                    # Scalar space - distribute to all DOFs
+                if self.is_mixed:
+                    # For mixed spaces, only modify the observed component
+                    cell_dofs = sub_dofmap.cell_dofs(cell)
+                    basis_values = self._evaluate_basis_at_point_mixed(point, cell, sub_space)
                     for j, dof in enumerate(cell_dofs):
                         adj_state.setValue(
-                            dof, value * basis_values[j], addv=PETSc.InsertMode.ADD
+                            dof,
+                            value * basis_values[j],
+                            addv=PETSc.InsertMode.ADD,
                         )
+                else:
+                    # Get cell DOFs
+                    cell_dofs = self.function_space.dofmap.cell_dofs(cell)
+                    basis_values = self._evaluate_basis_at_point(point, cell)
+
+                    # Add contribution to state DOFs
+                    if self.components is not None:
+                        bs = self.function_space.dofmap.bs
+                        for j in range(len(cell_dofs)):
+                            dof_component = j % bs
+                            if dof_component == self.components[0]:
+                                basis_idx = j // bs
+                                adj_state.setValue(
+                                    cell_dofs[j],
+                                    value * basis_values[basis_idx],
+                                    addv=PETSc.InsertMode.ADD,
+                                )
+                    else:
+                        # Scalar space - distribute to all DOFs
+                        for j, dof in enumerate(cell_dofs):
+                            adj_state.setValue(
+                                dof, value * basis_values[j], addv=PETSc.InsertMode.ADD
+                            )
 
         # Assemble to finalize local additions
         adj_state.assemble()
@@ -553,6 +600,56 @@ class PointObservationOperator(ObservationOperator):
         else:
             # For higher-order elements, use basix directly
             basis = element.basix_element.tabulate(0, ref_point.reshape(1, -1))[0, :, 0]
+
+        return basis
+
+    def _evaluate_basis_at_point_mixed(
+        self, point: np.ndarray, cell: int, sub_space
+    ) -> np.ndarray:
+        """
+        Evaluate basis functions for a sub-space of a mixed element at a point.
+
+        Args:
+            point: Physical coordinates of evaluation point
+            cell: Cell index containing the point
+            sub_space: The sub-function space for the observed component
+
+        Returns:
+            Array of basis function values at point
+        """
+        mesh = self.mesh
+
+        # Get cell geometry
+        cell_vertices = mesh.geometry.x[mesh.geometry.dofmap[cell]]
+
+        # Map physical point to reference coordinates
+        ref_point = self._physical_to_reference(point, cell_vertices)
+
+        # Get the element from the sub-space
+        element = sub_space.element
+
+        # Try to get basix_element, if that fails use simple P1 basis
+        try:
+            basix_element = element.basix_element
+            degree = basix_element.degree
+        except RuntimeError:
+            # Default to P1 for sub-elements
+            degree = 1
+
+        # Evaluate basis functions at reference point
+        # For P1 elements in 2D: [1-xi-eta, xi, eta]
+        if degree == 1:
+            if self.gdim == 2:
+                xi, eta = ref_point[0], ref_point[1]
+                basis = np.array([1.0 - xi - eta, xi, eta])
+            elif self.gdim == 3:
+                xi, eta, zeta = ref_point[0], ref_point[1], ref_point[2]
+                basis = np.array([1.0 - xi - eta - zeta, xi, eta, zeta])
+            else:
+                raise NotImplementedError(f"Dimension {self.gdim} not supported")
+        else:
+            # For higher-order elements, use basix directly
+            basis = basix_element.tabulate(0, ref_point.reshape(1, -1))[0, :, 0]
 
         return basis
 

@@ -1,6 +1,7 @@
 from swe4dvar.forward.solvers import get_solver
 from swe4dvar.forward.adcirc_problem import ADCIRCProblem
 from swe4dvar import FrictionLaw
+from swe4dvar.utils.output_paths import DATA_DIR, ensure_output_dirs
 from mpi4py import MPI
 import numpy as np
 from swe4dvar.physics.constants import R
@@ -121,15 +122,15 @@ if __name__ == "__main__":
         )
         station_data = solver.vals
         station_index = solver.inds
-        import os
         import json
 
-        if not os.path.exists(plot_name):
-            os.makedirs(plot_name, exist_ok=True)
+        ensure_output_dirs()
+        output_subdir = DATA_DIR / plot_name
+        output_subdir.mkdir(parents=True, exist_ok=True)
 
         # only save runtime if plotting is turned off
         if args.no_plot:
-            with open(plot_name + "/results.json", "w") as fp:
+            with open(output_subdir / "results.json", "w") as fp:
                 info = {**vars(args)}
                 info["runtime"] = elapsed
                 info["nprocs"] = size
@@ -152,4 +153,4 @@ if __name__ == "__main__":
             )
             for c in stations_df.columns:
                 df[c] = stations_df[c].values[s_inds]
-            df.to_csv(plot_name + "/stations.csv", index=False)
+            df.to_csv(output_subdir / "stations.csv", index=False)

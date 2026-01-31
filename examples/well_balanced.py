@@ -1,5 +1,6 @@
 from swe4dvar.forward.problems import WellBalancedProblem
 from swe4dvar.forward import solvers as Solvers
+from swe4dvar.utils.output_paths import FIGURES_DIR, ensure_output_dirs
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
@@ -74,6 +75,7 @@ solver.time_loop(
 # prob.plot_solution(solver.u.sub(0),'Single_time_step')
 # print(solver.station_data.shape)
 if rank == 0:
+    ensure_output_dirs()
     # note that station data is array with shape nt x nstattion x 3 (h,u,v)
     plt.plot(
         np.linspace(0, t_f / (60 * 60 * 24), nt + 1),
@@ -86,7 +88,7 @@ if rank == 0:
     plt.grid(True)
     plt.xlabel("t(day)")
     plt.title("Tidal Height for Base CG Scheme")
-    plt.savefig("wellposed_height_CG.png")
+    plt.savefig(FIGURES_DIR / "wellposed_height_CG.png")
 
     plt.close()
 
@@ -101,7 +103,7 @@ if rank == 0:
     plt.grid(True)
     plt.xlabel("t(day)")
     plt.title("Tidal Velocity for Base CG Scheme")
-    plt.savefig("wellposed_velocity_CG.png")
+    plt.savefig(FIGURES_DIR / "wellposed_velocity_CG.png")
 
 # Your statements here
 

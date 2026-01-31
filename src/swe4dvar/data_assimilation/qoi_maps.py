@@ -154,7 +154,7 @@ class StandardQoI(QoIMap):
         u_k = trajectory[time_index]
 
         # Apply observation operator
-        return self.obs_op.forward(u_k, time_index=time_index)
+        return self.obs_op.forward(u_k)
 
     def linearize(self, m: PETSc.Vec, time_index: int) -> "LinearizedQoI":
         """
@@ -294,7 +294,7 @@ class WeightedMeanErrorQoI(QoIMap):
             u_j = trajectory[t_j]
 
             # Apply observation operator: H_j(u_j)
-            Hu_j = self.obs_op.forward(u_j, time_index=t_j)
+            Hu_j = self.obs_op.forward(u_j)
 
             # Innovation: d_j = H_j(u_j) - y_j
             d_j = Hu_j.duplicate()
@@ -524,9 +524,8 @@ class LinearizedStandardQoI(LinearizedQoI):
         delta_u_k = tlm.propagate(delta_m, target_time=self.k)
 
         # Apply observation operator (linearized at u_k)
-        delta_q = self.obs_op.forward_linearized(
-            delta_u_k, self._trajectory[self.k], time_index=self.k
-        )
+        # For linear observation operators like point interpolation, forward == forward_linearized
+        delta_q = self.obs_op.forward(delta_u_k)
 
         return delta_q
 
@@ -548,7 +547,7 @@ class LinearizedStandardQoI(LinearizedQoI):
             Perturbation in control space.
         """
         # Apply adjoint observation operator
-        delta_u_k = self.obs_op.adjoint(delta_q, time_index=self.k)
+        delta_u_k = self.obs_op.adjoint(delta_q)
 
         # Run adjoint from time k to 0
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
@@ -697,9 +696,8 @@ class LinearizedWMEQoI(LinearizedQoI):
             delta_u_j = tlm.propagate(delta_m, target_time=t_j)
 
             # Apply linearized observation operator
-            delta_Hu_j = self.obs_op.forward_linearized(
-                delta_u_j, self._trajectory[t_j], time_index=t_j
-            )
+            # For linear observation operators like point interpolation, forward == forward_linearized
+            delta_Hu_j = self.obs_op.forward(delta_u_j)
 
             # Apply R^{-1/2}
             scaled = self._apply_R_sqrt_inv(delta_Hu_j, t_j)
@@ -761,7 +759,7 @@ class LinearizedWMEQoI(LinearizedQoI):
             scaled = self._apply_R_sqrt_inv(delta_q_scaled, t_j)
 
             # Apply adjoint observation operator
-            delta_u_j = self.obs_op.adjoint(scaled, time_index=t_j)
+            delta_u_j = self.obs_op.adjoint(scaled)
 
             # Run adjoint from time j to 0
             if t_j > 0:

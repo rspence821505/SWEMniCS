@@ -1,5 +1,6 @@
 from swe4dvar.forward.problems import ConvergenceProblem
 from swe4dvar.forward.solvers import get_solver
+from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
@@ -106,9 +107,10 @@ def run_experiment(name):
     # prob.plot_solution(solver.u.sub(0),'Single_time_step')
     # print(solver.station_data.shape)
     # save array for post processing
-    np.savetxt(f"{name}_p1_stations_eta.csv", solver.vals[:, :, 0], delimiter=",")
-    np.savetxt(f"{name}_p1_stations_xvel.csv", solver.vals[:, :, 1], delimiter=",")
-    np.savetxt(f"{name}_p1_stations_yvel.csv", solver.vals[:, :, 2], delimiter=",")
+    ensure_output_dirs()
+    np.savetxt(DATA_DIR / f"{name}_p1_stations_eta.csv", solver.vals[:, :, 0], delimiter=",")
+    np.savetxt(DATA_DIR / f"{name}_p1_stations_xvel.csv", solver.vals[:, :, 1], delimiter=",")
+    np.savetxt(DATA_DIR / f"{name}_p1_stations_yvel.csv", solver.vals[:, :, 2], delimiter=",")
     if rank == 0:
         # plt_nums = [0, 1, 2, 8]
         # note that station data is array with shape nt x nstattion x 3 (h,u,v)
@@ -128,7 +130,7 @@ def run_experiment(name):
         plt.ylabel("surface elevation(m)")
         plt.title(f"Surface Elevation for {name} Scheme")
         plt.legend()
-        plt.savefig(f"Tidal_height_{name}_order1_dt.png")
+        plt.savefig(FIGURES_DIR / f"Tidal_height_{name}_order1_dt.png")
         plt.close()
         plt.figure()
         plt.plot(t, vel_exact, "k", label="Exact solution")
@@ -144,7 +146,7 @@ def run_experiment(name):
         plt.xlabel("t(day)")
         plt.title(f"Tidal Velocity for {name} Scheme")
         plt.legend()
-        plt.savefig(f"Tidal_velocity_{name}.png")
+        plt.savefig(FIGURES_DIR / f"Tidal_velocity_{name}.png")
 
     # Your statements here
 

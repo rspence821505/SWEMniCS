@@ -1,11 +1,11 @@
 from swe4dvar.forward.problems import RainProblem
 from swe4dvar.forward import solvers as Solvers
+from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
 import timeit
 import argparse as ap
-import os
 
 
 def run_experiment(name, outdir=None, **kwargs):
@@ -75,15 +75,15 @@ def run_experiment(name, outdir=None, **kwargs):
     # prob.plot_solution(solver.u.sub(0),'Single_time_step')
     # print(solver.station_data.shape)
     # save array for post processing
-    if outdir is not None:
-        os.makedirs(outdir, exist_ok=True)
-    outdir = "" if outdir is None else outdir + "/"
-    np.savetxt(f"{outdir}{name}_p1_stations_h.csv", solver.vals[:, :, 0], delimiter=",")
+    ensure_output_dirs()
+    data_outdir = DATA_DIR if outdir is None else DATA_DIR / outdir
+    data_outdir.mkdir(parents=True, exist_ok=True)
+    np.savetxt(data_outdir / f"{name}_p1_stations_h.csv", solver.vals[:, :, 0], delimiter=",")
     np.savetxt(
-        f"{outdir}{name}_p1_stations_xvel.csv", solver.vals[:, :, 1], delimiter=","
+        data_outdir / f"{name}_p1_stations_xvel.csv", solver.vals[:, :, 1], delimiter=","
     )
     np.savetxt(
-        f"{outdir}{name}_p1_stations_yvel.csv", solver.vals[:, :, 2], delimiter=","
+        data_outdir / f"{name}_p1_stations_yvel.csv", solver.vals[:, :, 2], delimiter=","
     )
     if rank == 0:
         plt_nums = [0, nt]
@@ -106,7 +106,9 @@ def run_experiment(name, outdir=None, **kwargs):
         plt.ylabel("surface elevation(m)")
         plt.title(f"Surface Elevation for {name} Scheme")
         plt.legend()
-        plt.savefig(f"{outdir}rain_height_{name}_order1_dt.png")
+        fig_outdir = FIGURES_DIR if outdir is None else FIGURES_DIR / outdir
+        fig_outdir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(fig_outdir / f"rain_height_{name}_order1_dt.png")
         plt.close()
         # plt.plot(np.linspace(0,t_f/(60*60*24),nt+1), solver.vals[:nt+1,0,1], "k", linewidth=2, label="u at 800 m")
         # plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")

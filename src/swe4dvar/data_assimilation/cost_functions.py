@@ -342,7 +342,7 @@ class FourDVarCost(CostFunction):
             u_k = trajectory[k]
 
             # Apply observation operator: H_k(u_k)
-            Hu_k = self.obs_op.forward(u_k, time_index=k)
+            Hu_k = self.obs_op.forward(u_k)
 
             # Compute innovation: d_k = H_k(u_k) - y_k
             d_k = Hu_k.duplicate()
@@ -448,7 +448,7 @@ class FourDVarCost(CostFunction):
             u_k = trajectory[k]
 
             # Forward observation: H_k(u_k)
-            Hu_k = self.obs_op.forward(u_k, time_index=k)
+            Hu_k = self.obs_op.forward(u_k)
 
             # Innovation: d_k = H_k(u_k) - y_k
             d_k = Hu_k.duplicate()
@@ -459,7 +459,7 @@ class FourDVarCost(CostFunction):
             R_inv_d = R_k.apply_inverse(d_k)
 
             # Apply adjoint observation operator: H_k^T R_k^{-1} d_k
-            forcings[k] = self.obs_op.adjoint(R_inv_d, time_index=k)
+            forcings[k] = self.obs_op.adjoint(R_inv_d)
 
         return forcings
 

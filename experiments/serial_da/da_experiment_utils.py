@@ -269,7 +269,7 @@ def generate_observations(
             raise IndexError(f"Observation time {k} exceeds trajectory length {len(trajectory)}")
 
         # Apply observation operator to get true observation
-        H_u = obs_operator.forward(trajectory[k], time_index=k)
+        H_u = obs_operator.forward(trajectory[k])
         H_u_array = H_u.getArray()
 
         # Compute noise standard deviation based on signal magnitude
@@ -404,7 +404,7 @@ def compute_innovation_statistics(
     all_innovations = []
 
     for i, k in enumerate(obs_times):
-        H_u = obs_operator.forward(trajectory[k], time_index=k)
+        H_u = obs_operator.forward(trajectory[k])
         H_u_array = H_u.getArray()
         y_array = observations[i].getArray()
 

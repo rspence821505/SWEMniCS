@@ -8,13 +8,8 @@ and convergence monitoring.
 import pytest
 import numpy as np
 from petsc4py import PETSc
-import sys
-import os
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from optimizer_base import (
+from swe4dvar.optimization.optimizer_base import (
     Optimizer,
     LineSearch,
     TrustRegion,

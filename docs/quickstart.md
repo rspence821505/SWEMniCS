@@ -119,13 +119,15 @@ for state in solver.saved_states:
     eta = state.split()[0]  # First component is elevation
     elevations.append(eta.x.array.mean())
 
+from swe4dvar.utils import get_figure_path
+
 plt.figure(figsize=(10, 4))
 plt.plot(times, elevations)
 plt.xlabel("Time (hours)")
 plt.ylabel("Mean Elevation (m)")
 plt.title("Tidal Flow Simulation")
 plt.grid(True)
-plt.savefig("outputs/figures/tidal_elevation.png", dpi=150)
+plt.savefig(get_figure_path("tidal_elevation.png"), dpi=150)
 plt.show()
 ```
 

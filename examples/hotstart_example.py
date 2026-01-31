@@ -1,5 +1,6 @@
 from swe4dvar.forward.problems import SlopedBeachProblem
 from swe4dvar.forward import solvers as Solvers
+from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
@@ -113,13 +114,14 @@ final_u,_,_= solver.time_loop(solver_parameters=params,stations=stations,plot_ev
 #prob.plot_solution(solver.u.sub(0),'Single_time_step')
 #print(solver.station_data.shape)
 if rank ==0:
+	ensure_output_dirs()
 	#note that station data is array with shape nt x nstattion x 3 (h,u,v)
 	plt.plot(np.linspace(0,t_f/(60*60*24),nt+1), solver.vals[:nt+1,0,0], "k", linewidth=2, label="h at 800 m")
 	#plt.plot(points_on_proc[:, 1], p_values, "b--", linewidth = 2, label="Load")
 	plt.grid(True)
 	plt.xlabel("t(day)")
 	plt.title('Tidal Height for SUPG Scheme')
-	plt.savefig("tidal_height_SUPG.png")
+	plt.savefig(FIGURES_DIR / "tidal_height_SUPG.png")
 
 	plt.close()
 
@@ -128,10 +130,10 @@ if rank ==0:
 	plt.grid(True)
 	plt.xlabel("t(day)")
 	plt.title('Tidal Velocity for SUPG Scheme')
-	plt.savefig("tidal_velocity_SUPG.png")
-	np.savetxt(f"{name}_p1_wse.csv", solver.vals[:,:,0], delimiter=",")
-	np.savetxt(f"{name}_p1_xvel.csv", solver.vals[:,:,1], delimiter=",")
-	np.savetxt(f"{name}_p1_yvel.csv", solver.vals[:,:,2], delimiter=",")
+	plt.savefig(FIGURES_DIR / "tidal_velocity_SUPG.png")
+	np.savetxt(DATA_DIR / f"{name}_p1_wse.csv", solver.vals[:,:,0], delimiter=",")
+	np.savetxt(DATA_DIR / f"{name}_p1_xvel.csv", solver.vals[:,:,1], delimiter=",")
+	np.savetxt(DATA_DIR / f"{name}_p1_yvel.csv", solver.vals[:,:,2], delimiter=",")
 
 #Your statements here
 

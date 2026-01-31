@@ -68,12 +68,24 @@ def parse_args():
     parser.add_argument("--nx", type=int, default=10, help="Elements in x direction")
     parser.add_argument("--ny", type=int, default=5, help="Elements in y direction")
     parser.add_argument("--dt", type=float, default=3600.0, help="Time step (seconds)")
-    parser.add_argument("--final-time", type=float, default=24*3600.0, help="Final time (seconds)")
-    parser.add_argument("--obs-fraction", type=float, default=0.5, help="Fraction of points to observe")
-    parser.add_argument("--obs-frequency", type=int, default=1, help="Observe every N timesteps")
-    parser.add_argument("--noise-level", type=float, default=0.01, help="Observation noise level")
-    parser.add_argument("--background-error", type=float, default=0.1, help="Background error std")
-    parser.add_argument("--max-iter", type=int, default=50, help="Max L-BFGS iterations")
+    parser.add_argument(
+        "--final-time", type=float, default=24 * 3600.0, help="Final time (seconds)"
+    )
+    parser.add_argument(
+        "--obs-fraction", type=float, default=0.5, help="Fraction of points to observe"
+    )
+    parser.add_argument(
+        "--obs-frequency", type=int, default=1, help="Observe every N timesteps"
+    )
+    parser.add_argument(
+        "--noise-level", type=float, default=0.01, help="Observation noise level"
+    )
+    parser.add_argument(
+        "--background-error", type=float, default=0.1, help="Background error std"
+    )
+    parser.add_argument(
+        "--max-iter", type=int, default=50, help="Max L-BFGS iterations"
+    )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     return parser.parse_args()
 
@@ -93,7 +105,7 @@ def main():
         ny=args.ny,
         dt=args.dt,
         final_time=args.final_time,
-        solver_type="CG",
+        solver_type="SUPG",
         obs_fraction=args.obs_fraction,
         obs_frequency=args.obs_frequency,
         obs_noise_level=args.noise_level,
@@ -183,25 +195,23 @@ def main():
 
     # Generate observation points
     obs_points = generate_observation_points(
-        problem.mesh,
-        fraction=config.obs_fraction,
-        seed=42
+        problem.mesh, fraction=config.obs_fraction, seed=42
     )
 
     if rank == 0:
         print(f"  Observation points: {len(obs_points)}")
 
     # Create observation operator
-    obs_operator = PointObservationOperator(
-        solver.V,
-        obs_points,
-        comm=comm
-    )
+    obs_operator = PointObservationOperator(solver.V, obs_points, comm=comm)
 
     # Determine observation times (hourly = every obs_frequency timesteps)
-    obs_times = list(range(config.obs_frequency, num_time_steps + 1, config.obs_frequency))
+    obs_times = list(
+        range(config.obs_frequency, num_time_steps + 1, config.obs_frequency)
+    )
     if rank == 0:
-        print(f"  Observation times: {len(obs_times)} (every {config.obs_frequency} timesteps)")
+        print(
+            f"  Observation times: {len(obs_times)} (every {config.obs_frequency} timesteps)"
+        )
 
     # Generate observations with noise
     observations, obs_noise_stds = generate_observations(
@@ -209,7 +219,7 @@ def main():
         obs_operator,
         obs_times,
         noise_level=config.obs_noise_level,
-        seed=42
+        seed=42,
     )
 
     if rank == 0:
@@ -222,9 +232,7 @@ def main():
         print("\nStep 3: Setting up background state...")
 
     m_background = generate_background_state(
-        m_true,
-        error_std=config.background_error_std,
-        seed=123
+        m_true, error_std=config.background_error_std, seed=123
     )
 
     background_error = compute_rms_error(m_background, m_true, comm)
@@ -245,7 +253,9 @@ def main():
     B = DiagonalCovariance(comm, state_size, variance=background_variance)
 
     if rank == 0:
-        print(f"  Background covariance: diagonal, variance = {background_variance:.6e}")
+        print(
+            f"  Background covariance: diagonal, variance = {background_variance:.6e}"
+        )
 
     # Observation covariance: diagonal based on noise level
     n_obs = obs_operator.get_num_observations()
@@ -300,7 +310,7 @@ def main():
             "gradient_tolerance": config.gradient_tolerance,
             "cost_tolerance": config.cost_tolerance,
             "verbose": (rank == 0),
-        }
+        },
     )
 
     opt_start = time.time()
@@ -364,11 +374,15 @@ def main():
 
     total_time = time.time() - start_time
 
+    # Extract cost and gradient histories from convergence_history
+    cost_history = [h["cost"] for h in optimizer.convergence_history]
+    gradient_history = [h["grad_norm"] for h in optimizer.convergence_history]
+
     results = DAExperimentResults(
         method="dcwme",
         test_case="tidal",
-        cost_history=optimizer.cost_history,
-        gradient_norm_history=optimizer.gradient_history,
+        cost_history=cost_history,
+        gradient_norm_history=gradient_history,
         background_error=background_error,
         analysis_error=analysis_error,
         error_reduction=error_reduction,
