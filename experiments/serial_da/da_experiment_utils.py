@@ -219,6 +219,41 @@ class ForwardModelWrapper:
         """Return size of state vector."""
         return self.solver.u.x.array.shape[0]
 
+    def get_mass_matrix(self) -> PETSc.Mat:
+        """
+        Assemble and return the FEM mass matrix.
+
+        The mass matrix is essential for proper BDF2 adjoint time-coupling.
+        Without it, the adjoint solver uses an identity matrix which causes
+        numerical issues with large time steps.
+
+        Returns
+        -------
+        PETSc.Mat
+            Assembled mass matrix M where M_ij = ∫ φ_i φ_j dx
+        """
+        from dolfinx import fem
+        from ufl import inner, dx, TrialFunction, TestFunction
+
+        if not hasattr(self, '_mass_matrix'):
+            # Get function space
+            V = self.solver.V
+
+            # Create trial and test functions
+            u = TrialFunction(V)
+            v = TestFunction(V)
+
+            # Mass form: M = ∫ u · v dx
+            a = inner(u, v) * dx
+
+            # Assemble mass matrix
+            M = fem.petsc.assemble_matrix(fem.form(a))
+            M.assemble()
+
+            self._mass_matrix = M
+
+        return self._mass_matrix
+
 
 def generate_observation_points(
     mesh,
@@ -586,6 +621,24 @@ def create_tao_optimizer(
     if use_bounds:
         lower, upper = create_physical_bounds(m_template, h_min=h_min)
         tao_type = "blmvm"  # Bounded L-BFGS
+
+        # Project initial point onto feasible region if needed
+        m_arr = m_template.getArray()
+        lo_arr = lower.getArray()
+        up_arr = upper.getArray()
+
+        # Check for bound violations and warn
+        below = m_arr < lo_arr
+        above = m_arr > up_arr
+        if below.any() or above.any():
+            import warnings
+            n_violations = below.sum() + above.sum()
+            warnings.warn(
+                f"Initial point violates {n_violations} bounds. "
+                "TAO will project to feasible region.",
+                RuntimeWarning,
+                stacklevel=2
+            )
     else:
         lower, upper = None, None
         tao_type = "lmvm"  # Standard L-BFGS

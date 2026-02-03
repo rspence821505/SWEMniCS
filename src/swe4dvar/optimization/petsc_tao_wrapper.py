@@ -204,7 +204,9 @@ class PETScTAOWrapper(Optimizer):
                     g.zeroEntries()
                     return 1e20
 
-                g.copy(grad)
+                # Copy gradient values into output vector g
+                # PETSc copy: source.copy(dest) copies FROM source TO dest
+                grad.copy(g)
                 grad.destroy()
                 return f
             else:
@@ -219,7 +221,8 @@ class PETScTAOWrapper(Optimizer):
 
                 # Compute gradient
                 grad = self.cost_function.gradient(x)
-                g.copy(grad)
+                # Copy gradient values into output vector g
+                grad.copy(g)
                 grad.destroy()
                 self.n_grad_evals += 1
 

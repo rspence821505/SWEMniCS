@@ -165,7 +165,15 @@ class CostFunction(ABC):
         str
             MD5 hash string.
         """
-        m_bytes = m.getArray().tobytes()
+        # Make a copy first to handle TAO vectors that may not allow direct array access
+        # (TAO vectors can be in a special read-only state)
+        try:
+            m_bytes = m.getArray().tobytes()
+        except Exception:
+            # Fall back to copying the vector first
+            m_copy = m.copy()
+            m_bytes = m_copy.getArray().tobytes()
+            m_copy.destroy()
         return hashlib.md5(m_bytes).hexdigest()
 
     def _run_forward_model(
@@ -533,7 +541,11 @@ class FourDVarCost(CostFunction):
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
 
         # Check if forward model has a variational form (for BDF2 time coefficients)
+        # Look in multiple places since forward_model may be a wrapper
         variational_form = getattr(self.forward_model, 'var_form', None)
+        if variational_form is None and hasattr(self.forward_model, 'solver'):
+            # ForwardModelWrapper wraps the actual solver
+            variational_form = getattr(self.forward_model.solver, 'var_form', None)
 
         adjoint_solver = ImplicitAdjointSolver(
             self.forward_model,
