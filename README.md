@@ -23,9 +23,11 @@ A comprehensive Python framework for solving the shallow water equations using F
 - **Checkpointing**: Memory-efficient strategies for long time windows
 
 ### Optimization
-- **L-BFGS**: Limited-memory BFGS optimizer
+- **PETSc TAO** (Recommended): Production-grade optimization via PETSc's TAO library
+  - L-BFGS, Bounded L-BFGS, Newton Trust Region, Conjugate Gradient
+  - Battle-tested line search and convergence monitoring
+- **L-BFGS**: Custom limited-memory BFGS optimizer (legacy)
 - **Gauss-Newton**: Second-order optimization with Hessian-vector products
-- **PETSc TAO**: Integration with PETSc's optimization toolkit
 
 ### Parallelization
 - **Full MPI Support**: Scalable to thousands of cores
@@ -118,7 +120,7 @@ solver.time_loop(
 from swe4dvar.data_assimilation import (
     FourDVarCost, DCWMEFourDVarCost, create_cost_function
 )
-from swe4dvar.optimization.lbfgs import LBFGSOptimizer
+from swe4dvar.optimization import TAOOptimizerFactory
 
 # Setup cost function
 cost = FourDVarCost(
@@ -143,8 +145,12 @@ dc_cost = DCWMEFourDVarCost(
     obs_times=obs_times
 )
 
-# Optimize
-optimizer = LBFGSOptimizer(cost, max_iter=50, gtol=1e-6)
+# Optimize with PETSc TAO L-BFGS (Recommended)
+optimizer = TAOOptimizerFactory.create_lbfgs(
+    cost,
+    memory_size=10,
+    options={'max_iterations': 50, 'gradient_tolerance': 1e-6, 'verbose': True}
+)
 m_analysis = optimizer.solve(m_b)
 ```
 
