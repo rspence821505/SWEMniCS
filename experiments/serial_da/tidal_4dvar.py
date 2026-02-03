@@ -10,7 +10,15 @@ Twin Experiment Setup:
 2. Sample observations at 50% of spatial points with hourly frequency
 3. Add 1% Gaussian noise to observations
 4. Define background state with 10% error from truth
-5. Minimize 4D-Var cost function using L-BFGS
+5. Minimize 4D-Var cost function using PETSc TAO L-BFGS (default)
+
+Optimizer Options:
+    - Default: PETSc TAO bounded L-BFGS (blmvm) with physical constraints
+    - --no-bounds: Use unbounded TAO L-BFGS (lmvm)
+    - --use-legacy-lbfgs: Use custom L-BFGS implementation (deprecated)
+
+Note: Shallow water 4D-Var optimization can be challenging due to
+nonlinear dynamics. Line search failures may occur with large perturbations.
 
 Usage:
     python tidal_4dvar.py [--nx 10] [--ny 5] [--dt 3600] [--final-time 86400]
@@ -19,6 +27,7 @@ Usage:
 import argparse
 import time
 import sys
+import warnings
 import numpy as np
 from pathlib import Path
 from mpi4py import MPI
@@ -34,7 +43,6 @@ from swe4dvar.data_assimilation import (
     DiagonalCovariance,
     PointObservationOperator,
 )
-from swe4dvar.optimization.lbfgs import LBFGSOptimizer
 from swe4dvar.utils import get_default_solver_params
 from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
 
@@ -81,8 +89,12 @@ def parse_args():
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
-        "--use-tao", action="store_true",
-        help="Use PETSc TAO with bounded L-BFGS (more robust for shallow water)"
+        "--use-legacy-lbfgs", action="store_true",
+        help="Use legacy custom L-BFGS instead of TAO (deprecated)"
+    )
+    parser.add_argument(
+        "--no-bounds", action="store_true",
+        help="Use unbounded TAO L-BFGS (lmvm) instead of bounded (blmvm)"
     )
     parser.add_argument(
         "--h-min", type=float, default=0.01,
@@ -305,26 +317,37 @@ def main():
         "verbose": (rank == 0),
     }
 
-    if args.use_tao:
+    if args.use_legacy_lbfgs:
+        # Legacy L-BFGS (deprecated)
         if rank == 0:
-            print("\nStep 7: Running TAO bounded L-BFGS optimization...")
-            print(f"  Using h_min = {args.h_min} for water depth bound")
+            print("\nStep 7: Running legacy L-BFGS optimization...")
+            print("  WARNING: Legacy L-BFGS is deprecated. Consider using TAO.")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            from swe4dvar.optimization.lbfgs import LBFGSOptimizer
+            optimizer = LBFGSOptimizer(
+                cost_function,
+                memory_size=config.lbfgs_memory,
+                options=opt_options,
+            )
+    else:
+        # TAO optimizer (default, recommended)
+        use_bounds = not args.no_bounds
+        if rank == 0:
+            if use_bounds:
+                print("\nStep 7: Running TAO bounded L-BFGS optimization...")
+                print(f"  Using h_min = {args.h_min} for water depth bound")
+            else:
+                print("\nStep 7: Running TAO unbounded L-BFGS optimization...")
+            print("  Note: Line search failures may occur with challenging problems.")
 
         optimizer = create_tao_optimizer(
             cost_function,
             m_background,
             options=opt_options,
-            use_bounds=True,
+            use_bounds=use_bounds,
             h_min=args.h_min,
-        )
-    else:
-        if rank == 0:
-            print("\nStep 7: Running L-BFGS optimization...")
-
-        optimizer = LBFGSOptimizer(
-            cost_function,
-            memory_size=config.lbfgs_memory,
-            options=opt_options,
         )
 
     opt_start = time.time()

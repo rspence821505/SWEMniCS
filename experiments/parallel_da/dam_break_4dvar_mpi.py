@@ -13,6 +13,14 @@ The dam break problem features:
 - Rapid flow dynamics with shock formation
 - No friction for analytical comparison
 
+Optimizer Options:
+    - Default: PETSc TAO bounded L-BFGS (blmvm) with physical constraints
+    - --no-bounds: Use unbounded TAO L-BFGS (lmvm)
+    - --use-legacy-lbfgs: Use custom L-BFGS implementation (deprecated)
+
+Note: Shallow water 4D-Var optimization can be challenging due to
+nonlinear dynamics. Line search failures may occur with large perturbations.
+
 Usage:
     mpirun -n 4 python dam_break_4dvar_mpi.py [--nx 30] [--ny 30] [--dt 0.5]
 """
@@ -21,6 +29,7 @@ import argparse
 import time
 import sys
 import json
+import warnings
 import numpy as np
 from pathlib import Path
 from mpi4py import MPI
@@ -37,7 +46,6 @@ from swe4dvar.data_assimilation import (
     DiagonalCovariance,
     PointObservationOperator,
 )
-from swe4dvar.optimization.lbfgs import LBFGSOptimizer
 from swe4dvar.utils import get_default_solver_params
 from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
 from swe4dvar.utils.parallel_ops import ParallelTimer
@@ -54,6 +62,7 @@ from da_experiment_utils import (
     compute_rms_error,
     compute_innovation_statistics,
     save_experiment_results,
+    create_tao_optimizer,
 )
 
 
@@ -76,6 +85,18 @@ def parse_args():
                         help="Solver type")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--profile", action="store_true", help="Enable detailed timing")
+    parser.add_argument(
+        "--use-legacy-lbfgs", action="store_true",
+        help="Use legacy custom L-BFGS instead of TAO (deprecated)"
+    )
+    parser.add_argument(
+        "--no-bounds", action="store_true",
+        help="Use unbounded TAO L-BFGS (lmvm) instead of bounded (blmvm)"
+    )
+    parser.add_argument(
+        "--h-min", type=float, default=0.01,
+        help="Minimum water depth for bounded optimization"
+    )
     return parser.parse_args()
 
 
@@ -323,21 +344,47 @@ def main():
     # =========================================================================
     # Step 8: Run optimization
     # =========================================================================
-    if rank == 0:
-        print("\nStep 7: Running L-BFGS optimization...")
+    opt_options = {
+        "max_iterations": config.max_iterations,
+        "gradient_tolerance": config.gradient_tolerance,
+        "cost_tolerance": config.cost_tolerance,
+        "verbose": (rank == 0),
+    }
 
     timer.start("optimization")
 
-    optimizer = LBFGSOptimizer(
-        cost_function,
-        memory_size=config.lbfgs_memory,
-        options={
-            "max_iterations": config.max_iterations,
-            "gradient_tolerance": config.gradient_tolerance,
-            "cost_tolerance": config.cost_tolerance,
-            "verbose": (rank == 0),
-        }
-    )
+    if args.use_legacy_lbfgs:
+        # Legacy L-BFGS (deprecated)
+        if rank == 0:
+            print("\nStep 7: Running legacy L-BFGS optimization...")
+            print("  WARNING: Legacy L-BFGS is deprecated. Consider using TAO.")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            from swe4dvar.optimization.lbfgs import LBFGSOptimizer
+            optimizer = LBFGSOptimizer(
+                cost_function,
+                memory_size=config.lbfgs_memory,
+                options=opt_options,
+            )
+    else:
+        # TAO optimizer (default, recommended)
+        use_bounds = not args.no_bounds
+        if rank == 0:
+            if use_bounds:
+                print("\nStep 7: Running TAO bounded L-BFGS optimization...")
+                print(f"  Using h_min = {args.h_min} for water depth bound")
+            else:
+                print("\nStep 7: Running TAO unbounded L-BFGS optimization...")
+            print("  Note: Line search failures may occur with challenging problems.")
+
+        optimizer = create_tao_optimizer(
+            cost_function,
+            m_background,
+            options=opt_options,
+            use_bounds=use_bounds,
+            h_min=args.h_min,
+        )
 
     opt_start = time.time()
     m_analysis = optimizer.solve(m_background.copy())
