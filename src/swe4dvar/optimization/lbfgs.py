@@ -4,6 +4,17 @@ Limited-memory BFGS (L-BFGS) optimizer.
 Efficient quasi-Newton method for large-scale unconstrained optimization.
 Uses two-loop recursion to compute search directions.
 
+.. deprecated::
+    For production use, prefer PETScTAOWrapper or TAOOptimizerFactory
+    from swe4dvar.optimization. TAO provides battle-tested optimization
+    algorithms with robust line search and convergence monitoring.
+
+    Example::
+
+        from swe4dvar.optimization import TAOOptimizerFactory
+        optimizer = TAOOptimizerFactory.create_lbfgs(cost_function, memory_size=10)
+        solution = optimizer.solve(initial_guess)
+
 References:
     Liu, D. C., & Nocedal, J. (1989). On the limited memory BFGS method for
     large scale optimization. Mathematical programming, 45(1-3), 503-528.
@@ -12,6 +23,7 @@ References:
 from typing import List, Tuple, Optional
 from petsc4py import PETSc
 import numpy as np
+import warnings
 from mpi4py import MPI
 
 from .optimizer_base import Optimizer, LineSearch
@@ -30,6 +42,10 @@ class LBFGSOptimizer(Optimizer):
 
     These are used to implicitly represent an approximation to H_k ≈ (∇²f)^{-1}
     via the two-loop recursion algorithm.
+
+    .. deprecated::
+        For production use, prefer ``TAOOptimizerFactory.create_lbfgs()``
+        which provides a more robust and well-tested implementation.
     """
 
     def __init__(
@@ -52,7 +68,17 @@ class LBFGSOptimizer(Optimizer):
                 - line_search_c2: Wolfe parameter for line search (default: 0.9)
                 - line_search_max_iter: Max line search iterations (default: 20)
                 - verbose: Print iteration info (default: False)
+
+        .. deprecated::
+            Consider using ``TAOOptimizerFactory.create_lbfgs()`` instead.
         """
+        warnings.warn(
+            "LBFGSOptimizer is deprecated for production use. "
+            "Consider using TAOOptimizerFactory.create_lbfgs() instead, "
+            "which provides a more robust implementation with better convergence properties.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         super().__init__(cost_function, options)
 
         self.m = memory_size  # Memory size
@@ -368,6 +394,10 @@ class PreconditionedLBFGS(LBFGSOptimizer):
         - Diagonal scaling (Jacobi)
         - Approximate inverse Hessian
         - Background error covariance B in 4D-Var context
+
+    .. deprecated::
+        For production use, prefer ``TAOOptimizerFactory.create_lbfgs()``
+        which provides a more robust implementation.
     """
 
     def __init__(
@@ -441,6 +471,11 @@ class BoundedLBFGS(LBFGSOptimizer):
 
     Note: Full L-BFGS-B implementation is complex. This is a simplified
     version using projected gradient and projected line search.
+
+    .. deprecated::
+        For production use with box constraints, prefer
+        ``TAOOptimizerFactory.create_bounded_lbfgs()`` which provides
+        a complete L-BFGS-B implementation with full active set handling.
     """
 
     def __init__(

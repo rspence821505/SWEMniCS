@@ -179,6 +179,11 @@ class PETScTAOWrapper(Optimizer):
         TAO requires combined function that returns objective value
         and fills gradient vector.
 
+        Uses the efficient value_gradient() method when available, which
+        computes both value and gradient in a single forward/adjoint pass.
+        This avoids the double forward model execution that would occur
+        if value() and gradient() were called separately.
+
         Args:
             tao: TAO solver object
             x: Current iterate
@@ -188,23 +193,37 @@ class PETScTAOWrapper(Optimizer):
             Objective function value
         """
         try:
-            # Compute objective
-            f = self.cost_function.value(x)
-            self.n_func_evals += 1
+            # Use efficient combined method if available (avoids double forward solve)
+            if hasattr(self.cost_function, 'value_gradient'):
+                f, grad = self.cost_function.value_gradient(x)
+                self.n_func_evals += 1
+                self.n_grad_evals += 1
 
-            # Check for infinity (forward model failure)
-            if not np.isfinite(f):
-                # Return large value and zero gradient to signal bad point
-                g.zeroEntries()
-                return 1e20
+                # Check for infinity (forward model failure)
+                if not np.isfinite(f):
+                    g.zeroEntries()
+                    return 1e20
 
-            # Compute gradient
-            grad = self.cost_function.gradient(x)
-            g.copy(grad)
-            grad.destroy()
-            self.n_grad_evals += 1
+                g.copy(grad)
+                grad.destroy()
+                return f
+            else:
+                # Fallback to separate calls (less efficient, but works with any cost function)
+                f = self.cost_function.value(x)
+                self.n_func_evals += 1
 
-            return f
+                # Check for infinity (forward model failure)
+                if not np.isfinite(f):
+                    g.zeroEntries()
+                    return 1e20
+
+                # Compute gradient
+                grad = self.cost_function.gradient(x)
+                g.copy(grad)
+                grad.destroy()
+                self.n_grad_evals += 1
+
+                return f
         except Exception as e:
             # Forward model failed - return large cost and zero gradient
             import warnings

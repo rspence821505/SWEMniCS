@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from petsc4py import PETSc
 from mpi4py import MPI
 import numpy as np
+import hashlib
 
 
 @dataclass
@@ -93,6 +94,7 @@ class CostFunction(ABC):
         self._trajectory: Optional[List[PETSc.Vec]] = None
         self._jacobians: Optional[List[PETSc.Mat]] = None
         self._current_control: Optional[PETSc.Vec] = None
+        self._control_hash: Optional[str] = None  # Hash for efficient cache checking
 
     @abstractmethod
     def value(self, m: PETSc.Vec) -> float:
@@ -146,11 +148,36 @@ class CostFunction(ABC):
         """
         raise NotImplementedError("Gauss-Newton Hessian not yet implemented")
 
+    def _get_control_hash(self, m: PETSc.Vec) -> str:
+        """
+        Compute hash of control vector for caching.
+
+        Uses MD5 hash of the vector's byte representation for efficient
+        comparison without needing to allocate temporary vectors.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control vector.
+
+        Returns
+        -------
+        str
+            MD5 hash string.
+        """
+        m_bytes = m.getArray().tobytes()
+        return hashlib.md5(m_bytes).hexdigest()
+
     def _run_forward_model(
         self, m: PETSc.Vec, store_jacobians: bool = True
     ) -> Tuple[List[PETSc.Vec], Optional[List[PETSc.Mat]]]:
         """
         Run forward model and cache trajectory.
+
+        Uses hash-based caching to efficiently detect when the same control
+        vector is used, avoiding redundant forward solves. This is critical
+        for TAO efficiency, where value() and gradient() may be called
+        separately for the same point.
 
         Parameters
         ----------
@@ -164,23 +191,24 @@ class CostFunction(ABC):
         Tuple[List[PETSc.Vec], Optional[List[PETSc.Mat]]]
             (trajectory, jacobians) tuple.
         """
+        # Compute hash for cache lookup
+        m_hash = self._get_control_hash(m)
+
         # Check if we can reuse cached trajectory
-        if self._current_control is not None:
-            diff = m.duplicate()
-            diff.waxpy(-1.0, self._current_control, m)
-            if diff.norm() < 1e-14:
-                # If jacobians are requested but not cached, re-run
-                if store_jacobians and self._jacobians is None:
-                    self._trajectory, self._jacobians = self.forward_model.solve(
-                        m, store_jacobians=True
-                    )
-                return self._trajectory, self._jacobians
+        if self._control_hash == m_hash and self._trajectory is not None:
+            # If jacobians are requested but not cached, re-run
+            if store_jacobians and self._jacobians is None:
+                self._trajectory, self._jacobians = self.forward_model.solve(
+                    m, store_jacobians=True
+                )
+            return self._trajectory, self._jacobians
 
         # Run forward model
         self._trajectory, self._jacobians = self.forward_model.solve(
             m, store_jacobians=store_jacobians
         )
         self._current_control = m.copy()
+        self._control_hash = m_hash
 
         # Warn if Jacobians were requested but not stored
         if store_jacobians and (self._jacobians is None or len(self._jacobians) == 0):
@@ -207,6 +235,7 @@ class CostFunction(ABC):
         self._trajectory = None
         self._jacobians = None
         self._current_control = None
+        self._control_hash = None
 
 
 class FourDVarCost(CostFunction):
@@ -414,6 +443,70 @@ class FourDVarCost(CostFunction):
         grad.axpy(1.0, lambda_0)
 
         return grad
+
+    def value_gradient(self, m: PETSc.Vec) -> Tuple[float, PETSc.Vec]:
+        """
+        Compute cost function value and gradient together (efficient for TAO).
+
+        Uses single forward model run + adjoint solve, avoiding the double
+        computation that occurs when calling value() then gradient() separately.
+        This is the preferred method for TAO optimization callbacks.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable (initial condition).
+
+        Returns
+        -------
+        Tuple[float, PETSc.Vec]
+            (cost_value, gradient_vector)
+
+        Notes
+        -----
+        The efficiency gain comes from:
+        1. Running forward model once with Jacobian caching enabled
+        2. Computing both cost terms from the same trajectory
+        3. Using the same Jacobians for the adjoint solve
+
+        This avoids the typical pattern where value() and gradient() each
+        independently run the forward model, doubling the computation cost.
+        """
+        # Run forward model once, storing Jacobians for adjoint
+        try:
+            trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+        except Exception as e:
+            # Forward model failed - return infinity and zero gradient
+            import warnings
+            warnings.warn(
+                f"Forward model failed during value_gradient: {e}. "
+                "Returning inf cost and zero gradient.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            # Create zero gradient
+            zero_grad = m.duplicate()
+            zero_grad.zeroEntries()
+            return float('inf'), zero_grad
+
+        # Compute cost value (same as value())
+        background_term = self._compute_background_term(m)
+        observation_term = self._compute_observation_term(trajectory)
+        cost = background_term + observation_term
+
+        # Compute gradient (same as gradient() but reuses trajectory/jacobians)
+        delta_m = m.duplicate()
+        delta_m.waxpy(-1.0, self.m_b, m)
+        grad_background = self.B.apply_inverse(delta_m)
+
+        # Adjoint solve (uses cached jacobians)
+        lambda_0 = self._solve_adjoint(trajectory, jacobians)
+
+        # Total gradient
+        grad = grad_background.duplicate()
+        grad.axpy(1.0, lambda_0)
+
+        return cost, grad
 
     def _solve_adjoint(
         self, trajectory: List[PETSc.Vec], jacobians: List[PETSc.Mat]
@@ -711,6 +804,44 @@ class DCFourDVarCost(FourDVarCost):
         grad_standard.axpy(-1.0, grad_predictability)
 
         return grad_standard
+
+    def value_gradient(self, m: PETSc.Vec) -> Tuple[float, PETSc.Vec]:
+        """
+        Compute DC-4DVar cost and gradient together (efficient for TAO).
+
+        Uses single forward model run + adjoint solve for the standard
+        4D-Var component, then adds predictability corrections.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
+
+        Returns
+        -------
+        Tuple[float, PETSc.Vec]
+            (cost_value, gradient_vector)
+        """
+        # Get standard 4D-Var value and gradient (uses single forward solve)
+        J_standard, grad_standard = super().value_gradient(m)
+
+        # Handle forward model failure
+        if not np.isfinite(J_standard):
+            return J_standard, grad_standard
+
+        # Compute predictability term
+        predictability_term = self._compute_predictability_term(m)
+
+        # Compute predictability gradient correction
+        grad_predictability = self._compute_predictability_gradient(m)
+
+        # DC cost = standard cost - predictability term
+        cost = J_standard - predictability_term
+
+        # DC gradient = standard gradient - predictability gradient
+        grad_standard.axpy(-1.0, grad_predictability)
+
+        return cost, grad_standard
 
     def _compute_predictability_gradient(self, m: PETSc.Vec) -> PETSc.Vec:
         """
@@ -1111,6 +1242,82 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         grad.axpy(1.0, grad_wme)
 
         return grad
+
+    def value_gradient(self, m: PETSc.Vec) -> Tuple[float, PETSc.Vec]:
+        """
+        Compute DC-WME cost and gradient together (efficient for TAO).
+
+        Combines value and gradient computation to avoid redundant forward
+        model evaluations.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable.
+
+        Returns
+        -------
+        Tuple[float, PETSc.Vec]
+            (cost_value, gradient_vector)
+        """
+        # Run forward model once for trajectory and Jacobians
+        try:
+            trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+        except Exception as e:
+            import warnings
+            warnings.warn(
+                f"Forward model failed during value_gradient: {e}",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            zero_grad = m.duplicate()
+            zero_grad.zeroEntries()
+            return float('inf'), zero_grad
+
+        # === Compute cost value ===
+        # Background term
+        delta_m = m.duplicate()
+        delta_m.waxpy(-1.0, self.m_b, m)
+        B_inv_delta = self.B.apply_inverse(delta_m)
+        background_term = 0.5 * delta_m.dot(B_inv_delta)
+
+        # WME data misfit: ½||Q_wme(m)||²
+        Q_wme_m = self._compute_wme(m)
+        data_misfit = 0.5 * Q_wme_m.dot(Q_wme_m)
+
+        # Predictability term
+        predictability = self._compute_wme_predictability(m, Q_wme_m)
+
+        cost = background_term + data_misfit - predictability
+
+        # === Compute gradient ===
+        # Background gradient: B⁻¹(m - m_b) (reuse delta_m)
+        grad = self.B.apply_inverse(delta_m)
+
+        # Compute WME gradient contribution
+        if "Q_wme_mb" not in self._wme_cache:
+            self._wme_cache["Q_wme_mb"] = self._compute_wme(self.m_b)
+        Q_wme_mb = self._wme_cache["Q_wme_mb"]
+
+        # Correction residual
+        delta_Q = Q_wme_m.duplicate()
+        delta_Q.waxpy(-1.0, Q_wme_mb, Q_wme_m)
+
+        # Compute forcing: Q_wme - L_wme⁻¹(Q_wme - Q_wme,b)
+        self._ensure_wme_predicted_covariance()
+        L_inv_delta = self._L_wme.apply_inverse(delta_Q)
+
+        forcing = Q_wme_m.duplicate()
+        forcing.axpy(-1.0, L_inv_delta)
+
+        # Apply adjoint of WME Jacobian
+        linearized_wme = self.qoi_map.linearize(m, max(self.obs_times))
+        grad_wme = linearized_wme.apply_adjoint(forcing)
+
+        # Accumulate
+        grad.axpy(1.0, grad_wme)
+
+        return cost, grad
 
 
 # Factory function for creating cost functions

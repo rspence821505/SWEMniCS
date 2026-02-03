@@ -201,13 +201,13 @@ cost_function = FourDVarCost(
 )
 ```
 
-### Step 3: Optimize
+### Step 3: Optimize with PETSc TAO
 
 ```python
-from swe4dvar.optimization.lbfgs import LBFGSOptimizer
+from swe4dvar.optimization import TAOOptimizerFactory
 
-# Create optimizer
-optimizer = LBFGSOptimizer(
+# Create TAO L-BFGS optimizer (recommended for production)
+optimizer = TAOOptimizerFactory.create_lbfgs(
     cost_function,
     memory_size=5,
     options={
@@ -282,12 +282,14 @@ dc_cost = DCWMEFourDVarCost(
 ### Step 3: Compare Methods
 
 ```python
-# Optimize with standard 4D-Var
-opt_4dvar = LBFGSOptimizer(cost_function, options={"verbose": False})
+from swe4dvar.optimization import TAOOptimizerFactory
+
+# Optimize with standard 4D-Var using TAO
+opt_4dvar = TAOOptimizerFactory.create_lbfgs(cost_function, options={"verbose": False})
 m_4dvar = opt_4dvar.solve(m0)
 
-# Optimize with DC-WME-4DVar
-opt_dcwme = LBFGSOptimizer(dc_cost, options={"verbose": False})
+# Optimize with DC-WME-4DVar using TAO
+opt_dcwme = TAOOptimizerFactory.create_lbfgs(dc_cost, options={"verbose": False})
 m_dcwme = opt_dcwme.solve(m0)
 
 print("Results Comparison:")

@@ -672,15 +672,124 @@ class CompositeObservationOperator(ObservationOperator):
 
 Optimization algorithms for minimizing cost functions.
 
-### LBFGSOptimizer
+**Recommendation:** Use `TAOOptimizerFactory` or `PETScTAOWrapper` for production use.
+TAO provides battle-tested optimization algorithms with robust line search and convergence monitoring.
+
+### TAOOptimizerFactory (Recommended)
+
+```python
+class TAOOptimizerFactory:
+    """
+    Factory for creating PETSc TAO optimizers with common configurations.
+
+    Provides convenience methods for typical optimization scenarios.
+    Recommended for production 4D-Var applications.
+
+    Methods
+    -------
+    create_lbfgs(cost_function, memory_size=10, options=None) -> PETScTAOWrapper
+        Create TAO L-BFGS optimizer (unconstrained).
+
+    create_bounded_lbfgs(cost_function, lower_bounds=None, upper_bounds=None,
+                         memory_size=10, options=None) -> PETScTAOWrapper
+        Create TAO bounded L-BFGS optimizer (box constraints).
+
+    create_trust_region(cost_function, options=None) -> PETScTAOWrapper
+        Create TAO Newton trust region optimizer.
+
+    create_conjugate_gradient(cost_function, cg_type='pr', options=None) -> PETScTAOWrapper
+        Create TAO nonlinear conjugate gradient optimizer.
+
+    Example
+    -------
+    >>> from swe4dvar.optimization import TAOOptimizerFactory
+    >>> optimizer = TAOOptimizerFactory.create_lbfgs(
+    ...     cost_function,
+    ...     memory_size=10,
+    ...     options={'verbose': True, 'max_iterations': 50}
+    ... )
+    >>> m_optimal = optimizer.solve(m_initial)
+    """
+```
+
+### PETScTAOWrapper
+
+```python
+class PETScTAOWrapper:
+    """
+    Wrapper for PETSc TAO (Toolkit for Advanced Optimization).
+
+    Bridges SWE4DVar cost function interface with TAO's callback system.
+    TAO handles the optimization loop and convergence monitoring internally.
+
+    Supported TAO types:
+        - 'lmvm': Limited-memory variable metric (L-BFGS)
+        - 'blmvm': Bounded L-BFGS with box constraints
+        - 'nls': Newton line search
+        - 'ntr': Newton trust region
+        - 'cg': Nonlinear conjugate gradient
+        - 'nm': Nelder-Mead (derivative-free)
+
+    Key advantages over custom implementation:
+        - Production-grade L-BFGS-B with full active set handling
+        - Sophisticated line search and trust region methods
+        - Automatic convergence monitoring and diagnostics
+        - Battle-tested robustness on ill-conditioned problems
+
+    Parameters
+    ----------
+    cost_function : CostFunction
+        Cost function to minimize. If it has a `value_gradient()` method,
+        TAO will use it for efficient combined objective/gradient evaluation.
+    tao_type : str
+        TAO algorithm type (default: 'lmvm').
+    lower_bounds : PETSc.Vec, optional
+        Lower bounds for box constraints (None = unbounded).
+    upper_bounds : PETSc.Vec, optional
+        Upper bounds for box constraints (None = unbounded).
+    options : dict, optional
+        Optimizer options:
+        - max_iterations: Maximum iterations (default: 100)
+        - gradient_tolerance: Gradient norm tolerance (default: 1e-6)
+        - cost_tolerance: Function value tolerance (default: 1e-8)
+        - verbose: Print iteration info (default: False)
+        - tao_monitor: Use TAO's built-in monitor (default: False)
+        - Additional TAO options with 'tao_' prefix
+
+    Methods
+    -------
+    solve(x0) -> PETSc.Vec
+        Minimize cost function starting from initial guess x0.
+    get_convergence_info() -> dict
+        Get convergence information after solve.
+
+    Example
+    -------
+    >>> from swe4dvar.optimization import PETScTAOWrapper
+    >>> optimizer = PETScTAOWrapper(
+    ...     cost_function,
+    ...     tao_type='lmvm',
+    ...     options={'max_iterations': 100, 'verbose': True}
+    ... )
+    >>> m_optimal = optimizer.solve(m_initial)
+    >>> info = optimizer.get_convergence_info()
+    >>> print(f"Converged: {info['converged']}, Iterations: {info['iterations']}")
+    """
+```
+
+### LBFGSOptimizer (Legacy)
 
 ```python
 class LBFGSOptimizer:
     """
     Limited-memory BFGS optimizer.
 
+    .. deprecated::
+        For production use, prefer `TAOOptimizerFactory.create_lbfgs()`
+        which provides a battle-tested L-BFGS implementation with better
+        convergence properties and line search algorithms.
+
     Efficient quasi-Newton method using two-loop recursion.
-    Recommended for most 4D-Var applications.
 
     Parameters
     ----------
@@ -722,29 +831,6 @@ class GaussNewtonOptimizer:
         - max_iterations: int
         - cg_max_iterations: int
         - cg_tolerance: float
-    """
-```
-
-### PETScTAOWrapper
-
-```python
-class PETScTAOWrapper:
-    """
-    Wrapper for PETSc TAO optimization library.
-
-    Provides access to TAO's optimization algorithms:
-    - 'lmvm': Limited-memory variable metric
-    - 'nls': Newton line search
-    - 'cg': Conjugate gradient
-
-    Parameters
-    ----------
-    cost_function : CostFunction
-        Cost function to minimize.
-    method : str
-        TAO method name (default: 'lmvm').
-    options : dict, optional
-        TAO-specific options.
     """
 ```
 
@@ -935,9 +1021,11 @@ solver = get_solver("SUPG")(problem, theta=1.0, p_degree=[1, 1])
 solver.time_loop({"rtol": 1e-5, "atol": 1e-6, "max_it": 10})
 ```
 
-### Pattern 2: 4D-Var with Saved Jacobians
+### Pattern 2: 4D-Var with TAO Optimizer (Recommended)
 
 ```python
+from swe4dvar.optimization import TAOOptimizerFactory
+
 # Run forward with Jacobian caching
 solver.time_loop(solver_params, save_state=True, save_jacobian=True)
 
@@ -952,8 +1040,12 @@ cost = FourDVarCost(
     obs_times=obs_times,
 )
 
-# Optimize
-optimizer = LBFGSOptimizer(cost, memory_size=10, options={"max_iterations": 50})
+# Optimize with TAO L-BFGS (production-grade)
+optimizer = TAOOptimizerFactory.create_lbfgs(
+    cost,
+    memory_size=10,
+    options={"max_iterations": 50, "verbose": True}
+)
 m_optimal = optimizer.solve(m_b)
 ```
 
