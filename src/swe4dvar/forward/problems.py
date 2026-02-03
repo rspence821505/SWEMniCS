@@ -86,7 +86,7 @@ class BaseProblem(abc.ABC):
 
     def _create_mesh(self):
         self.mesh = mesh.create_unit_square(
-            MPI.COMM_WORLD, nx, ny, mesh.CellType.triangle
+            MPI.COMM_WORLD, self.nx, self.ny, mesh.CellType.triangle
         )
 
     def log(self, *msg):
@@ -153,7 +153,10 @@ class BaseProblem(abc.ABC):
         elif self.solution_var == "flux":
             h, hux, huy = u[0], u[1], u[2]
             eta = h - self.h_b
-            ux, uy = hux / h, huy / h
+            # Protect against division by zero (common in wetting/drying)
+            h_min = self.wd_alpha if self.wd else 1e-10
+            h_safe = conditional(h > h_min, h, h_min)
+            ux, uy = hux / h_safe, huy / h_safe
         else:
             raise ValueError(f"Invalid solution variable '{self.solution_var}'")
 
@@ -247,16 +250,9 @@ class BaseProblem(abc.ABC):
 
         if self.spherical:
             # add spherical correction factor
-            # Mark messing with things
             for i in range(len(components)):
                 components[i][0] = components[i][0] * self.S
             if self.projected:
-                # just write our own
-                # components = [
-                #    [(self.S-1)*h*ux,0],
-                #    [ (self.S-1)*(h*ux*ux)+self.S*0.5*g*h*h, 0],
-                #    [(self.S-1)*h*ux*uy,0.5*g*h*h ]
-                #    ]
                 return as_tensor(components)
             else:
                 return as_tensor(components) / R
@@ -316,15 +312,19 @@ class BaseProblem(abc.ABC):
     def get_friction(self, u, momentum_form="conservative"):
         friction_law = self.friction_law
         h, ux, uy = self._get_standard_vars(u, form="h")
+        # Minimum depth for division safety (use wd_alpha if available)
+        h_min = self.wd_alpha if self.wd else 1e-10
+        h_safe = conditional(h > h_min, h, h_min)
+
         if friction_law == "linear":
-            # hard code experiment
-            cf = 0.025
+            # Use TAU if available, else default
+            cf = self.TAU if hasattr(self, 'TAU') and self.TAU > 0 else 0.025
             self.log("CF = ", cf)
             # linear law which is same as ADCIRC option
             if momentum_form == "conservative":
                 return as_vector((0, ux * cf, uy * cf))
             elif momentum_form == "nonconservative":
-                return as_vector((0, ux * cf / h, uy * cf / h))
+                return as_vector((0, ux * cf / h_safe, uy * cf / h_safe))
 
         elif friction_law == "quadratic":
             # experimental but 1e-16 seems to be ok
@@ -341,8 +341,8 @@ class BaseProblem(abc.ABC):
                 return as_vector(
                     (
                         0,
-                        vel_mag * ux * self.TAU_const / h,
-                        vel_mag * uy * self.TAU_const / h,
+                        vel_mag * ux * self.TAU_const / h_safe,
+                        vel_mag * uy * self.TAU_const / h_safe,
                     )
                 )
 
@@ -384,7 +384,7 @@ class BaseProblem(abc.ABC):
             if momentum_form == "conservative":
                 return as_vector((0, Cd * ux * mag_v, Cd * uy * mag_v))
             elif momentum_form == "nonconservative":
-                return as_vector((0, Cd * ux * mag_v / h, Cd * uy * mag_v / h))
+                return as_vector((0, Cd * ux * mag_v / h_safe, Cd * uy * mag_v / h_safe))
         else:
             return as_vector((0, 0, 0))
 
@@ -1093,10 +1093,6 @@ class RainProblem(TidalProblem):
         )
         # h_b.interpolate(lambda x: 5 - x[0]*0)
         return h_b
-
-    def evaluate_tidal_boundary(self, t):
-        # no tides
-        return 0
 
     def make_Source(self, u, form="well_balanced"):
         """Create the forcing terms"""

@@ -378,10 +378,12 @@ class NewtonSolver:
 
         viewer = PETSc.Viewer().createASCII("linear_output.txt")
         ksp.view(viewer)
+        viewer.destroy()
 
-        solver_output = open("linear_output.txt", "r")
-        for line in solver_output.readlines():
-            print(line)
+        # Use context manager to ensure file is properly closed
+        with open("linear_output.txt", "r") as solver_output:
+            for line in solver_output:
+                print(line, end='')
         # print(self.u.vector.getArray())
 
     def solve(self, u, return_jacobian=False):

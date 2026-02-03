@@ -58,8 +58,8 @@ class SolverStateStorage:
             try:
                 if hasattr(J, 'destroy') and callable(J.destroy):
                     J.destroy()
-            except:
-                # Ignore errors - matrix may already be destroyed
+            except (PETSc.Error, RuntimeError, AttributeError):
+                # Ignore errors - matrix may already be destroyed or invalid
                 pass
         self.saved_jacobians.clear()
 
@@ -67,8 +67,8 @@ class SolverStateStorage:
             try:
                 if hasattr(A, 'destroy') and callable(A.destroy):
                     A.destroy()
-            except:
-                # Ignore errors - matrix may already be destroyed
+            except (PETSc.Error, RuntimeError, AttributeError):
+                # Ignore errors - matrix may already be destroyed or invalid
                 pass
         self.saved_adjoints.clear()
 

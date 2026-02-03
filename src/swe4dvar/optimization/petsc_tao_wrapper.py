@@ -98,7 +98,14 @@ class PETScTAOWrapper(Optimizer):
 
         # Set initial guess
         x = x0.copy()
-        self.tao.setInitialVector(x)
+        # API changed: setInitialVector -> setSolution in newer PETSc
+        if hasattr(self.tao, 'setInitial'):
+            self.tao.setInitial(x)
+        elif hasattr(self.tao, 'setSolution'):
+            self.tao.setSolution(x)
+        else:
+            # Fallback: set via solving with x as initial
+            self.tao.setSolution(x)
 
         # Set objective and gradient callbacks
         self.tao.setObjectiveGradient(self._compute_objective_gradient)
@@ -180,17 +187,35 @@ class PETScTAOWrapper(Optimizer):
         Returns:
             Objective function value
         """
-        # Compute objective
-        f = self.cost_function.value(x)
-        self.n_func_evals += 1
+        try:
+            # Compute objective
+            f = self.cost_function.value(x)
+            self.n_func_evals += 1
 
-        # Compute gradient
-        grad = self.cost_function.gradient(x)
-        g.copy(grad)
-        grad.destroy()
-        self.n_grad_evals += 1
+            # Check for infinity (forward model failure)
+            if not np.isfinite(f):
+                # Return large value and zero gradient to signal bad point
+                g.zeroEntries()
+                return 1e20
 
-        return f
+            # Compute gradient
+            grad = self.cost_function.gradient(x)
+            g.copy(grad)
+            grad.destroy()
+            self.n_grad_evals += 1
+
+            return f
+        except Exception as e:
+            # Forward model failed - return large cost and zero gradient
+            import warnings
+            warnings.warn(
+                f"TAO callback: forward model failed: {e}. "
+                "Returning large cost to signal bad point.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            g.zeroEntries()
+            return 1e20
 
     def _tao_monitor_callback(self, tao: PETSc.TAO):
         """
@@ -213,7 +238,10 @@ class PETScTAOWrapper(Optimizer):
         iteration = tao.getIterationNumber()
         f = tao.getFunctionValue()
         grad = tao.getGradient()
-        gnorm = grad.norm()
+        # getGradient may return (grad_vec, grad_vec) tuple in newer PETSc
+        if isinstance(grad, tuple):
+            grad = grad[0]
+        gnorm = grad.norm() if grad is not None else 0.0
 
         # Get step size (if available)
         step = "N/A"

@@ -294,10 +294,23 @@ class FourDVarCost(CostFunction):
         Returns
         -------
         float
-            Cost function value.
+            Cost function value. Returns float('inf') if forward model fails
+            (e.g., due to unphysical states), allowing line search to reject the step.
         """
-        # Run forward model
-        trajectory, _ = self._run_forward_model(m, store_jacobians=False)
+        # Run forward model with error handling for unphysical states
+        try:
+            trajectory, _ = self._run_forward_model(m, store_jacobians=False)
+        except Exception as e:
+            # Forward model failed (e.g., negative water depth, NaN)
+            # Return infinity so line search rejects this step
+            import warnings
+            warnings.warn(
+                f"Forward model failed during cost evaluation: {e}. "
+                "Returning inf to reject line search step.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            return float('inf')
 
         # Background term: ½⟨m - m_b, B⁻¹(m - m_b)⟩
         background_term = self._compute_background_term(m)
@@ -970,19 +983,30 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         Returns
         -------
         float
-            DC-WME cost function value.
+            DC-WME cost function value. Returns float('inf') if forward model fails.
         """
-        # Background term
-        background_term = self._compute_background_term(m)
+        try:
+            # Background term
+            background_term = self._compute_background_term(m)
 
-        # WME data misfit: ½ ‖Q_wme(m)‖²
-        Q_wme_m = self._compute_wme(m)
-        data_misfit = 0.5 * Q_wme_m.dot(Q_wme_m)
+            # WME data misfit: ½ ‖Q_wme(m)‖²
+            Q_wme_m = self._compute_wme(m)
+            data_misfit = 0.5 * Q_wme_m.dot(Q_wme_m)
 
-        # Predictability term: ½ ⟨Q_wme(m) - Q_wme(m_b), L⁻¹(...)⟩
-        predictability = self._compute_wme_predictability(m, Q_wme_m)
+            # Predictability term: ½ ⟨Q_wme(m) - Q_wme(m_b), L⁻¹(...)⟩
+            predictability = self._compute_wme_predictability(m, Q_wme_m)
 
-        return background_term + data_misfit - predictability
+            return background_term + data_misfit - predictability
+        except Exception as e:
+            # Forward model failed (e.g., negative water depth, NaN)
+            import warnings
+            warnings.warn(
+                f"Forward model failed during DC-WME cost evaluation: {e}. "
+                "Returning inf to reject line search step.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            return float('inf')
 
     def _compute_wme(self, m: PETSc.Vec) -> PETSc.Vec:
         """

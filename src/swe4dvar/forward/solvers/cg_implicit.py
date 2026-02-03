@@ -313,11 +313,13 @@ class CGImplicit(BaseSolver):
                     )
 
                 # Log success in verbose mode
-                if self.verbose and self.mpi_rank == 0:
+                # NOTE: J.getInfo() is collective in PETSc - must call on all ranks
+                if self.verbose:
                     nnz = J.getInfo()["nz_used"]
-                    self.log(
-                        f"  Jacobian extracted: {size[0]}x{size[1]}, nnz={int(nnz)}"
-                    )
+                    if self.mpi_rank == 0:
+                        self.log(
+                            f"  Jacobian extracted: {size[0]}x{size[1]}, nnz={int(nnz)}"
+                        )
 
                 # NOTE: Newton solver already returns a copy (J_final = A.copy()),
                 # so we don't need to copy again here. However, to be

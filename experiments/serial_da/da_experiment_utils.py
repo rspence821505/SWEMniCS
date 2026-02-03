@@ -152,10 +152,32 @@ class ForwardModelWrapper:
         self.solver.storage.clear()
 
         # Set initial condition
-        m_array = m.getArray()
-        self.solver.u_n.x.array[:] = m_array
-        self.solver.u_n_old.x.array[:] = m_array
-        self.solver.u.x.array[:] = m_array
+        # Use copy to avoid issues with read-only vectors (e.g., from TAO)
+        m_local = m.copy()
+        m_array = m_local.getArray()
+
+        # Handle MPI: m_array may have only owned DOFs while u_n.x.array includes ghosts
+        u_owned_size = self.solver.V.dofmap.index_map.size_local
+        if len(m_array) == len(self.solver.u_n.x.array):
+            # Arrays match (serial or vector includes ghosts)
+            self.solver.u_n.x.array[:] = m_array
+            self.solver.u_n_old.x.array[:] = m_array
+            self.solver.u.x.array[:] = m_array
+        elif len(m_array) == u_owned_size:
+            # m_array has only owned DOFs - copy to owned portion only
+            self.solver.u_n.x.array[:u_owned_size] = m_array
+            self.solver.u_n_old.x.array[:u_owned_size] = m_array
+            self.solver.u.x.array[:u_owned_size] = m_array
+            # Update ghosts
+            self.solver.u_n.x.scatter_forward()
+            self.solver.u_n_old.x.scatter_forward()
+            self.solver.u.x.scatter_forward()
+        else:
+            raise ValueError(
+                f"Initial condition size {len(m_array)} does not match "
+                f"solver DOFs (owned={u_owned_size}, total={len(self.solver.u_n.x.array)})"
+            )
+        m_local.destroy()
 
         # Reset problem time
         self.problem.t = 0.0
@@ -171,12 +193,19 @@ class ForwardModelWrapper:
         )
 
         # Extract trajectory as PETSc vectors
+        # Note: saved_states include ghost values, need proper distributed vectors
+        from dolfinx import la
+        u_owned_size = self.solver.V.dofmap.index_map.size_local
         trajectory = []
         for state_array in self.solver.storage.saved_states:
-            vec = PETSc.Vec().createWithArray(
-                state_array.copy(),
-                comm=self.comm
+            # Create properly distributed PETSc vector
+            vec = la.create_petsc_vector(
+                self.solver.V.dofmap.index_map,
+                self.solver.V.dofmap.index_map_bs,
             )
+            # Only copy owned DOFs (not ghosts)
+            vec.setArray(state_array[:u_owned_size])
+            vec.assemble()
             trajectory.append(vec)
 
         # Extract Jacobians if stored
@@ -466,3 +495,107 @@ def load_all_results(output_dir: str = "outputs/data") -> Dict[str, DAExperiment
         results[name] = DAExperimentResults.load(str(filepath))
 
     return results
+
+
+def create_physical_bounds(
+    m_template: PETSc.Vec,
+    n_vars: int = 3,
+    h_min: float = 0.01,
+    momentum_bound: float = 1e10,
+) -> Tuple[PETSc.Vec, PETSc.Vec]:
+    """
+    Create physical bounds for the control variable.
+
+    For shallow water equations with state [h, hu, hv], enforces:
+    - h >= h_min (water depth must be positive)
+    - |hu|, |hv| <= momentum_bound (momentum bounded)
+
+    Parameters
+    ----------
+    m_template : PETSc.Vec
+        Template vector with correct size and distribution.
+    n_vars : int
+        Number of state variables per node (default: 3 for h, hu, hv).
+    h_min : float
+        Minimum water depth (default: 0.01).
+    momentum_bound : float
+        Maximum momentum magnitude (default: 1e10, effectively unbounded).
+
+    Returns
+    -------
+    lower_bounds : PETSc.Vec
+        Lower bound vector.
+    upper_bounds : PETSc.Vec
+        Upper bound vector.
+    """
+    lower = m_template.duplicate()
+    upper = m_template.duplicate()
+
+    lower_array = lower.getArray()
+    upper_array = upper.getArray()
+
+    n_dofs = len(lower_array)
+    n_nodes = n_dofs // n_vars
+
+    for i in range(n_nodes):
+        # Water depth h: must be >= h_min
+        lower_array[i * n_vars] = h_min
+        upper_array[i * n_vars] = 1e10  # No practical upper bound
+
+        # Momentum hu, hv: bounded
+        for j in range(1, n_vars):
+            lower_array[i * n_vars + j] = -momentum_bound
+            upper_array[i * n_vars + j] = momentum_bound
+
+    lower.setArray(lower_array)
+    upper.setArray(upper_array)
+
+    return lower, upper
+
+
+def create_tao_optimizer(
+    cost_function,
+    m_template: PETSc.Vec,
+    options: Dict[str, Any],
+    use_bounds: bool = True,
+    h_min: float = 0.01,
+):
+    """
+    Create a TAO optimizer with optional physical bounds.
+
+    Parameters
+    ----------
+    cost_function : CostFunctionBase
+        4D-Var cost function.
+    m_template : PETSc.Vec
+        Template vector for bounds creation.
+    options : Dict[str, Any]
+        Optimizer options (max_iterations, gradient_tolerance, etc.).
+    use_bounds : bool
+        Whether to use bounded optimization (default: True).
+    h_min : float
+        Minimum water depth for bounds (default: 0.01).
+
+    Returns
+    -------
+    optimizer : PETScTAOWrapper
+        Configured TAO optimizer.
+    """
+    from swe4dvar.optimization.petsc_tao_wrapper import PETScTAOWrapper
+
+    if use_bounds:
+        lower, upper = create_physical_bounds(m_template, h_min=h_min)
+        tao_type = "blmvm"  # Bounded L-BFGS
+    else:
+        lower, upper = None, None
+        tao_type = "lmvm"  # Standard L-BFGS
+
+    optimizer = PETScTAOWrapper(
+        cost_function,
+        tao_type=tao_type,
+        lower_bounds=lower,
+        upper_bounds=upper,
+        options=options,
+    )
+
+    return optimizer

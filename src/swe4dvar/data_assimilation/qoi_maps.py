@@ -25,6 +25,7 @@ from typing import List, Optional, Dict, Tuple
 from petsc4py import PETSc
 from mpi4py import MPI
 import numpy as np
+import hashlib
 
 
 class QoIMap(ABC):
@@ -103,8 +104,10 @@ class QoIMap(ABC):
         self, m: PETSc.Vec, store_jacobians: bool = True
     ) -> Tuple[List[PETSc.Vec], Optional[List]]:
         """Get or compute trajectory for given initial condition."""
-        # Simple hash for caching (could be improved)
-        m_hash = hash(m.norm())
+        # Use robust hash based on vector contents to avoid collisions
+        # Different vectors can have the same norm, so hash the full array
+        m_bytes = m.getArray().tobytes()
+        m_hash = hashlib.md5(m_bytes).hexdigest()
 
         if m_hash not in self._trajectory_cache:
             trajectory, jacobians = self.forward_model.solve(m, store_jacobians)
@@ -948,7 +951,13 @@ class QoICovarianceEstimator:
         CovarianceMatrix
             Low-rank approximation of L_k.
         """
-        from .covariance import LowRankCovariance
+        try:
+            from .covariance import LowRankCovariance
+        except ImportError:
+            raise NotImplementedError(
+                "LowRankCovariance is not yet implemented in covariance.py. "
+                "Use DiagonalCovariance or DenseCovariance instead."
+            )
 
         linearized_qoi = self.qoi_map.linearize(m_bar, time_index)
 

@@ -305,12 +305,43 @@ class PointObservationOperator(ObservationOperator):
         # Create FEniCSx function from PETSc vector
         u = dolfinx.fem.Function(self.function_space)
 
-        # Copy state values to function - handle ghosts properly
-        state.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        # Copy state values to function - handle various vector types
+        # Get sizes to determine how to copy
+        # Account for block size (e.g., 2 for 2D vector spaces)
+        state_local_size = state.getLocalSize()
+        bs = self.function_space.dofmap.index_map_bs
+        u_owned_size = self.function_space.dofmap.index_map.size_local * bs
+        u_total_size = u_owned_size + self.function_space.dofmap.index_map.num_ghosts * bs
 
-        # Use local form to handle ghost values correctly
-        with state.localForm() as loc_state, u.x.petsc_vec.localForm() as loc_u:
-            loc_u[:] = loc_state[:]
+        if state_local_size == u_total_size:
+            # State includes ghosts - direct copy
+            try:
+                state.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+                with state.localForm() as loc_state, u.x.petsc_vec.localForm() as loc_u:
+                    loc_u[:] = loc_state[:]
+            except Exception:
+                # Fallback if ghostUpdate fails
+                u.x.array[:] = state.getArray()[:]
+        elif state_local_size == u_owned_size:
+            # State has only owned DOFs - copy to owned portion
+            u.x.array[:u_owned_size] = state.getArray()[:]
+        else:
+            # Try to handle other cases - might be sequential vector
+            try:
+                arr = state.getArray()
+                if len(arr) == u_total_size:
+                    u.x.array[:] = arr
+                elif len(arr) == u_owned_size:
+                    u.x.array[:u_owned_size] = arr
+                else:
+                    raise ValueError(
+                        f"State vector size {len(arr)} does not match "
+                        f"function space (owned={u_owned_size}, total={u_total_size})"
+                    )
+            except Exception as e:
+                raise ValueError(
+                    f"Could not copy state vector to function: {e}"
+                )
 
         u.x.scatter_forward()
 

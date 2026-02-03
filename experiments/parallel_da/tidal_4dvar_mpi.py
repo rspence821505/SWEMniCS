@@ -191,9 +191,19 @@ def main():
     )
 
     # Store truth trajectory
+    # Note: saved_states include ghost values, need to create proper distributed vectors
+    from dolfinx import la
     truth_trajectory = []
+    num_owned = solver.V.dofmap.index_map.size_local
     for state_array in solver.storage.saved_states:
-        vec = PETSc.Vec().createWithArray(state_array.copy(), comm=comm)
+        # Create properly distributed PETSc vector
+        vec = la.create_petsc_vector(
+            solver.V.dofmap.index_map,
+            solver.V.dofmap.index_map_bs,
+        )
+        # Only copy owned DOFs (not ghosts)
+        vec.setArray(state_array[:num_owned])
+        vec.assemble()
         truth_trajectory.append(vec)
 
     truth_jacobians = solver.storage.saved_jacobians.copy()
@@ -273,9 +283,10 @@ def main():
     state_size = m_true.getSize()
 
     # Background covariance
+    # Use factory method to match function space distribution
     truth_magnitude = np.abs(m_true.getArray()).mean()
     background_variance = (config.background_error_std * truth_magnitude) ** 2
-    B = DiagonalCovariance(comm, state_size, variance=background_variance)
+    B = DiagonalCovariance.from_function_space(solver.V, variance=background_variance)
 
     if rank == 0:
         print(
@@ -283,9 +294,10 @@ def main():
         )
 
     # Observation covariance
+    # Use COMM_SELF since observations are replicated on all ranks
     n_obs = obs_operator.get_num_observations()
     obs_variance = obs_noise_stds.mean() ** 2
-    R = DiagonalCovariance(comm, n_obs, variance=obs_variance)
+    R = DiagonalCovariance(MPI.COMM_SELF, n_obs, variance=obs_variance)
 
     if rank == 0:
         print(f"  Observation covariance: diagonal, variance = {obs_variance:.6e}")
@@ -384,7 +396,14 @@ def main():
 
     analysis_trajectory = []
     for state_array in solver.storage.saved_states:
-        vec = PETSc.Vec().createWithArray(state_array.copy(), comm=comm)
+        # Create properly distributed PETSc vector
+        vec = la.create_petsc_vector(
+            solver.V.dofmap.index_map,
+            solver.V.dofmap.index_map_bs,
+        )
+        # Only copy owned DOFs (not ghosts)
+        vec.setArray(state_array[:num_owned])
+        vec.assemble()
         analysis_trajectory.append(vec)
 
     innov_mean, innov_std = compute_innovation_statistics(

@@ -452,11 +452,30 @@ class ImplicitAdjointSolver:
                 self._mass_matrix = self.forward_model.mass_matrix
             else:
                 # Fallback: create identity matrix
-                # Get size from first trajectory vector
-                n_dofs = self.trajectory[0].getSize()
-                comm = self.trajectory[0].getComm()
+                # Use Jacobian's distribution to match DOF partitioning
+                if len(self.jacobians) > 0:
+                    # Get sizes from Jacobian which has correct distribution
+                    J = self.jacobians[0]
+                    global_size = J.getSize()[0]
+                    local_size = J.getLocalSize()[0]
+                    comm = J.getComm()
 
-                M = PETSc.Mat().createAIJ([n_dofs, n_dofs], comm=comm)
+                    # Create matrix with matching distribution
+                    M = PETSc.Mat().createAIJ(
+                        size=[[local_size, global_size], [local_size, global_size]],
+                        comm=comm
+                    )
+                else:
+                    # No Jacobians available - use trajectory vector
+                    n_dofs = self.trajectory[0].getSize()
+                    local_size = self.trajectory[0].getLocalSize()
+                    comm = self.trajectory[0].getComm()
+
+                    M = PETSc.Mat().createAIJ(
+                        size=[[local_size, n_dofs], [local_size, n_dofs]],
+                        comm=comm
+                    )
+
                 M.setUp()
 
                 # Set diagonal to 1 (identity)

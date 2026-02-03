@@ -48,6 +48,7 @@ from da_experiment_utils import (
     compute_rms_error,
     compute_innovation_statistics,
     save_experiment_results,
+    create_tao_optimizer,
 )
 
 
@@ -79,6 +80,14 @@ def parse_args():
         "--max-iter", type=int, default=50, help="Max L-BFGS iterations"
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--use-tao", action="store_true",
+        help="Use PETSc TAO with bounded L-BFGS (more robust for shallow water)"
+    )
+    parser.add_argument(
+        "--h-min", type=float, default=0.01,
+        help="Minimum water depth for bounded optimization"
+    )
     return parser.parse_args()
 
 
@@ -289,19 +298,34 @@ def main():
     # =========================================================================
     # Step 8: Run optimization
     # =========================================================================
-    if rank == 0:
-        print("\nStep 7: Running L-BFGS optimization...")
+    opt_options = {
+        "max_iterations": config.max_iterations,
+        "gradient_tolerance": config.gradient_tolerance,
+        "cost_tolerance": config.cost_tolerance,
+        "verbose": (rank == 0),
+    }
 
-    optimizer = LBFGSOptimizer(
-        cost_function,
-        memory_size=config.lbfgs_memory,
-        options={
-            "max_iterations": config.max_iterations,
-            "gradient_tolerance": config.gradient_tolerance,
-            "cost_tolerance": config.cost_tolerance,
-            "verbose": (rank == 0),
-        },
-    )
+    if args.use_tao:
+        if rank == 0:
+            print("\nStep 7: Running TAO bounded L-BFGS optimization...")
+            print(f"  Using h_min = {args.h_min} for water depth bound")
+
+        optimizer = create_tao_optimizer(
+            cost_function,
+            m_background,
+            options=opt_options,
+            use_bounds=True,
+            h_min=args.h_min,
+        )
+    else:
+        if rank == 0:
+            print("\nStep 7: Running L-BFGS optimization...")
+
+        optimizer = LBFGSOptimizer(
+            cost_function,
+            memory_size=config.lbfgs_memory,
+            options=opt_options,
+        )
 
     opt_start = time.time()
     m_analysis = optimizer.solve(m_background.copy())
@@ -309,8 +333,10 @@ def main():
 
     if rank == 0:
         print(f"\nOptimization completed in {opt_time:.2f} seconds")
-        print(f"  Iterations: {optimizer.iteration}")
-        print(f"  Converged: {optimizer.converged}")
+        if hasattr(optimizer, 'iteration'):
+            print(f"  Iterations: {optimizer.iteration}")
+        if hasattr(optimizer, 'converged'):
+            print(f"  Converged: {optimizer.converged}")
 
     # =========================================================================
     # Step 9: Evaluate results

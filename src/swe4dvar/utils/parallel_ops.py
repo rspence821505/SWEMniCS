@@ -206,8 +206,9 @@ class DistributedMatrixOps:
         mat = PETSc.Mat().create(comm=comm)
         mat.setSizes(size)
         mat.setType(PETSc.Mat.Type.AIJ)
-        mat.setUp()
+        # Preallocation must come BEFORE setUp for efficiency
         mat.setPreallocation(nnz=nnz)
+        mat.setUp()
         return mat
 
     @staticmethod
@@ -410,18 +411,27 @@ class ParallelTimer:
 
         if rank == root:
             print("\n=== Parallel Timing Report ===")
-            for name in self.timers.keys():
-                times = [t[name]["total"] for t in all_timers]
-                counts = [t[name]["count"] for t in all_timers]
+            # Collect all timer names across all ranks to handle inconsistent timers
+            all_timer_names = set()
+            for t in all_timers:
+                all_timer_names.update(t.keys())
+
+            for name in all_timer_names:
+                # Safely get times/counts, defaulting to 0 if timer doesn't exist on a rank
+                times = [t.get(name, {}).get("total", 0.0) for t in all_timers]
+                counts = [t.get(name, {}).get("count", 0) for t in all_timers]
 
                 min_time = min(times)
                 max_time = max(times)
-                avg_time = sum(times) / len(times)
-                avg_count = sum(counts) / len(counts)
+                avg_time = sum(times) / len(times) if times else 0.0
+                avg_count = sum(counts) / len(counts) if counts else 0.0
 
                 print(f"{name}:")
                 print(f"  Min: {min_time:.4f}s")
                 print(f"  Max: {max_time:.4f}s")
                 print(f"  Avg: {avg_time:.4f}s")
                 print(f"  Count: {avg_count:.1f}")
-                print(f"  Imbalance: {(max_time - min_time) / avg_time * 100:.1f}%")
+                if avg_time > 0:
+                    print(f"  Imbalance: {(max_time - min_time) / avg_time * 100:.1f}%")
+                else:
+                    print(f"  Imbalance: N/A")

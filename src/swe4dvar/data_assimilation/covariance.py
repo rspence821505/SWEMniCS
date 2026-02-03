@@ -358,6 +358,66 @@ class DiagonalCovariance(CovarianceMatrix):
         global_max = self.comm.allreduce(local_max, op=MPI.MAX)
         return global_max
 
+    @classmethod
+    def from_function_space(
+        cls,
+        function_space,
+        variance: float,
+        comm: MPI.Comm = None,
+    ):
+        """Create diagonal covariance matching a DOLFINx function space distribution.
+
+        This ensures the covariance vector has the same MPI distribution as DOFs
+        in the function space, which is required for proper parallel operation.
+
+        Parameters
+        ----------
+        function_space : dolfinx.fem.FunctionSpace
+            DOLFINx function space to match distribution of
+        variance : float
+            Uniform variance for all entries
+        comm : MPI.Comm, optional
+            MPI communicator (defaults to function space's communicator)
+
+        Returns
+        -------
+        DiagonalCovariance
+            Covariance with distribution matching the function space
+        """
+        from dolfinx import la
+
+        if comm is None:
+            comm = function_space.mesh.comm
+
+        size = function_space.dofmap.index_map.size_global
+        local_size = function_space.dofmap.index_map.size_local
+
+        # Create instance with standard constructor
+        # We need to override the diagonal vector creation
+        instance = cls.__new__(cls)
+        instance.comm = comm
+        instance.size = size
+        instance.local_size = local_size
+        instance.ownership_range = (
+            function_space.dofmap.index_map.local_range[0],
+            function_space.dofmap.index_map.local_range[1],
+        )
+
+        # Create diagonal vector using function space's index_map
+        instance.diagonal = la.create_petsc_vector(
+            function_space.dofmap.index_map,
+            function_space.dofmap.index_map_bs,
+        )
+        instance.diagonal.set(variance)
+        instance.diagonal.assemble()
+
+        # Precompute inverse
+        instance.inv_diagonal = instance.diagonal.duplicate()
+        instance.diagonal.copy(instance.inv_diagonal)
+        instance.inv_diagonal.reciprocal()
+
+        return instance
+
     def __del__(self):
         """Clean up PETSc resources."""
         if hasattr(self, "diagonal"):

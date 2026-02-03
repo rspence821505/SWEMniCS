@@ -20,9 +20,10 @@ tangent_linear : Tangent Linear Model
     - TLMValidator
 
 checkpointing : Checkpointing strategies
-    - StateCheckpointer
-    - JacobianCheckpointer
+    - FullTrajectoryCheckpointer
+    - StateOnlyCheckpointer
     - BinomialCheckpointer
+    - CheckpointingStrategy
 
 Mathematical Background
 -----------------------
@@ -72,14 +73,16 @@ except ImportError:
 # Import checkpointing (when available)
 try:
     from .checkpointing import (
-        StateCheckpointer,
-        JacobianCheckpointer,
+        FullTrajectoryCheckpointer,
+        StateOnlyCheckpointer,
         BinomialCheckpointer,
+        CheckpointingStrategy,
     )
 except ImportError:
-    StateCheckpointer = None
-    JacobianCheckpointer = None
+    FullTrajectoryCheckpointer = None
+    StateOnlyCheckpointer = None
     BinomialCheckpointer = None
+    CheckpointingStrategy = None
 
 __all__ = [
     # Tangent Linear Model
@@ -94,9 +97,10 @@ __all__ = [
     "ImplicitAdjointSolver",
     "ImplicitAdjointStepAnalyzer",
     # Checkpointing
-    "StateCheckpointer",
-    "JacobianCheckpointer",
+    "FullTrajectoryCheckpointer",
+    "StateOnlyCheckpointer",
     "BinomialCheckpointer",
+    "CheckpointingStrategy",
 ]
 
 __version__ = "0.1.0"

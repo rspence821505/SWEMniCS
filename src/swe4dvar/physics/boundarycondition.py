@@ -10,7 +10,17 @@ class BoundaryCondition:
     """A class describing a boundary condition.
     """
 
+    # Valid boundary condition types
+    VALID_TYPES = {"Open", "Wall", "OF"}
+
     def __init__(self, type, marker, forcing_func=None, V=None, bound_func=None, facet_tag=None):
+        # Validate boundary condition type early
+        if type not in self.VALID_TYPES:
+            raise ValueError(
+                f"Unknown boundary condition type '{type}'. "
+                f"Valid types are: {self.VALID_TYPES}"
+            )
+
         self._type = type
         self._func = forcing_func
 
@@ -20,7 +30,8 @@ class BoundaryCondition:
                 dofs = fe.locate_dofs_geometrical((V, V.collapse()[0]), bound_func)[0]
             elif facet_tag is not None:
                 facets = facet_tag.find(marker)
-                fdim = 1 #hardcoded for 2d
+                # Get facet dimension from mesh topology (supports 2D and 3D)
+                fdim = V.mesh.topology.dim - 1
                 #only works for CG
                 dofs = fe.locate_dofs_topological((V, V.collapse()[0]), fdim, facets)[0]
             self._bc = fe.dirichletbc(forcing_func, dofs)
@@ -32,8 +43,6 @@ class BoundaryCondition:
                 self._bc = []
                 self._marker = marker
                 self._dofs = np.array([])
-        else:
-            raise TypeError("Unknown boundary condition: {0:s}".format(type))
     @property
     def bc(self):
         return self._bc

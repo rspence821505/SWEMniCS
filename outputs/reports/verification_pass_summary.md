@@ -157,12 +157,29 @@ See detailed report: [`bug_hunt_report.md`](bug_hunt_report.md)
 2. **Enable Jacobian caching** - Change `store_jacobians=True` as default or add user warning
 3. **Fix R^{-1/2} computation** - Use proper matrix square root instead of identity fallback
 
+### MPI Compatibility Issues (Phase 3 Findings)
+
+The parallel DA execution revealed several MPI compatibility issues:
+
+1. **J.getInfo() is collective (FIXED)** - `cg_implicit.py:317` called `J.getInfo()` only on rank 0 in verbose mode, causing MPI deadlock. Fixed by calling on all ranks.
+
+2. **Vector distribution mismatch** - Multiple places create PETSc vectors using global size with default distribution (n/nprocs) instead of matching DOLFINx's mesh partitioning. Affects:
+   - `tidal_4dvar_mpi.py`: Trajectory vector creation
+   - `da_experiment_utils.py`: ForwardModelWrapper trajectory extraction
+   - `covariance.py`: DiagonalCovariance distribution
+   - `implicit_adjoint.py`: Mass matrix creation
+
+3. **Ghost value handling** - Saved states include ghost values but vector operations assume only owned DOFs, causing size mismatches.
+
+4. **Observation operator ghost updates** - Tried to call `ghostUpdate()` on non-ghost vectors, fixed with proper vector type detection.
+
 ### Recommended Improvements
 
 1. Add integration tests for full DA workflow
 2. Implement Wolfe line search with correct signature
 3. Remove hardcoded BDF2 assumptions in TLM startup
 4. Add validation for observation operator function space matching
+5. **Refactor parallel DA utilities** - Create MPI-aware versions of `ForwardModelWrapper` and trajectory storage that properly handle DOLFINx mesh partitioning
 
 ---
 

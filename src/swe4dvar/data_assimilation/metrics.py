@@ -51,7 +51,7 @@ class DAMetrics:
 
             # Apply observation operator to state: H·x
             state = trajectory[time_idx]
-            Hx = H.apply(state)
+            Hx = H.forward(state)
 
             # Compute difference: obs - H·x
             diff = obs.duplicate()
@@ -90,7 +90,7 @@ class DAMetrics:
 
             # Apply observation operator to state: H·x
             state = trajectory[time_idx]
-            Hx = H.apply(state)
+            Hx = H.forward(state)
 
             # Compute innovation: d = obs - H·x
             innovation = obs.duplicate()
@@ -134,7 +134,7 @@ class DAMetrics:
 
             # Apply observation operator to state: H·x
             state = trajectory[time_idx]
-            Hx = H.apply(state)
+            Hx = H.forward(state)
 
             # Compute bias: H·x - obs (model minus observations)
             bias_vec = Hx.duplicate()
@@ -177,7 +177,7 @@ class DAMetrics:
 
             # Apply observation operator to state: H·x
             state = trajectory[time_idx]
-            Hx = H.apply(state)
+            Hx = H.forward(state)
 
             # Compute innovation: d = obs - H·x
             innovation = obs.duplicate()
@@ -324,16 +324,19 @@ class CostFunctionHistory:
 
         Args:
             filename: Optional filename to save plot
+
+        Returns:
+            bool: True if plot was created successfully, False otherwise
         """
         try:
             import matplotlib.pyplot as plt
         except ImportError:
             print("Warning: matplotlib not available, cannot plot")
-            return
+            return False
 
         if len(self.iterations) == 0:
             print("No data to plot")
-            return
+            return False
 
         fig, axes = plt.subplots(2, 1, figsize=(10, 8))
 
@@ -360,3 +363,4 @@ class CostFunctionHistory:
             plt.show()
 
         plt.close()
+        return True
