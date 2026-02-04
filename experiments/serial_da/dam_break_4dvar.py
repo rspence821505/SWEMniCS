@@ -359,7 +359,17 @@ def main():
         )
 
     opt_start = time.time()
-    m_analysis = optimizer.solve(m_background.copy())
+
+    # Project initial guess onto feasible region for bounded optimization
+    m_initial = m_background.copy()
+    if not args.use_legacy_lbfgs and not args.no_bounds:
+        from da_experiment_utils import project_onto_bounds, create_physical_bounds
+        lower, upper = create_physical_bounds(m_background, h_min=args.h_min)
+        m_initial = project_onto_bounds(m_initial, lower, upper, inplace=True)
+        if rank == 0:
+            print("  Initial guess projected onto feasible region")
+
+    m_analysis = optimizer.solve(m_initial)
     opt_time = time.time() - opt_start
 
     if rank == 0:

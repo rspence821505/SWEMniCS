@@ -16,6 +16,7 @@ Optimizer Options:
     - Default: PETSc TAO bounded L-BFGS (blmvm) with physical constraints
     - --no-bounds: Use unbounded TAO L-BFGS (lmvm)
     - --use-legacy-lbfgs: Use custom L-BFGS implementation (deprecated)
+    - --component-aware-cov: Use component-aware covariance (h vs u,v scaling)
 
 Note: Shallow water 4D-Var optimization can be challenging due to
 nonlinear dynamics. Line search failures may occur with large perturbations.
@@ -99,6 +100,10 @@ def parse_args():
     parser.add_argument(
         "--h-min", type=float, default=0.01,
         help="Minimum water depth for bounded optimization"
+    )
+    parser.add_argument(
+        "--component-aware-cov", action="store_true",
+        help="Use component-aware covariance (different variance for h vs u,v)"
     )
     return parser.parse_args()
 
@@ -260,15 +265,36 @@ def main():
 
     state_size = m_true.getSize()
 
-    # Background covariance: diagonal with variance = (background_error_std * magnitude)^2
-    truth_magnitude = np.abs(m_true.getArray()).mean()
-    background_variance = (config.background_error_std * truth_magnitude) ** 2
-    B = DiagonalCovariance(comm, state_size, variance=background_variance)
-
-    if rank == 0:
-        print(
-            f"  Background covariance: diagonal, variance = {background_variance:.6e}"
+    if args.component_aware_cov:
+        # Component-aware covariance: different variances for h vs u,v
+        # This improves conditioning and helps TAO line search convergence
+        from da_experiment_utils import (
+            estimate_component_variances,
+            create_component_aware_covariance,
         )
+
+        h_var, uv_var = estimate_component_variances(
+            m_true, error_fraction=config.background_error_std, n_vars=3
+        )
+        B = create_component_aware_covariance(
+            comm, state_size, n_vars=3, h_variance=h_var, velocity_variance=uv_var
+        )
+
+        if rank == 0:
+            print(f"  Background covariance: component-aware diagonal")
+            print(f"    h variance:  {h_var:.6e}")
+            print(f"    u,v variance: {uv_var:.6e}")
+            print(f"    Ratio (h/uv): {h_var/uv_var:.1f}x")
+    else:
+        # Uniform variance (legacy behavior)
+        truth_magnitude = np.abs(m_true.getArray()).mean()
+        background_variance = (config.background_error_std * truth_magnitude) ** 2
+        B = DiagonalCovariance(comm, state_size, variance=background_variance)
+
+        if rank == 0:
+            print(
+                f"  Background covariance: diagonal, variance = {background_variance:.6e}"
+            )
 
     # Observation covariance: diagonal based on noise level
     n_obs = obs_operator.get_num_observations()
@@ -379,10 +405,42 @@ def main():
     solver.storage.clear()
     problem.t = 0.0
 
+    # Project analysis onto feasible region if using bounded optimization
+    if not args.use_legacy_lbfgs and not args.no_bounds:
+        from da_experiment_utils import project_onto_bounds, create_physical_bounds
+        lower, upper = create_physical_bounds(m_analysis, h_min=args.h_min)
+        m_analysis = project_onto_bounds(m_analysis, lower, upper, inplace=True)
+        if rank == 0:
+            m_arr = m_analysis.getArray()
+            h_vals = m_arr[0::3]
+            if (h_vals < args.h_min).any():
+                print(f"  WARNING: Analysis still has h < h_min after projection")
+            else:
+                print(f"  Analysis projected onto feasible region (h_min={args.h_min})")
+
     m_analysis_array = m_analysis.getArray()
-    solver.u_n.x.array[:] = m_analysis_array
-    solver.u_n_old.x.array[:] = m_analysis_array
-    solver.u.x.array[:] = m_analysis_array
+
+    # Debug: check h values in analysis
+    if rank == 0:
+        h_vals = m_analysis_array[0::3]
+        print(f"  Analysis h after projection: min={h_vals.min():.4f}, max={h_vals.max():.4f}")
+        if (h_vals < 0).any():
+            print(f"  WARNING: {(h_vals < 0).sum()} negative h values in analysis!")
+
+    # Handle array size mismatch (owned DOFs vs owned+ghost)
+    u_owned_size = solver.V.dofmap.index_map.size_local
+    if len(m_analysis_array) == len(solver.u_n.x.array):
+        solver.u_n.x.array[:] = m_analysis_array
+        solver.u_n_old.x.array[:] = m_analysis_array
+        solver.u.x.array[:] = m_analysis_array
+    else:
+        solver.u_n.x.array[:u_owned_size] = m_analysis_array
+        solver.u_n_old.x.array[:u_owned_size] = m_analysis_array
+        solver.u.x.array[:u_owned_size] = m_analysis_array
+        # Update ghosts
+        solver.u_n.x.scatter_forward()
+        solver.u_n_old.x.scatter_forward()
+        solver.u.x.scatter_forward()
 
     solver.time_loop(
         solver_parameters=solver_params,

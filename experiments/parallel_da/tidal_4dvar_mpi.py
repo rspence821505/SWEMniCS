@@ -108,6 +108,10 @@ def parse_args():
         "--h-min", type=float, default=0.01,
         help="Minimum water depth for bounded optimization"
     )
+    parser.add_argument(
+        "--component-aware-cov", action="store_true",
+        help="Use component-aware covariance (different variance for h vs u,v)"
+    )
     return parser.parse_args()
 
 
@@ -303,16 +307,37 @@ def main():
 
     state_size = m_true.getSize()
 
-    # Background covariance
-    # Use factory method to match function space distribution
-    truth_magnitude = np.abs(m_true.getArray()).mean()
-    background_variance = (config.background_error_std * truth_magnitude) ** 2
-    B = DiagonalCovariance.from_function_space(solver.V, variance=background_variance)
-
-    if rank == 0:
-        print(
-            f"  Background covariance: diagonal, variance = {background_variance:.6e}"
+    if args.component_aware_cov:
+        # Component-aware covariance: different variances for h vs u,v
+        # This improves conditioning and helps TAO line search convergence
+        from da_experiment_utils import (
+            estimate_component_variances,
+            create_component_aware_covariance_from_function_space,
         )
+
+        h_var, uv_var = estimate_component_variances(
+            m_true, error_fraction=config.background_error_std, n_vars=3
+        )
+        B = create_component_aware_covariance_from_function_space(
+            solver.V, n_vars=3, h_variance=h_var, velocity_variance=uv_var, comm=comm
+        )
+
+        if rank == 0:
+            print(f"  Background covariance: component-aware diagonal")
+            print(f"    h variance:  {h_var:.6e}")
+            print(f"    u,v variance: {uv_var:.6e}")
+            print(f"    Ratio (h/uv): {h_var/uv_var:.1f}x")
+    else:
+        # Uniform variance (legacy behavior)
+        # Use factory method to match function space distribution
+        truth_magnitude = np.abs(m_true.getArray()).mean()
+        background_variance = (config.background_error_std * truth_magnitude) ** 2
+        B = DiagonalCovariance.from_function_space(solver.V, variance=background_variance)
+
+        if rank == 0:
+            print(
+                f"  Background covariance: diagonal, variance = {background_variance:.6e}"
+            )
 
     # Observation covariance
     # Use COMM_SELF since observations are replicated on all ranks

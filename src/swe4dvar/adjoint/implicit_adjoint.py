@@ -201,13 +201,20 @@ class ImplicitAdjointSolver:
                 f"got {len(observation_forcings)}"
             )
 
-        # Initialize adjoint at final time
+        # Initialize adjoint at final time by solving J_N^T λ_N = -f_N
+        # The adjoint equation at n=N is: J_N^T λ_N = terminal_forcing - f_N
+        # NOTE: Previous code incorrectly set λ_N = f_N directly without solving!
         lambda_next_next = None  # λ^{n+2}
-        lambda_next = terminal_forcing.copy()  # λ^{n+1}
 
-        # Add observation forcing at final time if present
+        # Build RHS for final time: terminal_forcing - f_N
+        final_rhs = terminal_forcing.copy()
         if observation_forcings[-1] is not None:
-            lambda_next.axpy(1.0, observation_forcings[-1])
+            final_rhs.axpy(-1.0, observation_forcings[-1])  # RHS = terminal - f_N
+
+        # Solve J_N^T λ_N = RHS
+        # Note: For n=N (final time), we use jacobians[N-1] = jacobians[num_steps-1]
+        lambda_next = self._solve_transpose_system(self.num_steps, final_rhs)
+        final_rhs.destroy()
 
         # Backward sweep: n = N-1, N-2, ..., 1
         # Note: We stop at n=1, not n=0, because n=0 (initial condition)
@@ -314,16 +321,26 @@ class ImplicitAdjointSolver:
         Compute gradient w.r.t. initial condition u^0.
 
         For the initial condition, there is no residual R^0 to linearize.
-        The gradient comes purely from time-coupling terms:
+        The gradient comes from time-coupling to R^1 and R^2:
 
-            ∂L/∂u^0 = obs_forcing + (4/(2Δt))·M·λ^1 - (1/(2Δt))·M·λ^2
+            ∂L/∂u^0 = λ_1^T ∂R^1/∂u^0 + λ_2^T ∂R^2/∂u^0 - obs_forcing
+
+        Where:
+        - R^1 uses backward Euler: ∂R^1/∂u^0 = -1/Δt · M
+        - R^2 uses BDF2: ∂R^2/∂u^0 = +1/(2Δt) · M
+
+        So: ∂L/∂u^0 = -(1/Δt)·M·λ^1 + (1/(2Δt))·M·λ^2 - obs_forcing
+
+        NOTE: This is DIFFERENT from interior adjoint steps which use
+        BDF2 coefficients (4/(2Δt), -1/(2Δt)). The initial condition
+        has special coefficients because R^1 uses backward Euler.
 
         Parameters
         ----------
         lambda_1 : PETSc.Vec
             Adjoint variable at time 1.
         lambda_2 : Optional[PETSc.Vec]
-            Adjoint variable at time 2 (None for Backward Euler).
+            Adjoint variable at time 2 (None for single step).
         obs_forcing : Optional[PETSc.Vec]
             Observation forcing at time 0 (if any).
 
@@ -332,26 +349,34 @@ class ImplicitAdjointSolver:
         PETSc.Vec
             Gradient ∂L/∂u^0.
         """
-        # Get time-coupling coefficients for initial condition
-        # For BDF2: c_1 = 4/(2Δt), c_2 = -1/(2Δt)
-        c_1, c_2 = self.time_coeffs.get_adjoint_coeffs(0)
+        # Get time step size
+        dt = self.dt if isinstance(self.dt, (float, int)) else self.dt[0]
         M = self._get_mass_matrix()
 
-        # Compute c_1·M·λ^1
+        # Coefficient for λ^1 from backward Euler R^1: -1/Δt
+        # Coefficient for λ^2 from BDF2 R^2: +1/(2Δt)
+        c_1 = -1.0 / dt  # From ∂R^1/∂u^0
+        c_2 = 1.0 / (2.0 * dt)  # From ∂R^2/∂u^0 (only for BDF2)
+
+        # Compute c_1·M·λ^1 = -(1/Δt)·M·λ^1
         result = lambda_1.duplicate()
         M.mult(lambda_1, result)
         result.scale(c_1)
 
-        # Add c_2·M·λ^2 (if BDF2 and λ^2 exists)
-        if lambda_2 is not None and abs(c_2) > 1e-14:
+        # Add c_2·M·λ^2 = +(1/(2Δt))·M·λ^2 (if BDF2 and λ^2 exists)
+        if self.use_bdf2 and lambda_2 is not None:
             temp = lambda_1.duplicate()
             M.mult(lambda_2, temp)
             result.axpy(c_2, temp)
             temp.destroy()
 
-        # Add observation forcing (if present)
+        # ADD observation forcing at t=0 (if present)
+        # NOTE: For initial condition, the gradient is:
+        #   λ_0 = (time coupling) + ∂J_obs/∂u_0
+        # This is DIFFERENT from interior points where forcing is SUBTRACTED.
+        # The observation term at t=0 directly contributes to ∂J/∂m since u_0 = m.
         if obs_forcing is not None:
-            result.axpy(1.0, obs_forcing)
+            result.axpy(+1.0, obs_forcing)
 
         return result
 
@@ -366,7 +391,11 @@ class ImplicitAdjointSolver:
         Assemble RHS for adjoint step.
 
         For BDF2, the adjoint time coupling is:
-            RHS = c_{n+1}·M·λ^{n+1} + c_{n+2}·M·λ^{n+2} + obs_forcing
+            RHS = c_{n+1}·M·λ^{n+1} + c_{n+2}·M·λ^{n+2} - obs_forcing
+
+        Note: The observation forcing is SUBTRACTED because the adjoint equation
+        comes from setting ∂L/∂u_n = 0 where L = J + Σ λ^T R. This gives:
+            J_n^T λ_n = -∂J_obs/∂u_n + (time coupling terms)
 
         The coefficients come from BDF2TimeCoefficients and support both
         BDF2 and Backward Euler schemes, as well as adaptive time-stepping.
@@ -411,9 +440,9 @@ class ImplicitAdjointSolver:
             forcing.axpy(c_next_next, temp)
             temp.destroy()
 
-        # Add observation forcing
+        # SUBTRACT observation forcing (from ∂L/∂u_n = 0 gives -∂J_obs/∂u_n)
         if obs_forcing is not None:
-            forcing.axpy(1.0, obs_forcing)
+            forcing.axpy(-1.0, obs_forcing)
 
         return forcing
 

@@ -126,6 +126,24 @@ class ForwardModelWrapper:
         # MPI communicator
         self.comm = MPI.COMM_WORLD
 
+        # Expose variational form for adjoint solver to get mass matrix
+        # The variational form is created by the solver during initialization
+        self.var_form = getattr(solver, 'var_form', None)
+        if self.var_form is None:
+            # Try to create a SWEVariationalForm if V is available
+            try:
+                from swe4dvar.forward.variational_forms import SWEVariationalForm
+                # SWEVariationalForm requires function_space and dt
+                self.var_form = SWEVariationalForm(solver.V, problem.dt)
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"Could not create variational form for mass matrix: {e}. "
+                    "Adjoint solver will use identity matrix fallback.",
+                    RuntimeWarning
+                )
+                self.var_form = None
+
     def solve(
         self,
         m: PETSc.Vec,
@@ -479,6 +497,194 @@ def compute_innovation_statistics(
     return float(np.mean(all_innovations)), float(np.std(all_innovations))
 
 
+def create_component_aware_covariance(
+    comm: MPI.Comm,
+    state_size: int,
+    n_vars: int = 3,
+    h_variance: float = 1.0,
+    velocity_variance: float = 0.01,
+) -> "DiagonalCovariance":
+    """
+    Create component-aware background covariance for shallow water state.
+
+    For shallow water equations with state [h, hu, hv] or [h, u, v], the
+    different state variables have vastly different magnitudes:
+    - Water depth h: typically O(10) meters
+    - Velocities u, v: typically O(0.01-0.1) m/s
+
+    Using uniform variance creates gradient imbalance that causes
+    TAO line search failures. This function creates component-specific
+    variances to properly scale the optimization problem.
+
+    Parameters
+    ----------
+    comm : MPI.Comm
+        MPI communicator.
+    state_size : int
+        Total size of state vector.
+    n_vars : int
+        Number of variables per node (default: 3 for h, hu/u, hv/v).
+    h_variance : float
+        Variance for water depth h (default: 1.0).
+        Typical value: (σ_h * |h_mean|)² where σ_h ~ 0.1
+    velocity_variance : float
+        Variance for velocity components (default: 0.01).
+        Typical value: (σ_v * |v_mean|)² where σ_v ~ 0.01-0.1
+
+    Returns
+    -------
+    DiagonalCovariance
+        Component-aware diagonal covariance matrix.
+
+    Example
+    -------
+    >>> # For h ~ 10m with 10% error, velocity ~ 0.1 m/s with 10% error
+    >>> h_var = (0.1 * 10.0)**2  # = 1.0
+    >>> v_var = (0.1 * 0.1)**2   # = 0.0001
+    >>> B = create_component_aware_covariance(comm, state_size, h_variance=h_var, velocity_variance=v_var)
+    """
+    from swe4dvar.data_assimilation import DiagonalCovariance
+
+    n_nodes = state_size // n_vars
+
+    # Build diagonal variance array
+    variances = np.zeros(state_size)
+    for i in range(n_nodes):
+        # Water depth h
+        variances[i * n_vars] = h_variance
+        # Momentum/velocity components
+        for j in range(1, n_vars):
+            variances[i * n_vars + j] = velocity_variance
+
+    return DiagonalCovariance(comm, state_size, diagonal=variances)
+
+
+def create_component_aware_covariance_from_function_space(
+    function_space,
+    n_vars: int = 3,
+    h_variance: float = 1.0,
+    velocity_variance: float = 0.01,
+    comm: MPI.Comm = None,
+) -> "DiagonalCovariance":
+    """
+    Create component-aware covariance matching a DOLFINx function space.
+
+    Similar to create_component_aware_covariance but uses DOLFINx
+    function space for proper MPI distribution.
+
+    Parameters
+    ----------
+    function_space : dolfinx.fem.FunctionSpace
+        DOLFINx function space to match distribution of.
+    n_vars : int
+        Number of variables per node (default: 3 for h, hu/u, hv/v).
+    h_variance : float
+        Variance for water depth h.
+    velocity_variance : float
+        Variance for velocity components.
+    comm : MPI.Comm, optional
+        MPI communicator (defaults to function space's communicator).
+
+    Returns
+    -------
+    DiagonalCovariance
+        Component-aware diagonal covariance with MPI distribution.
+    """
+    from swe4dvar.data_assimilation import DiagonalCovariance
+    from dolfinx import la
+
+    if comm is None:
+        comm = function_space.mesh.comm
+
+    size = function_space.dofmap.index_map.size_global
+    local_size = function_space.dofmap.index_map.size_local
+
+    # Create instance matching function space distribution
+    instance = DiagonalCovariance.__new__(DiagonalCovariance)
+    instance.comm = comm
+    instance.size = size
+    instance.local_size = local_size
+    instance.ownership_range = (
+        function_space.dofmap.index_map.local_range[0],
+        function_space.dofmap.index_map.local_range[1],
+    )
+
+    # Create diagonal vector using function space's index_map
+    instance.diagonal = la.create_petsc_vector(
+        function_space.dofmap.index_map,
+        function_space.dofmap.index_map_bs,
+    )
+
+    # Get local range for this process
+    start, end = instance.ownership_range
+    local_arr = instance.diagonal.getArray()
+    n_local = end - start
+    n_nodes_local = n_local // n_vars
+
+    # Set variances for local portion
+    for i in range(n_nodes_local):
+        local_arr[i * n_vars] = h_variance
+        for j in range(1, n_vars):
+            local_arr[i * n_vars + j] = velocity_variance
+
+    instance.diagonal.assemble()
+
+    # Precompute inverse
+    instance.inv_diagonal = instance.diagonal.duplicate()
+    instance.diagonal.copy(instance.inv_diagonal)
+    instance.inv_diagonal.reciprocal()
+
+    return instance
+
+
+def estimate_component_variances(
+    truth: PETSc.Vec,
+    error_fraction: float = 0.1,
+    n_vars: int = 3,
+) -> Tuple[float, float]:
+    """
+    Estimate component-specific variances from truth state.
+
+    Analyzes the truth state to determine appropriate variance scaling
+    for water depth vs velocity components.
+
+    Parameters
+    ----------
+    truth : PETSc.Vec
+        True initial condition.
+    error_fraction : float
+        Error as fraction of component magnitude (default: 0.1 = 10%).
+    n_vars : int
+        Number of variables per node (default: 3).
+
+    Returns
+    -------
+    h_variance : float
+        Recommended variance for water depth.
+    velocity_variance : float
+        Recommended variance for velocity components.
+    """
+    arr = truth.getArray()
+    n_nodes = len(arr) // n_vars
+
+    # Extract component values
+    h_values = arr[0::n_vars]  # Every n_vars-th element starting at 0
+    uv_values = []
+    for j in range(1, n_vars):
+        uv_values.extend(arr[j::n_vars].tolist())
+    uv_values = np.array(uv_values)
+
+    # Compute magnitudes
+    h_mag = np.abs(h_values).mean() + 1e-10
+    uv_mag = np.abs(uv_values).mean() + 1e-10
+
+    # Compute variances: σ² = (error_fraction * magnitude)²
+    h_variance = (error_fraction * h_mag) ** 2
+    velocity_variance = (error_fraction * uv_mag) ** 2
+
+    return h_variance, velocity_variance
+
+
 def save_experiment_results(
     results: DAExperimentResults,
     output_dir: str = "outputs/data"
@@ -588,6 +794,47 @@ def create_physical_bounds(
     return lower, upper
 
 
+def project_onto_bounds(
+    m: PETSc.Vec,
+    lower: PETSc.Vec,
+    upper: PETSc.Vec,
+    inplace: bool = False,
+) -> PETSc.Vec:
+    """
+    Project a vector onto box constraints.
+
+    Parameters
+    ----------
+    m : PETSc.Vec
+        Vector to project.
+    lower : PETSc.Vec
+        Lower bounds.
+    upper : PETSc.Vec
+        Upper bounds.
+    inplace : bool
+        If True, modify m in place. Otherwise return a copy.
+
+    Returns
+    -------
+    PETSc.Vec
+        Projected vector.
+    """
+    if inplace:
+        result = m
+    else:
+        result = m.copy()
+
+    m_arr = result.getArray()
+    lo_arr = lower.getArray()
+    up_arr = upper.getArray()
+
+    # Project: max(lower, min(upper, m))
+    np.clip(m_arr, lo_arr, up_arr, out=m_arr)
+
+    result.assemble()
+    return result
+
+
 def create_tao_optimizer(
     cost_function,
     m_template: PETSc.Vec,
@@ -615,19 +862,30 @@ def create_tao_optimizer(
     -------
     optimizer : PETScTAOWrapper
         Configured TAO optimizer.
+
+    Note
+    ----
+    When use_bounds=True, the optimizer stores the bounds as attributes
+    (optimizer.lower_bounds, optimizer.upper_bounds) for projecting
+    initial points before calling solve().
     """
     from swe4dvar.optimization.petsc_tao_wrapper import PETScTAOWrapper
+
+    # Get scaling diagonal if provided for better conditioning
+    scaling = options.get("scaling_diagonal", None)
+    if scaling is not None and hasattr(PETScTAOWrapper, "set_initial_hessian"):
+        # Future: TAO preconditioning support
+        pass
 
     if use_bounds:
         lower, upper = create_physical_bounds(m_template, h_min=h_min)
         tao_type = "blmvm"  # Bounded L-BFGS
 
-        # Project initial point onto feasible region if needed
+        # Check for bound violations
         m_arr = m_template.getArray()
         lo_arr = lower.getArray()
         up_arr = upper.getArray()
 
-        # Check for bound violations and warn
         below = m_arr < lo_arr
         above = m_arr > up_arr
         if below.any() or above.any():
@@ -635,7 +893,7 @@ def create_tao_optimizer(
             n_violations = below.sum() + above.sum()
             warnings.warn(
                 f"Initial point violates {n_violations} bounds. "
-                "TAO will project to feasible region.",
+                "Use project_onto_bounds() before calling solve().",
                 RuntimeWarning,
                 stacklevel=2
             )
