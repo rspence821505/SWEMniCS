@@ -1263,7 +1263,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         self._ensure_wme_predicted_covariance()
         L_inv_delta = self._L_wme.apply_inverse(delta_Q)
 
-        forcing = Q_wme_m.duplicate()
+        # Use copy() not duplicate() - duplicate() creates empty vector!
+        forcing = Q_wme_m.copy()
         forcing.axpy(-1.0, L_inv_delta)
 
         # Apply adjoint of WME Jacobian
@@ -1272,6 +1273,10 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         # Accumulate
         grad.axpy(1.0, grad_wme)
+
+        # Zero boundary DOF gradients (same as standard 4D-Var adjoint)
+        # BC DOFs are fixed and should not be modified by the optimizer
+        grad = self._zero_boundary_gradient(grad)
 
         return grad
 
@@ -1339,7 +1344,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         self._ensure_wme_predicted_covariance()
         L_inv_delta = self._L_wme.apply_inverse(delta_Q)
 
-        forcing = Q_wme_m.duplicate()
+        # Use copy() not duplicate() - duplicate() creates empty vector!
+        forcing = Q_wme_m.copy()
         forcing.axpy(-1.0, L_inv_delta)
 
         # Apply adjoint of WME Jacobian
@@ -1349,7 +1355,51 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         # Accumulate
         grad.axpy(1.0, grad_wme)
 
+        # Zero boundary DOF gradients (same as standard 4D-Var adjoint)
+        grad = self._zero_boundary_gradient(grad)
+
         return cost, grad
+
+    def _zero_boundary_gradient(self, grad: PETSc.Vec) -> PETSc.Vec:
+        """
+        Zero gradient at boundary DOFs.
+
+        BC DOFs are fixed in the forward problem, so their gradient should
+        be zero to prevent the optimizer from modifying them.
+
+        Parameters
+        ----------
+        grad : PETSc.Vec
+            Gradient vector to modify in-place.
+
+        Returns
+        -------
+        PETSc.Vec
+            Modified gradient with zeros at boundary DOFs.
+        """
+        from ..utils import get_boundary_dofs
+
+        # Get boundary DOFs using topological detection
+        bc_dof_indices = None
+        if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model, 'problem'):
+            V = self.forward_model.solver.V
+            mesh = self.forward_model.problem.mesh
+            boundary_dofs = get_boundary_dofs(V, mesh)
+            bc_dof_indices = set(boundary_dofs.tolist())
+        elif hasattr(self.forward_model, 'V') and hasattr(self.forward_model, 'mesh'):
+            V = self.forward_model.V
+            mesh = self.forward_model.mesh
+            boundary_dofs = get_boundary_dofs(V, mesh)
+            bc_dof_indices = set(boundary_dofs.tolist())
+
+        if bc_dof_indices is not None and len(bc_dof_indices) > 0:
+            grad_arr = grad.getArray()
+            for dof in bc_dof_indices:
+                if dof < len(grad_arr):
+                    grad_arr[dof] = 0.0
+            grad.setArray(grad_arr)
+
+        return grad
 
 
 # Factory function for creating cost functions
