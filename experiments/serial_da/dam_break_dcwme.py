@@ -17,10 +17,16 @@ DC-WME is particularly suited for:
 
 Twin Experiment Setup:
 1. Run forward model with true initial condition to generate truth trajectory
-2. Sample observations at 50% of spatial points with regular frequency
+2. Sample observations at 50% of INTERIOR spatial points with regular frequency
 3. Add 1% Gaussian noise to observations
 4. Define background state with 10% error from truth
 5. Minimize DC-WME-4DVar cost function using PETSc TAO L-BFGS (default)
+
+NOTE: Observations are taken only from interior mesh nodes (away from domain
+boundaries) to avoid gradient errors associated with Dirichlet boundary
+conditions. The discrete adjoint Jacobians have identity rows at boundary
+DOFs due to strong BC imposition, which causes incorrect gradient propagation
+for boundary observations.
 
 Optimizer Options:
     - Default: PETSc TAO bounded L-BFGS (blmvm) with physical constraints
@@ -61,7 +67,7 @@ from da_experiment_utils import (
     DAExperimentConfig,
     DAExperimentResults,
     ForwardModelWrapper,
-    generate_observation_points,
+    generate_interior_observation_points,
     generate_observations,
     generate_background_state,
     compute_rms_error,
@@ -217,15 +223,19 @@ def main():
     if rank == 0:
         print("\nStep 2: Setting up observations...")
 
-    # Generate observation points
-    obs_points = generate_observation_points(
+    # Generate interior-only observation points
+    # NOTE: We observe only interior nodes to avoid gradient errors from
+    # Dirichlet boundary conditions. The discrete adjoint Jacobians have
+    # identity rows at boundary DOFs, which causes incorrect gradient
+    # propagation for boundary observations.
+    obs_points = generate_interior_observation_points(
         problem.mesh,
         fraction=config.obs_fraction,
         seed=42
     )
 
     if rank == 0:
-        print(f"  Observation points: {len(obs_points)}")
+        print(f"  Interior observation points: {len(obs_points)}")
 
     # Create observation operator
     obs_operator = PointObservationOperator(

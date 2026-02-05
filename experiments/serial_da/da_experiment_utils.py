@@ -312,6 +312,89 @@ def generate_observation_points(
     return obs_points
 
 
+def generate_interior_observation_points(
+    mesh,
+    fraction: float = 0.5,
+    seed: int = 42,
+    boundary_tol: float = 1e-10,
+) -> np.ndarray:
+    """
+    Generate random observation points from interior mesh nodes only.
+
+    This function filters out nodes on the domain boundary to avoid gradient
+    errors associated with Dirichlet boundary condition treatment in the
+    adjoint solver. The discrete adjoint Jacobians have identity rows at
+    boundary DOFs due to strong BC imposition, which causes incorrect
+    gradient propagation for boundary observations.
+
+    Parameters
+    ----------
+    mesh : dolfinx.mesh.Mesh
+        Computational mesh.
+    fraction : float
+        Fraction of interior nodes to use as observation points.
+    seed : int
+        Random seed for reproducibility.
+    boundary_tol : float
+        Tolerance for boundary detection. Nodes within this distance
+        of the domain boundary are excluded.
+
+    Returns
+    -------
+    obs_points : np.ndarray
+        Array of interior observation point coordinates, shape (n_obs, 3).
+
+    Notes
+    -----
+    For shallow water equations with wall boundaries, velocity DOFs on
+    boundaries have Dirichlet conditions (no-normal-flow). Observing these
+    DOFs leads to gradient errors because the adjoint Jacobian structure
+    differs from what the discrete adjoint formulation expects.
+
+    Interior nodes (away from all boundaries) produce correct gradients
+    for all state components (h, ux, uy).
+    """
+    rng = np.random.default_rng(seed)
+
+    # Get mesh coordinates
+    coords = mesh.geometry.x
+    n_points = coords.shape[0]
+
+    # Determine domain bounds
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+
+    # Find interior nodes (not on any boundary)
+    interior_mask = (
+        (coords[:, 0] > x_min + boundary_tol) &
+        (coords[:, 0] < x_max - boundary_tol) &
+        (coords[:, 1] > y_min + boundary_tol) &
+        (coords[:, 1] < y_max - boundary_tol)
+    )
+    interior_indices = np.where(interior_mask)[0]
+    n_interior = len(interior_indices)
+
+    if n_interior == 0:
+        raise ValueError(
+            "No interior nodes found. Mesh may be too coarse or "
+            "boundary_tol too large. Try reducing boundary_tol or "
+            "using a finer mesh."
+        )
+
+    # Select random subset of interior nodes
+    n_obs = int(n_interior * fraction)
+    n_obs = max(1, n_obs)  # Ensure at least one observation
+
+    selected_local = rng.choice(n_interior, size=min(n_obs, n_interior), replace=False)
+    selected_indices = interior_indices[selected_local]
+
+    # Ensure 3D coordinates for DOLFINx
+    obs_points = np.zeros((len(selected_indices), 3))
+    obs_points[:, :coords.shape[1]] = coords[selected_indices, :]
+
+    return obs_points
+
+
 def generate_observations(
     trajectory: List[PETSc.Vec],
     obs_operator,
