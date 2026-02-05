@@ -539,6 +539,7 @@ class FourDVarCost(CostFunction):
 
         # Solve adjoint using implicit adjoint solver
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
+        from ..utils import get_boundary_dofs
 
         # Check if forward model has a variational form (for BDF2 time coefficients)
         # Look in multiple places since forward_model may be a wrapper
@@ -547,12 +548,31 @@ class FourDVarCost(CostFunction):
             # ForwardModelWrapper wraps the actual solver
             variational_form = getattr(self.forward_model.solver, 'var_form', None)
 
+        # Get boundary DOFs for proper adjoint BC handling
+        # For discrete adjoint (DTO), we need to zero the adjoint at all boundary DOFs
+        # This uses topological detection to find ALL boundary DOFs, including
+        # those from wall BCs (velocity) that the problem may not explicitly track
+        bc_dof_indices = None
+        if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model, 'problem'):
+            # ForwardModelWrapper provides access to solver and problem
+            V = self.forward_model.solver.V
+            mesh = self.forward_model.problem.mesh
+            boundary_dofs = get_boundary_dofs(V, mesh)
+            bc_dof_indices = set(boundary_dofs.tolist())
+        elif hasattr(self.forward_model, 'V') and hasattr(self.forward_model, 'mesh'):
+            # Direct solver access
+            V = self.forward_model.V
+            mesh = self.forward_model.mesh
+            boundary_dofs = get_boundary_dofs(V, mesh)
+            bc_dof_indices = set(boundary_dofs.tolist())
+
         adjoint_solver = ImplicitAdjointSolver(
             self.forward_model,
             trajectory,
             jacobians,
             self.forward_model.dt,
-            variational_form=variational_form  # NEW: Pass variational form if available
+            variational_form=variational_form,
+            bc_dof_indices=bc_dof_indices  # Pass boundary DOFs for proper adjoint BCs
         )
 
         # Terminal condition (usually zero)

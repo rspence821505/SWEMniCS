@@ -273,6 +273,250 @@ class ForwardModelWrapper:
         return self._mass_matrix
 
 
+def get_boundary_dofs(V, mesh) -> np.ndarray:
+    """
+    Get DOF indices that lie on the domain boundary.
+
+    Parameters
+    ----------
+    V : dolfinx.fem.FunctionSpace
+        Function space.
+    mesh : dolfinx.mesh.Mesh
+        Computational mesh.
+
+    Returns
+    -------
+    boundary_dofs : np.ndarray
+        Array of DOF indices on the boundary.
+    """
+    import dolfinx
+    from dolfinx.mesh import locate_entities_boundary
+
+    tdim = mesh.topology.dim
+    fdim = tdim - 1
+
+    def on_boundary(x):
+        return np.full(x.shape[1], True)
+
+    boundary_facets = locate_entities_boundary(mesh, fdim, on_boundary)
+    boundary_dofs = dolfinx.fem.locate_dofs_topological(V, fdim, boundary_facets)
+
+    return boundary_dofs
+
+
+class ZeroBoundaryGradientCost:
+    """
+    Wrapper that zeros gradient at boundary DOFs.
+
+    This allows optimization of only interior DOFs while fixing boundary
+    values at their initial state. Useful when the adjoint solver has
+    issues computing gradients at boundary DOFs.
+
+    Parameters
+    ----------
+    base_cost : CostFunctionBase
+        The underlying 4D-Var cost function.
+    boundary_dofs : np.ndarray
+        Indices of DOFs to zero out in the gradient.
+
+    Notes
+    -----
+    The discrete adjoint Jacobians have identity rows at boundary DOFs due to
+    strong Dirichlet BC imposition, which can cause incorrect gradient
+    propagation for boundary observations. Zeroing these gradients constrains
+    the optimization to only modify interior DOF values.
+    """
+
+    def __init__(self, base_cost, boundary_dofs: np.ndarray):
+        self.base_cost = base_cost
+        self.boundary_dofs = boundary_dofs
+
+    def value(self, m: PETSc.Vec) -> float:
+        """Evaluate cost function."""
+        return self.base_cost.value(m)
+
+    def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
+        """Compute gradient with boundary DOFs zeroed."""
+        grad = self.base_cost.gradient(m)
+        grad_arr = grad.getArray()
+        grad_arr[self.boundary_dofs] = 0.0
+        grad.setArray(grad_arr)
+        return grad
+
+    def value_gradient(self, m: PETSc.Vec):
+        """Compute cost and gradient together, with boundary DOFs zeroed."""
+        cost, grad = self.base_cost.value_gradient(m)
+        grad_arr = grad.getArray()
+        grad_arr[self.boundary_dofs] = 0.0
+        grad.setArray(grad_arr)
+        return cost, grad
+
+    def clear_cache(self):
+        """Clear any cached computations."""
+        if hasattr(self.base_cost, 'clear_cache'):
+            self.base_cost.clear_cache()
+
+
+class SimpleGradientDescentOptimizer:
+    """
+    Simple gradient descent optimizer with Armijo backtracking line search.
+
+    This is a fallback optimizer for cases where TAO's line search is too
+    aggressive. Uses small initial step sizes and simple backtracking.
+
+    Parameters
+    ----------
+    cost_function : CostFunctionBase
+        Cost function with value() and gradient() or value_gradient() methods.
+    max_iterations : int
+        Maximum number of iterations.
+    initial_alpha : float
+        Initial step size for line search.
+    min_alpha : float
+        Minimum step size before declaring failure.
+    armijo_c : float
+        Armijo condition parameter (default 1e-4).
+    gradient_tolerance : float
+        Convergence tolerance on gradient norm.
+    verbose : bool
+        Print progress information.
+
+    Attributes
+    ----------
+    iteration : int
+        Number of iterations completed.
+    converged : bool
+        Whether optimization converged.
+    convergence_history : list
+        History of cost and gradient norm at each iteration.
+    """
+
+    def __init__(
+        self,
+        cost_function,
+        max_iterations: int = 50,
+        initial_alpha: float = 0.01,
+        min_alpha: float = 1e-12,
+        armijo_c: float = 1e-4,
+        gradient_tolerance: float = 1e-8,
+        verbose: bool = True,
+    ):
+        self.cost_function = cost_function
+        self.max_iterations = max_iterations
+        self.initial_alpha = initial_alpha
+        self.min_alpha = min_alpha
+        self.armijo_c = armijo_c
+        self.gradient_tolerance = gradient_tolerance
+        self.verbose = verbose
+
+        self.iteration = 0
+        self.converged = False
+        self.convergence_history = []
+
+    def solve(self, m0: PETSc.Vec) -> PETSc.Vec:
+        """
+        Minimize cost function starting from m0.
+
+        Parameters
+        ----------
+        m0 : PETSc.Vec
+            Initial guess.
+
+        Returns
+        -------
+        m : PETSc.Vec
+            Optimized solution.
+        """
+        m = m0.copy()
+        m_arr = m.getArray().copy()
+
+        if self.verbose:
+            print("=" * 70)
+            print("Simple Gradient Descent Optimizer")
+            print("=" * 70)
+            print(f"  {'Iter':>4}  {'Cost':>15}  {'||grad||':>12}  {'Alpha':>10}")
+            print("-" * 70)
+
+        for iteration in range(self.max_iterations):
+            # Evaluate cost and gradient
+            if hasattr(self.cost_function, 'clear_cache'):
+                self.cost_function.clear_cache()
+
+            if hasattr(self.cost_function, 'value_gradient'):
+                cost, grad = self.cost_function.value_gradient(m)
+                grad_arr = grad.getArray().copy()
+                grad.destroy()
+            else:
+                cost = self.cost_function.value(m)
+                grad = self.cost_function.gradient(m)
+                grad_arr = grad.getArray().copy()
+                grad.destroy()
+
+            grad_norm = np.linalg.norm(grad_arr)
+
+            # Record history
+            self.convergence_history.append({
+                "cost": float(cost),
+                "grad_norm": float(grad_norm),
+            })
+
+            if iteration == 0 and self.verbose:
+                print(f"  {iteration:4d}  {cost:15.8e}  {grad_norm:12.6e}  {'N/A':>10}")
+
+            # Check convergence
+            if grad_norm < self.gradient_tolerance:
+                self.converged = True
+                if self.verbose:
+                    print(f"Converged: gradient norm {grad_norm:.2e} < {self.gradient_tolerance:.2e}")
+                break
+
+            # Backtracking line search
+            alpha = self.initial_alpha
+            search_dir = -grad_arr
+
+            step_accepted = False
+            while alpha > self.min_alpha:
+                m_new_arr = m_arr + alpha * search_dir
+                m_new = m.duplicate()
+                m_new.setArray(m_new_arr)
+
+                if hasattr(self.cost_function, 'clear_cache'):
+                    self.cost_function.clear_cache()
+
+                try:
+                    new_cost = self.cost_function.value(m_new)
+
+                    # Armijo condition: f(x + alpha*d) <= f(x) + c*alpha*grad'*d
+                    expected_decrease = self.armijo_c * alpha * np.dot(grad_arr, search_dir)
+                    if np.isfinite(new_cost) and new_cost <= cost + expected_decrease:
+                        m_arr = m_new_arr.copy()
+                        m.setArray(m_arr)
+                        step_accepted = True
+                        m_new.destroy()
+
+                        if self.verbose:
+                            print(f"  {iteration+1:4d}  {new_cost:15.8e}  {grad_norm:12.6e}  {alpha:10.2e}")
+
+                        break
+                except Exception:
+                    pass
+
+                alpha *= 0.5
+                m_new.destroy()
+
+            if not step_accepted:
+                if self.verbose:
+                    print(f"Line search failed at iteration {iteration + 1}")
+                break
+
+            self.iteration = iteration + 1
+
+        if self.verbose:
+            print("=" * 70)
+
+        return m
+
+
 def generate_observation_points(
     mesh,
     fraction: float = 0.5,

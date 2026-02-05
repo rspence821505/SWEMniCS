@@ -15,7 +15,7 @@ shared across solver implementations, including:
 - non-blocking communication utilities
 """
 
-from .fem_utilities import create_element, create_mixed_element
+from .fem_utilities import create_element, create_mixed_element, get_boundary_dofs
 from .observation_stations import StationManager
 from .timestep_manager import TimeStepDataManager
 from .solver_storage import SolverStateStorage
@@ -62,6 +62,7 @@ from .output_paths import (
 __all__ = [
     "create_element",
     "create_mixed_element",
+    "get_boundary_dofs",
     "StationManager",
     "TimeStepDataManager",
     "SolverStateStorage",

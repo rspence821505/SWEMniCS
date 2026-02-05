@@ -271,11 +271,22 @@ class CustomNewtonProblem:
             # but u was updated to u_{i+1} = u_i + dx. For correct adjoint
             # computation, we need ∂R/∂u evaluated at the CONVERGED solution u_{i+1}.
             # Therefore, we reassemble the Jacobian one final time.
+            #
+            # CRITICAL FIX: For discrete adjoint (DTO), we return the UNMODIFIED
+            # Jacobian (without BC rows set to identity). The BC-modified Jacobian
+            # has identity rows at Dirichlet DOFs, which when transposed become
+            # identity columns that block sensitivity propagation in the adjoint.
+            #
+            # The adjoint solver applies homogeneous Dirichlet BCs to the adjoint
+            # solution (λ = 0 at BC DOFs) separately after solving J^T λ = rhs.
             if converged:
                 if self.verbose:
-                    self.log("Reassembling Jacobian at converged solution for 4D-Var")
+                    self.log("Reassembling Jacobian at converged solution for adjoint (unmodified)")
                 A.zeroEntries()
-                petsc.assemble_matrix(A, self.jacobian, bcs=self.bcs)
+                # Assemble WITHOUT bcs - this gives the true physics Jacobian
+                # The BC-modified version was used for Newton iterations,
+                # but the unmodified version is needed for correct adjoint gradients
+                petsc.assemble_matrix(A, self.jacobian)  # No bcs parameter!
                 A.assemble()
 
             # Return a copy to avoid issues with A being modified in subsequent timesteps

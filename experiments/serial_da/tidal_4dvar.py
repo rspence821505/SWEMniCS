@@ -64,6 +64,9 @@ from da_experiment_utils import (
     compute_innovation_statistics,
     save_experiment_results,
     create_tao_optimizer,
+    get_boundary_dofs,
+    ZeroBoundaryGradientCost,
+    SimpleGradientDescentOptimizer,
 )
 
 
@@ -110,6 +113,10 @@ def parse_args():
     parser.add_argument(
         "--component-aware-cov", action="store_true",
         help="Use component-aware covariance (different variance for h vs u,v)"
+    )
+    parser.add_argument(
+        "--use-simple-gd", action="store_true",
+        help="Use simple gradient descent instead of TAO (more robust for difficult problems)"
     )
     return parser.parse_args()
 
@@ -332,7 +339,7 @@ def main():
     if rank == 0:
         print("\nStep 6: Setting up 4D-Var cost function...")
 
-    cost_function = FourDVarCost(
+    base_cost_function = FourDVarCost(
         forward_model=forward_model,
         observation_operator=obs_operator,
         background_cov=B,
@@ -342,6 +349,16 @@ def main():
         obs_times=obs_times,
         comm=comm,
     )
+
+    # Wrap cost function to zero boundary gradients
+    # This fixes boundary DOF values during optimization since the discrete
+    # adjoint has issues with gradient accuracy at boundary DOFs
+    boundary_dofs = get_boundary_dofs(solver.V, problem.mesh)
+    cost_function = ZeroBoundaryGradientCost(base_cost_function, boundary_dofs)
+
+    if rank == 0:
+        all_dofs = solver.V.dofmap.index_map.size_local * solver.V.dofmap.index_map_bs
+        print(f"  Zeroing {len(boundary_dofs)}/{all_dofs} boundary DOF gradients")
 
     # =========================================================================
     # Step 8: Run optimization
@@ -353,7 +370,20 @@ def main():
         "verbose": (rank == 0),
     }
 
-    if args.use_legacy_lbfgs:
+    if args.use_simple_gd:
+        # Simple gradient descent with backtracking (more robust)
+        if rank == 0:
+            print("\nStep 7: Running simple gradient descent optimization...")
+            print("  Using Armijo backtracking line search with small initial steps")
+
+        optimizer = SimpleGradientDescentOptimizer(
+            cost_function,
+            max_iterations=config.max_iterations,
+            initial_alpha=0.01,  # Small initial step size
+            gradient_tolerance=config.gradient_tolerance,
+            verbose=(rank == 0),
+        )
+    elif args.use_legacy_lbfgs:
         # Legacy L-BFGS (deprecated)
         if rank == 0:
             print("\nStep 7: Running legacy L-BFGS optimization...")
