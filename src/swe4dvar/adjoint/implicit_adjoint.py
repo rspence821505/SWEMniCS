@@ -631,10 +631,11 @@ class ImplicitAdjointSolver:
         J = self.jacobians[n - 1]
 
         # Create KSP solver on the Jacobian's communicator
+        # Use direct solver (LU) for stability, matching forward solver
         ksp = PETSc.KSP().create(J.getComm())
         ksp.setOperators(J)
-        ksp.setType(PETSc.KSP.Type.GMRES)
-        ksp.getPC().setType(PETSc.PC.Type.NONE)
+        ksp.setType(PETSc.KSP.Type.PREONLY)
+        ksp.getPC().setType(PETSc.PC.Type.LU)
         ksp.setTolerances(rtol=1e-10, atol=1e-12)
 
         # Set transpose mode - this is critical!

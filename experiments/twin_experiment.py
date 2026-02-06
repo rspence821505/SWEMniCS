@@ -1142,22 +1142,29 @@ class TwinExperiment:
         return optimizer, opt_time
 
     def _create_physical_bounds(self, n_vars: int = 3):
-        """Create physical bounds for the control variable."""
+        """Create physical bounds for the control variable.
+
+        Uses proper component DOF indices for mixed elements where DOFs
+        may not be interleaved in the simple [h,u,v,h,u,v,...] pattern.
+        """
         lower = self.m_background.duplicate()
         upper = self.m_background.duplicate()
 
         lower_array = lower.getArray()
         upper_array = upper.getArray()
 
-        n_dofs = len(lower_array)
-        n_nodes = n_dofs // n_vars
+        # Use proper component DOF indices
+        h_indices, u_indices, v_indices = self._get_component_dof_indices()
 
-        for i in range(n_nodes):
-            lower_array[i * n_vars] = self.config.h_min
-            upper_array[i * n_vars] = 1e10
-            for j in range(1, n_vars):
-                lower_array[i * n_vars + j] = -1e10
-                upper_array[i * n_vars + j] = 1e10
+        # h: constrained to be positive (h >= h_min)
+        lower_array[h_indices] = self.config.h_min
+        upper_array[h_indices] = 1e10
+
+        # u, v: unconstrained
+        lower_array[u_indices] = -1e10
+        upper_array[u_indices] = 1e10
+        lower_array[v_indices] = -1e10
+        upper_array[v_indices] = 1e10
 
         lower.setArray(lower_array)
         upper.setArray(upper_array)
