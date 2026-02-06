@@ -3,7 +3,8 @@
 Dam break case: Parallel DC-WME-4DVar data assimilation experiment.
 
 This script runs a twin experiment for the dam break problem using
-the Data-Consistent Weighted Mean Error 4DVar cost function with MPI parallelization.
+the Data-Consistent Weighted Mean Error 4DVar cost function with
+MPI parallelization via the TwinExperiment framework.
 
 Run with:
     mpirun -n 4 python dam_break_dcwme_mpi.py
@@ -13,62 +14,29 @@ The dam break problem features:
 - Rapid flow dynamics with shock formation
 - No friction for analytical comparison
 
-DC-WME is particularly suited for:
-- Problems with sparse observations
-- Situations where predictability is limited
-- Cases requiring robust error estimation
-
-Optimizer Options:
-    - Default: PETSc TAO bounded L-BFGS (blmvm) with physical constraints
-    - --no-bounds: Use unbounded TAO L-BFGS (lmvm)
-    - --use-legacy-lbfgs: Use custom L-BFGS implementation (deprecated)
-
-Note: Shallow water 4D-Var optimization can be challenging due to
-nonlinear dynamics. Line search failures may occur with large perturbations.
+DC-WME uses cumulative time-averaged innovation as QoI for improved stability.
 
 Usage:
     mpirun -n 4 python dam_break_dcwme_mpi.py [--nx 30] [--ny 30] [--dt 0.5]
 """
 
 import argparse
-import time
 import sys
-import json
-import warnings
 import numpy as np
 from pathlib import Path
 from mpi4py import MPI
-from petsc4py import PETSc
 
 # Add parent directories to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from swe4dvar.forward.problems import DamProblem
 from swe4dvar.forward.solvers import get_solver
 from swe4dvar import FrictionLaw
-from swe4dvar.data_assimilation import (
-    DCWMEFourDVarCost,
-    DiagonalCovariance,
-    PointObservationOperator,
-)
 from swe4dvar.utils import get_default_solver_params
-from swe4dvar.utils.output_paths import FIGURES_DIR, DATA_DIR, ensure_output_dirs
-from swe4dvar.utils.parallel_ops import ParallelTimer
+from swe4dvar.utils.output_paths import ensure_output_dirs
 
-# Import utilities from serial experiments
-sys.path.insert(0, str(Path(__file__).parent.parent / "serial_da"))
-from da_experiment_utils import (
-    DAExperimentConfig,
-    DAExperimentResults,
-    ForwardModelWrapper,
-    generate_observation_points,
-    generate_observations,
-    generate_background_state,
-    compute_rms_error,
-    compute_innovation_statistics,
-    save_experiment_results,
-    create_tao_optimizer,
-)
+from twin_experiment import TwinExperiment, TwinExperimentConfig
 
 
 def parse_args():
@@ -80,111 +48,45 @@ def parse_args():
     parser.add_argument("--nx", type=int, default=30, help="Elements in x direction")
     parser.add_argument("--ny", type=int, default=30, help="Elements in y direction")
     parser.add_argument("--dt", type=float, default=0.5, help="Time step (seconds)")
-    parser.add_argument(
-        "--final-time", type=float, default=20.0, help="Final time (seconds)"
-    )
-    parser.add_argument(
-        "--obs-fraction", type=float, default=0.5, help="Fraction of points to observe"
-    )
-    parser.add_argument(
-        "--obs-frequency", type=int, default=4, help="Observe every N timesteps"
-    )
-    parser.add_argument(
-        "--noise-level", type=float, default=0.01, help="Observation noise level"
-    )
-    parser.add_argument(
-        "--background-error", type=float, default=0.1, help="Background error std"
-    )
-    parser.add_argument(
-        "--max-iter", type=int, default=50, help="Max L-BFGS iterations"
-    )
-    parser.add_argument(
-        "--solver",
-        type=str,
-        default="DG",
-        choices=["CG", "DG", "SUPG"],
-        help="Solver type",
-    )
+    parser.add_argument("--final-time", type=float, default=20.0, help="Final time (seconds)")
+    parser.add_argument("--obs-fraction", type=float, default=0.5, help="Fraction of points to observe")
+    parser.add_argument("--obs-frequency", type=int, default=4, help="Observe every N timesteps")
+    parser.add_argument("--noise-level", type=float, default=0.01, help="Observation noise level")
+    parser.add_argument("--background-error", type=float, default=0.1, help="Background error std")
+    parser.add_argument("--max-iter", type=int, default=50, help="Max optimization iterations")
+    parser.add_argument("--solver", type=str, default="DG", choices=["CG", "DG", "SUPG"],
+                        help="Solver type")
+    parser.add_argument("--no-bounds", action="store_true", help="Disable bounded optimization")
+    parser.add_argument("--h-min", type=float, default=0.01, help="Minimum water depth for bounds")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--profile", action="store_true", help="Enable detailed timing")
-    parser.add_argument(
-        "--use-legacy-lbfgs", action="store_true",
-        help="Use legacy custom L-BFGS instead of TAO (deprecated)"
-    )
-    parser.add_argument(
-        "--no-bounds", action="store_true",
-        help="Use unbounded TAO L-BFGS (lmvm) instead of bounded (blmvm)"
-    )
-    parser.add_argument(
-        "--h-min", type=float, default=0.01,
-        help="Minimum water depth for bounded optimization"
-    )
     return parser.parse_args()
 
 
 def main():
     """Run parallel dam break DC-WME-4DVar experiment."""
     args = parse_args()
-
-    # MPI setup
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
-    size = comm.Get_size()
 
-    # Initialize timer
-    timer = ParallelTimer(comm)
-    timer.start("total")
-
-    # Ensure output directories exist (rank 0 only)
     if rank == 0:
         ensure_output_dirs()
     comm.Barrier()
 
-    # Configuration
-    config = DAExperimentConfig(
+    # Create problem
+    num_time_steps = int(np.ceil(args.final_time / args.dt))
+    problem = DamProblem(
+        dt=args.dt,
+        nt=num_time_steps,
         nx=args.nx,
         ny=args.ny,
-        dt=args.dt,
-        final_time=args.final_time,
-        solver_type=args.solver,
-        obs_fraction=args.obs_fraction,
-        obs_frequency=args.obs_frequency,
-        obs_noise_level=args.noise_level,
-        background_error_std=args.background_error,
-        max_iterations=args.max_iter,
-    )
-
-    if rank == 0:
-        print("=" * 70)
-        print("Parallel Dam Break DC-WME-4DVar Data Assimilation Experiment")
-        print("=" * 70)
-        print(f"MPI ranks: {size}")
-        print(f"Grid: {config.nx} x {config.ny}")
-        print(f"Solver: {config.solver_type}")
-        print(f"Time step: {config.dt} s, Final time: {config.final_time} s")
-        print(f"Observation fraction: {config.obs_fraction}")
-        print(f"Noise level: {config.obs_noise_level}")
-        print(f"Background error: {config.background_error_std}")
-        print("=" * 70)
-
-    # =========================================================================
-    # Step 1: Setup problem and solver
-    # =========================================================================
-    timer.start("setup")
-
-    num_time_steps = int(np.ceil(config.final_time / config.dt))
-
-    problem = DamProblem(
-        dt=config.dt,
-        nt=num_time_steps,
-        nx=config.nx,
-        ny=config.ny,
         friction_law=FrictionLaw.none,
         solution_var="h",
         spherical=False,
     )
 
-    solver = get_solver(config.solver_type)(problem, theta=0.5, p_degree=[1, 1])
+    # Create solver
+    solver = get_solver(args.solver)(problem, theta=0.5, p_degree=[1, 1])
 
     # Solver parameters
     solver_params = get_default_solver_params(
@@ -198,339 +100,37 @@ def main():
         error_if_not_converged=True,
     )
 
-    if rank == 0 and args.verbose:
-        solver.print_config()
-
-    timer.stop("setup")
-
-    # =========================================================================
-    # Step 2: Generate truth trajectory
-    # =========================================================================
-    if rank == 0:
-        print("\nStep 1: Generating truth trajectory...")
-
-    timer.start("forward_model")
-    start_time = time.time()
-
-    # Use consistent random seed across all ranks
-    np.random.seed(42)
-
-    # Time series output stations for dam break
-    nx_stations = 10
-    stations = np.zeros((nx_stations, 3))
-    stations[:, 0] = np.linspace(0, 1000, nx_stations)
-    stations[:, 1] = 450
-
-    # Run forward model to generate truth
-    solver.time_loop(
-        solver_parameters=solver_params,
-        stations=stations,
-        plot_every=9999,
-        save_state=True,
-        store_jacobians=True,
-        enable_video=False,
-        monitor_progress=(rank == 0 and args.verbose),
+    # Create experiment config
+    config = TwinExperimentConfig(
+        method="dcwme",
+        obs_fraction=args.obs_fraction,
+        obs_frequency=args.obs_frequency,
+        obs_noise_level=args.noise_level,
+        interior_only=True,
+        background_error_std=args.background_error,
+        max_iterations=args.max_iter,
+        use_bounds=not args.no_bounds,
+        h_min=args.h_min,
+        verbose=args.verbose,
     )
 
-    # Store truth trajectory
-    truth_trajectory = []
-    for state_array in solver.storage.saved_states:
-        vec = PETSc.Vec().createWithArray(state_array.copy(), comm=comm)
-        truth_trajectory.append(vec)
-
-    truth_jacobians = solver.storage.saved_jacobians.copy()
-
-    # True initial condition
-    m_true = truth_trajectory[0].copy()
-
-    timer.stop("forward_model")
-
-    if rank == 0:
-        print(f"  Truth trajectory generated: {len(truth_trajectory)} states")
-        print(f"  Jacobians stored: {len(truth_jacobians)}")
-
-    # =========================================================================
-    # Step 3: Setup observations
-    # =========================================================================
-    if rank == 0:
-        print("\nStep 2: Setting up observations...")
-
-    timer.start("observation_setup")
-
-    # Generate observation points (use consistent seed)
-    obs_points = generate_observation_points(
-        problem.mesh, fraction=config.obs_fraction, seed=42
-    )
-
-    if rank == 0:
-        print(f"  Observation points: {len(obs_points)}")
-
-    # Create observation operator
-    obs_operator = PointObservationOperator(solver.V, obs_points, comm=comm)
-
-    # Determine observation times
-    obs_times = list(
-        range(config.obs_frequency, num_time_steps + 1, config.obs_frequency)
-    )
-    if rank == 0:
-        print(
-            f"  Observation times: {len(obs_times)} (every {config.obs_frequency} timesteps)"
-        )
-
-    # Generate observations with noise (use consistent seed)
-    observations, obs_noise_stds = generate_observations(
-        truth_trajectory,
-        obs_operator,
-        obs_times,
-        noise_level=config.obs_noise_level,
-        seed=42,
-    )
-
-    timer.stop("observation_setup")
-
-    if rank == 0:
-        print(f"  Observations generated with noise std: {obs_noise_stds.mean():.6f}")
-
-    # =========================================================================
-    # Step 4: Setup background state
-    # =========================================================================
-    if rank == 0:
-        print("\nStep 3: Setting up background state...")
-
-    # Use consistent seed for background perturbation
-    m_background = generate_background_state(
-        m_true, error_std=config.background_error_std, seed=123
-    )
-
-    background_error = compute_rms_error(m_background, m_true, comm)
-    if rank == 0:
-        print(f"  Background RMS error: {background_error:.6f}")
-
-    # =========================================================================
-    # Step 5: Setup covariance matrices
-    # =========================================================================
-    if rank == 0:
-        print("\nStep 4: Setting up covariance matrices...")
-
-    state_size = m_true.getSize()
-
-    # Background covariance
-    truth_magnitude = np.abs(m_true.getArray()).mean()
-    background_variance = (config.background_error_std * truth_magnitude) ** 2
-    B = DiagonalCovariance(comm, state_size, variance=background_variance)
-
-    if rank == 0:
-        print(
-            f"  Background covariance: diagonal, variance = {background_variance:.6e}"
-        )
-
-    # Observation covariance
-    n_obs = obs_operator.get_num_observations()
-    obs_variance = obs_noise_stds.mean() ** 2
-    R = DiagonalCovariance(comm, n_obs, variance=obs_variance)
-
-    if rank == 0:
-        print(f"  Observation covariance: diagonal, variance = {obs_variance:.6e}")
-
-    # =========================================================================
-    # Step 6: Create forward model wrapper
-    # =========================================================================
-    if rank == 0:
-        print("\nStep 5: Creating forward model wrapper...")
-
-    # Reset solver for optimization
-    solver.storage.clear()
-    problem.t = 0.0
-
-    forward_model = ForwardModelWrapper(solver, problem, solver_params)
-
-    # =========================================================================
-    # Step 7: Setup DC-WME-4DVar cost function
-    # =========================================================================
-    if rank == 0:
-        print("\nStep 6: Setting up DC-WME-4DVar cost function...")
-        print("  DC-WME uses weighted mean error QoI for improved stability")
-
-    cost_function = DCWMEFourDVarCost(
-        forward_model=forward_model,
-        observation_operator=obs_operator,
-        background_cov=B,
-        observation_cov=R,
-        m_background=m_background,
-        observations=observations,
-        obs_times=obs_times,
-        predicted_cov_wme=None,  # Will be estimated automatically
+    # Run experiment
+    experiment = TwinExperiment(
+        problem=problem,
+        solver=solver,
+        config=config,
+        solver_params=solver_params,
         comm=comm,
     )
 
-    # =========================================================================
-    # Step 8: Run optimization
-    # =========================================================================
-    opt_options = {
-        "max_iterations": config.max_iterations,
-        "gradient_tolerance": config.gradient_tolerance,
-        "cost_tolerance": config.cost_tolerance,
-        "verbose": (rank == 0),
-    }
+    results = experiment.run()
 
-    timer.start("optimization")
-
-    if args.use_legacy_lbfgs:
-        # Legacy L-BFGS (deprecated)
-        if rank == 0:
-            print("\nStep 7: Running legacy L-BFGS optimization...")
-            print("  WARNING: Legacy L-BFGS is deprecated. Consider using TAO.")
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            from swe4dvar.optimization.lbfgs import LBFGSOptimizer
-            optimizer = LBFGSOptimizer(
-                cost_function,
-                memory_size=config.lbfgs_memory,
-                options=opt_options,
-            )
-    else:
-        # TAO optimizer (default, recommended)
-        use_bounds = not args.no_bounds
-        if rank == 0:
-            if use_bounds:
-                print("\nStep 7: Running TAO bounded L-BFGS optimization...")
-                print(f"  Using h_min = {args.h_min} for water depth bound")
-            else:
-                print("\nStep 7: Running TAO unbounded L-BFGS optimization...")
-            print("  Note: Line search failures may occur with challenging problems.")
-
-        optimizer = create_tao_optimizer(
-            cost_function,
-            m_background,
-            options=opt_options,
-            use_bounds=use_bounds,
-            h_min=args.h_min,
-        )
-
-    opt_start = time.time()
-    m_analysis = optimizer.solve(m_background.copy())
-    opt_time = time.time() - opt_start
-
-    timer.stop("optimization")
-
+    # Add MPI-specific info to results
     if rank == 0:
-        print(f"\nOptimization completed in {opt_time:.2f} seconds")
-        print(f"  Iterations: {optimizer.iteration}")
-        print(f"  Converged: {optimizer.converged}")
+        print(f"\nMPI ranks used: {comm.Get_size()}")
 
-    # =========================================================================
-    # Step 9: Evaluate results
-    # =========================================================================
-    if rank == 0:
-        print("\nStep 8: Evaluating results...")
-
-    timer.start("evaluation")
-
-    # Compute analysis error
-    analysis_error = compute_rms_error(m_analysis, m_true, comm)
-    error_reduction = (background_error - analysis_error) / background_error * 100
-
-    if rank == 0:
-        print(f"  Analysis RMS error: {analysis_error:.6f}")
-        print(f"  Error reduction: {error_reduction:.1f}%")
-
-    # Run analysis forward and compute innovation statistics
-    solver.storage.clear()
-    problem.t = 0.0
-
-    m_analysis_array = m_analysis.getArray()
-    solver.u_n.x.array[:] = m_analysis_array
-    solver.u_n_old.x.array[:] = m_analysis_array
-    solver.u.x.array[:] = m_analysis_array
-
-    solver.time_loop(
-        solver_parameters=solver_params,
-        stations=stations,
-        plot_every=9999,
-        save_state=True,
-        enable_video=False,
-    )
-
-    analysis_trajectory = []
-    for state_array in solver.storage.saved_states:
-        vec = PETSc.Vec().createWithArray(state_array.copy(), comm=comm)
-        analysis_trajectory.append(vec)
-
-    innov_mean, innov_std = compute_innovation_statistics(
-        analysis_trajectory, obs_operator, observations, obs_times
-    )
-
-    timer.stop("evaluation")
-
-    if rank == 0:
-        print(f"  Innovation mean: {innov_mean:.6f}")
-        print(f"  Innovation std: {innov_std:.6f}")
-
-    # =========================================================================
-    # Step 10: Save results
-    # =========================================================================
-    timer.stop("total")
-
-    if rank == 0:
-        print("\nStep 9: Saving results...")
-
-    total_time = time.time() - start_time
-
-    results = DAExperimentResults(
-        method="dcwme_mpi",
-        test_case="dam_break",
-        cost_history=optimizer.cost_history,
-        gradient_norm_history=optimizer.gradient_history,
-        background_error=background_error,
-        analysis_error=analysis_error,
-        error_reduction=error_reduction,
-        innovation_mean=innov_mean,
-        innovation_std=innov_std,
-        num_iterations=optimizer.iteration,
-        converged=optimizer.converged,
-        wall_time=total_time,
-        config=config.to_dict(),
-    )
-
-    # Add MPI-specific info
-    results.config["mpi_ranks"] = size
-
-    if rank == 0:
-        filepath = save_experiment_results(results, str(DATA_DIR))
-        print(f"  Results saved to: {filepath}")
-
-    # =========================================================================
-    # Summary and Timing Report
-    # =========================================================================
-    if rank == 0:
-        print("\n" + "=" * 70)
-        print("SUMMARY: Parallel Dam Break DC-WME-4DVar Experiment")
-        print("=" * 70)
-        print(f"MPI ranks:         {size}")
-        print(f"Background error:  {background_error:.6f}")
-        print(f"Analysis error:    {analysis_error:.6f}")
-        print(f"Error reduction:   {error_reduction:.1f}%")
-        print(f"Iterations:        {optimizer.iteration}")
-        print(f"Converged:         {optimizer.converged}")
-        print(f"Total time:        {total_time:.2f} s")
-        print("=" * 70)
-
-    # Print detailed timing report
-    if args.profile:
-        timer.report(root=0)
-
-    # Cleanup
-    for vec in truth_trajectory:
-        vec.destroy()
-    for vec in analysis_trajectory:
-        vec.destroy()
-    for vec in observations:
-        vec.destroy()
-    m_true.destroy()
-    m_background.destroy()
-    m_analysis.destroy()
+    return 0 if results.converged else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

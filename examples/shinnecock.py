@@ -76,13 +76,9 @@ from swe4dvar.physics.constants import R
 # Optional DA imports (only loaded if DA mode is enabled)
 DA_AVAILABLE = True
 try:
-    from swe4dvar.data_assimilation import (
-        FourDVarCost,
-        DCWMECost,
-        DiagonalCovariance,
-        PointObservationOperator,
-    )
-    from swe4dvar.optimization.lbfgs import LBFGSOptimizer
+    # Use generalized twin experiment framework
+    sys.path.insert(0, str(Path(__file__).parent.parent / "experiments"))
+    from twin_experiment import TwinExperiment, TwinExperimentConfig
 except ImportError:
     DA_AVAILABLE = False
 
@@ -188,10 +184,16 @@ def parse_args():
         help="Data assimilation mode",
     )
     parser.add_argument(
+        "--obs-points-file",
+        type=str,
+        default=None,
+        help="JSON file with pre-selected observation points (from select_observation_points.py)",
+    )
+    parser.add_argument(
         "--obs-fraction",
         type=float,
         default=0.5,
-        help="Fraction of spatial points to observe",
+        help="Fraction of spatial points to observe (ignored if --obs-points-file is set)",
     )
     parser.add_argument(
         "--obs-frequency",
@@ -278,104 +280,6 @@ def get_tidal_verification_data(nt, t_f, dt):
         )
 
     return t, eta_input
-
-
-def generate_observation_points(mesh, fraction=0.5, seed=42):
-    """
-    Generate random observation points from mesh nodes.
-
-    Parameters
-    ----------
-    mesh : dolfinx.mesh.Mesh
-        Computational mesh.
-    fraction : float
-        Fraction of nodes to use as observation points.
-    seed : int
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    obs_points : np.ndarray
-        Array of observation point coordinates, shape (n_obs, 3).
-    """
-    rng = np.random.default_rng(seed)
-
-    # Get mesh coordinates
-    coords = mesh.geometry.x
-    n_points = coords.shape[0]
-
-    # Select random subset
-    n_obs = int(n_points * fraction)
-    indices = rng.choice(n_points, size=n_obs, replace=False)
-
-    # Ensure 3D coordinates
-    obs_points = np.zeros((n_obs, 3))
-    obs_points[:, : coords.shape[1]] = coords[indices, :]
-
-    return obs_points
-
-
-def generate_synthetic_observations(
-    trajectory, obs_operator, obs_times, noise_level=0.01, seed=42
-):
-    """
-    Generate synthetic observations from truth trajectory.
-
-    Parameters
-    ----------
-    trajectory : List[np.ndarray]
-        True state trajectory as list of arrays.
-    obs_operator : PointObservationOperator
-        Observation operator H.
-    obs_times : List[int]
-        Time indices at which to observe.
-    noise_level : float
-        Standard deviation as fraction of signal magnitude.
-    seed : int
-        Random seed.
-
-    Returns
-    -------
-    observations : List[PETSc.Vec]
-        Observation vectors with added noise.
-    obs_noise_std : np.ndarray
-        Standard deviation of noise at each observation.
-    """
-    rng = np.random.default_rng(seed)
-    observations = []
-    noise_stds = []
-
-    for k in obs_times:
-        if k >= len(trajectory):
-            raise IndexError(
-                f"Observation time {k} exceeds trajectory length {len(trajectory)}"
-            )
-
-        # Create PETSc vector from trajectory state
-        state_vec = PETSc.Vec().createWithArray(trajectory[k].copy())
-
-        # Apply observation operator
-        H_u = obs_operator.forward(state_vec, time_index=k)
-        H_u_array = H_u.getArray()
-
-        # Compute noise standard deviation based on signal magnitude
-        signal_magnitude = np.abs(H_u_array).mean() + 1e-10
-        noise_std = noise_level * signal_magnitude
-        noise_stds.append(noise_std)
-
-        # Add Gaussian noise
-        noise = rng.normal(0, noise_std, size=H_u_array.shape)
-        noisy_obs = H_u_array + noise
-
-        # Create observation vector
-        obs_vec = PETSc.Vec().createSeq(len(noisy_obs), comm=PETSc.COMM_SELF)
-        obs_vec.setArray(noisy_obs)
-        obs_vec.assemble()
-
-        observations.append(obs_vec)
-        state_vec.destroy()
-
-    return observations, np.array(noise_stds)
 
 
 def run_forward_simulation(args, comm, rank):
@@ -577,20 +481,13 @@ def run_da_experiment(args, comm, rank):
     """
     Run data assimilation experiment (4D-Var or DC-WME).
 
-    This implements a twin experiment where:
-    1. Generate "truth" trajectory
-    2. Create synthetic observations with noise
-    3. Perturb initial condition to create background
-    4. Run DA optimization to recover initial condition
+    Uses the generalized TwinExperiment framework.
     """
     if not DA_AVAILABLE:
         if rank == 0:
             print("ERROR: Data assimilation modules not available.")
-            print("Please ensure swe4dvar.data_assimilation is installed.")
+            print("Please ensure twin_experiment module is available.")
         return
-
-    timer = ParallelTimer(comm)
-    timer.start("total")
 
     # Ensure output directories
     if rank == 0:
@@ -605,21 +502,7 @@ def run_da_experiment(args, comm, rank):
     wd = args.alpha is not None
     bath_adjust = 0 if wd else 4.0
 
-    if rank == 0:
-        print("=" * 70)
-        print(f"Shinnecock Inlet {args.da_mode.upper()} Data Assimilation Experiment")
-        print("=" * 70)
-        print(f"MPI ranks: {comm.Get_size()}")
-        print(f"Time step: {dt} s, Final time: {t_f} s ({args.T} hours)")
-        print(f"Observation fraction: {args.obs_fraction}")
-        print(f"Observation frequency: every {args.obs_frequency} timesteps")
-        print(f"Noise level: {args.obs_noise}")
-        print(f"Background error: {args.background_error}")
-        print("=" * 70)
-
-    # Setup problem
-    timer.start("setup")
-
+    # Create problem
     prob = ADCIRCProblem(
         adios_file=args.adios_file,
         spherical=is_spherical,
@@ -646,7 +529,10 @@ def run_da_experiment(args, comm, rank):
         solver = Solvers.DGImplicitNonConservative(
             prob, theta, p_degree=p_degree, verbose=not args.newton_quiet
         )
+    else:
+        raise ValueError(f"Unknown solver: {solver_name}")
 
+    # Solver parameters
     params = get_default_solver_params(
         rtol=1e-5,
         atol=1e-6,
@@ -658,281 +544,36 @@ def run_da_experiment(args, comm, rank):
         error_if_not_converged=True,
     )
 
-    timer.stop("setup")
-
-    # Step 1: Generate truth trajectory
-    if rank == 0:
-        print("\nStep 1: Generating truth trajectory...")
-
-    timer.start("truth_run")
-    np.random.seed(42)  # Reproducibility
-
-    stations = setup_observation_stations()
-    solver.time_loop(
-        solver_parameters=params,
-        stations=stations,
-        plot_every=9999,
-        save_state=True,
-        store_jacobians=True,
-        enable_video=False,
-        monitor_progress=(rank == 0 and args.verbose),
+    # Create experiment config
+    config = TwinExperimentConfig(
+        method=args.da_mode,
+        obs_fraction=args.obs_fraction,
+        obs_frequency=args.obs_frequency,
+        obs_noise_level=args.obs_noise,
+        obs_points_file=args.obs_points_file,
+        interior_only=True,
+        background_error_std=args.background_error,
+        max_iterations=args.max_da_iter,
+        use_bounds=True,
+        h_min=0.01,
+        output_dir=str(DATA_DIR),
+        verbose=args.verbose,
     )
 
-    # Store truth trajectory
-    truth_trajectory = [state.copy() for state in solver.storage.saved_states]
-    truth_jacobians = solver.storage.saved_jacobians.copy()
-
-    # True initial condition
-    m_true = PETSc.Vec().createWithArray(truth_trajectory[0].copy(), comm=comm)
-
-    timer.stop("truth_run")
-
-    if rank == 0:
-        print(f"  Truth trajectory: {len(truth_trajectory)} states")
-
-    # Step 2: Setup observations
-    if rank == 0:
-        print("\nStep 2: Setting up observations...")
-
-    timer.start("obs_setup")
-
-    obs_points = generate_observation_points(
-        prob.mesh, fraction=args.obs_fraction, seed=42
+    # Create and run experiment
+    experiment = TwinExperiment(
+        problem=prob,
+        solver=solver,
+        config=config,
+        solver_params=params,
+        comm=comm,
     )
 
-    if rank == 0:
-        print(f"  Observation points: {len(obs_points)}")
-
-    obs_operator = PointObservationOperator(solver.V, obs_points, comm=comm)
-
-    # Observation times
-    obs_times = list(
-        range(args.obs_frequency, nt + 1, args.obs_frequency)
-    )
-
-    if rank == 0:
-        print(f"  Observation times: {len(obs_times)}")
-
-    # Generate observations
-    observations, obs_noise_stds = generate_synthetic_observations(
-        truth_trajectory,
-        obs_operator,
-        obs_times,
-        noise_level=args.obs_noise,
-        seed=42,
-    )
-
-    timer.stop("obs_setup")
-
-    # Step 3: Setup background state
-    if rank == 0:
-        print("\nStep 3: Setting up background state...")
-
-    rng = np.random.default_rng(123)
-    m_true_array = m_true.getArray()
-    truth_magnitude = np.abs(m_true_array).mean() + 1e-10
-    error_magnitude = args.background_error * truth_magnitude
-    perturbation = rng.normal(0, error_magnitude, size=m_true_array.shape)
-
-    m_background = m_true.duplicate()
-    m_background.setArray(m_true_array + perturbation)
-    m_background.assemble()
-
-    # Compute background error
-    diff = m_background.copy()
-    diff.axpy(-1.0, m_true)
-    background_error = np.sqrt(diff.dot(diff) / diff.getSize())
-
-    if rank == 0:
-        print(f"  Background RMS error: {background_error:.6f}")
-
-    # Step 4: Setup covariances
-    if rank == 0:
-        print("\nStep 4: Setting up covariance matrices...")
-
-    state_size = m_true.getSize()
-    background_variance = (args.background_error * truth_magnitude) ** 2
-    B = DiagonalCovariance(comm, state_size, variance=background_variance)
-
-    n_obs = obs_operator.get_num_observations()
-    obs_variance = obs_noise_stds.mean() ** 2
-    R = DiagonalCovariance(comm, n_obs, variance=obs_variance)
-
-    # Step 5: Create forward model wrapper
-    if rank == 0:
-        print("\nStep 5: Creating forward model wrapper...")
-
-    # Reset solver
-    solver.storage.clear()
-    prob.t = 0.0
-
-    # Create wrapper class for DA
-    class ForwardModelWrapper:
-        def __init__(self, solver, problem, params):
-            self.solver = solver
-            self.problem = problem
-            self.params = params
-            self.dt = problem.dt
-            self.nt = problem.nt
-            self.comm = comm
-
-        def solve(self, m, store_jacobians=True):
-            self.solver.storage.clear()
-            m_array = m.getArray()
-            self.solver.u_n.x.array[:] = m_array
-            self.solver.u_n_old.x.array[:] = m_array
-            self.solver.u.x.array[:] = m_array
-            self.problem.t = 0.0
-
-            self.solver.time_loop(
-                solver_parameters=self.params,
-                stations=np.array([[0.0, 0.0, 0.0]]),
-                plot_every=9999,
-                save_state=True,
-                store_jacobians=store_jacobians,
-                enable_video=False,
-            )
-
-            trajectory = []
-            for state_array in self.solver.storage.saved_states:
-                vec = PETSc.Vec().createWithArray(state_array.copy(), comm=self.comm)
-                trajectory.append(vec)
-
-            jacobians = None
-            if store_jacobians and len(self.solver.storage.saved_jacobians) > 0:
-                jacobians = self.solver.storage.saved_jacobians.copy()
-
-            return trajectory, jacobians
-
-    forward_model = ForwardModelWrapper(solver, prob, params)
-
-    # Step 6: Setup cost function
-    if rank == 0:
-        print(f"\nStep 6: Setting up {args.da_mode.upper()} cost function...")
-
-    timer.start("optimization")
-
-    if args.da_mode == "4dvar":
-        cost_function = FourDVarCost(
-            forward_model=forward_model,
-            observation_operator=obs_operator,
-            background_cov=B,
-            observation_cov=R,
-            m_background=m_background,
-            observations=observations,
-            obs_times=obs_times,
-            comm=comm,
-        )
-    else:  # dcwme
-        cost_function = DCWMECost(
-            forward_model=forward_model,
-            observation_operator=obs_operator,
-            background_cov=B,
-            observation_cov=R,
-            m_background=m_background,
-            observations=observations,
-            obs_times=obs_times,
-            comm=comm,
-        )
-
-    # Step 7: Run optimization
-    if rank == 0:
-        print("\nStep 7: Running L-BFGS optimization...")
-
-    optimizer = LBFGSOptimizer(
-        cost_function,
-        memory_size=10,
-        options={
-            "max_iterations": args.max_da_iter,
-            "gradient_tolerance": 1e-6,
-            "cost_tolerance": 1e-8,
-            "verbose": (rank == 0),
-        },
-    )
-
-    opt_start = time.time()
-    m_analysis = optimizer.solve(m_background.copy())
-    opt_time = time.time() - opt_start
-
-    timer.stop("optimization")
-
-    if rank == 0:
-        print(f"\nOptimization completed in {opt_time:.2f} seconds")
-        print(f"  Iterations: {optimizer.iteration}")
-        print(f"  Converged: {optimizer.converged}")
-
-    # Step 8: Evaluate results
-    if rank == 0:
-        print("\nStep 8: Evaluating results...")
-
-    timer.start("evaluation")
-
-    # Analysis error
-    diff_analysis = m_analysis.copy()
-    diff_analysis.axpy(-1.0, m_true)
-    analysis_error = np.sqrt(diff_analysis.dot(diff_analysis) / diff_analysis.getSize())
-    error_reduction = (background_error - analysis_error) / background_error * 100
-
-    timer.stop("evaluation")
-    timer.stop("total")
-
-    if rank == 0:
-        print(f"  Analysis RMS error: {analysis_error:.6f}")
-        print(f"  Error reduction: {error_reduction:.1f}%")
-
-    # Save results
-    if rank == 0:
-        print("\nStep 9: Saving results...")
-
-        results = {
-            "method": args.da_mode,
-            "test_case": "shinnecock",
-            "background_error": background_error,
-            "analysis_error": analysis_error,
-            "error_reduction": error_reduction,
-            "iterations": optimizer.iteration,
-            "converged": optimizer.converged,
-            "wall_time": opt_time,
-            "config": {
-                "dt": args.dt,
-                "T_hours": args.T,
-                "obs_fraction": args.obs_fraction,
-                "obs_frequency": args.obs_frequency,
-                "obs_noise": args.obs_noise,
-                "background_error_std": args.background_error,
-                "mpi_ranks": comm.Get_size(),
-            },
-            "cost_history": optimizer.cost_history,
-            "gradient_history": optimizer.gradient_history,
-        }
-
-        output_file = DATA_DIR / f"shinnecock_{args.da_mode}_results.json"
-        with open(output_file, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"  Results saved to: {output_file}")
-
-        print("\n" + "=" * 70)
-        print(f"SUMMARY: Shinnecock {args.da_mode.upper()} Experiment")
-        print("=" * 70)
-        print(f"Background error:  {background_error:.6f}")
-        print(f"Analysis error:    {analysis_error:.6f}")
-        print(f"Error reduction:   {error_reduction:.1f}%")
-        print(f"Iterations:        {optimizer.iteration}")
-        print(f"Converged:         {optimizer.converged}")
-        print("=" * 70)
+    results = experiment.run()
 
     # Timing report
-    if args.profile:
-        timer.report(root=0)
-
-    # Cleanup
-    for obs in observations:
-        obs.destroy()
-    m_true.destroy()
-    m_background.destroy()
-    m_analysis.destroy()
-    diff.destroy()
-    diff_analysis.destroy()
+    if args.profile and rank == 0:
+        print(f"\nTotal wall time: {results.wall_time:.2f} seconds")
 
 
 def plot_results(solver, nt, t_f, t, eta_input, solver_name, prefix, output_dir):
