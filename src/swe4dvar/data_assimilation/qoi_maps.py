@@ -106,7 +106,14 @@ class QoIMap(ABC):
         """Get or compute trajectory for given initial condition."""
         # Use robust hash based on vector contents to avoid collisions
         # Different vectors can have the same norm, so hash the full array
-        m_bytes = m.getArray().tobytes()
+        # Use readonly=True to handle TAO's read-only vectors
+        try:
+            m_bytes = m.getArray(readonly=True).tobytes()
+        except Exception:
+            # Fallback: copy the vector first
+            m_copy = m.copy()
+            m_bytes = m_copy.getArray().tobytes()
+            m_copy.destroy()
         m_hash = hashlib.md5(m_bytes).hexdigest()
 
         if m_hash not in self._trajectory_cache:

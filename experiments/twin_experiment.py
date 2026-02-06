@@ -1323,7 +1323,8 @@ class ZeroBoundaryGradientCost:
 
     def __init__(self, base_cost, boundary_dofs: np.ndarray):
         self.base_cost = base_cost
-        self.boundary_dofs = boundary_dofs
+        # Ensure integer dtype (empty arrays default to float64, causing index errors)
+        self.boundary_dofs = np.asarray(boundary_dofs, dtype=int)
 
     def value(self, m: PETSc.Vec) -> float:
         return self.base_cost.value(m)
