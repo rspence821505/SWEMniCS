@@ -5,13 +5,23 @@ This document describes the twin experiment (also called OSSE - Observing System
 ## Overview
 
 A twin experiment is a controlled test where we:
-1. Generate a "truth" simulation
+1. Generate a "truth" simulation with true physics parameters
 2. Create synthetic observations from the truth (with added noise)
-3. Perturb the initial condition to simulate uncertainty
-4. Run data assimilation to recover the true initial condition
-5. Measure how well DA reduces the error
+3. Optionally perturb physics parameters (bathymetry, friction) to avoid "inverse crime"
+4. Perturb the initial condition to simulate uncertainty
+5. Run data assimilation to recover the true initial condition
+6. Measure how well DA reduces the error
 
 This allows validation of the DA system in a controlled setting where we know the true answer.
+
+### Inverse Crime Avoidance
+
+An **inverse crime** occurs when using the exact same model for both truth generation and assimilation, leading to artificially favorable results. The framework supports **physics perturbation** to avoid this:
+
+- **Bathymetry perturbation**: Add noise to bed elevation
+- **Friction perturbation**: Scale Manning's n coefficient
+
+See [inverse_crime.md](inverse_crime.md) for detailed recommendations.
 
 ## Generalized Framework
 
@@ -36,20 +46,21 @@ The twin experiment framework is designed to work with **any problem** that inhe
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        4D-VAR TWIN EXPERIMENT WORKFLOW                      │
+│                     (with Inverse Crime Avoidance)                          │
 └─────────────────────────────────────────────────────────────────────────────┘
 
                               ┌──────────────┐
                               │   m_true     │  True initial condition
-                              │   (u₀)       │
+                              │   (u₀)       │  with TRUE physics
                               └──────┬───────┘
                                      │
                     ┌────────────────┼────────────────┐
                     │                │                │
                     ▼                ▼                ▼
             ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-            │   Forward    │  │   Forward    │  │   Forward    │
-            │   Model      │  │   Model      │  │   Model      │
-            │   Step 1     │  │   Step 2     │  │   Step N     │
+            │   Forward    │  │   Forward    │  │   Forward    │  Truth run
+            │   Model      │  │   Model      │  │   Model      │  (true bathy,
+            │   Step 1     │  │   Step 2     │  │   Step N     │   true friction)
             └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
                    │                 │                 │
                    ▼                 ▼                 ▼
@@ -69,6 +80,14 @@ The twin experiment framework is designed to work with **any problem** that inhe
             │              │  │              │  │              │  Observations
             └──────────────┘  └──────────────┘  └──────────────┘
 
+         ┌─────────────────────────────────────────────────────┐
+         │              PHYSICS PERTURBATION                   │
+         │         (Inverse Crime Avoidance)                   │
+         │                                                     │
+         │   bathy_assim = bathy_true + noise   (or * noise)   │
+         │   friction_assim = friction_true * scale_factor     │
+         └─────────────────────────────────────────────────────┘
+
                               ┌──────────────┐
                               │ m_background │  Perturbed initial condition
                               │ = m_true + ε │  (simulates uncertainty)
@@ -76,9 +95,9 @@ The twin experiment framework is designed to work with **any problem** that inhe
                                      │
                                      ▼
                               ┌──────────────┐
-                              │   4D-Var     │
-                              │   Minimize   │  J(m) = J_b + J_obs
-                              │   J(m)       │
+                              │   4D-Var     │  DA uses PERTURBED
+                              │   Minimize   │  physics parameters
+                              │   J(m)       │  J(m) = J_b + J_obs
                               └──────┬───────┘
                                      │
                                      ▼
@@ -193,6 +212,91 @@ python examples/shinnecock.py --da-mode none
 | `obs_seed` | `42` | Random seed for observations |
 | `background_seed` | `123` | Random seed for background perturbation |
 
+**Physics Perturbation (Inverse Crime Avoidance):**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `perturb_bathymetry` | `False` | Enable bathymetry perturbation |
+| `bathymetry_noise_std` | `0.5` | Noise std (meters for additive, fraction for multiplicative) |
+| `bathymetry_noise_type` | `"additive"` | Type: `"additive"` or `"multiplicative"` |
+| `bathymetry_correlation_length` | `500.0` | Spatial correlation length (meters) |
+| `perturb_friction` | `False` | Enable friction perturbation |
+| `friction_scale_factor` | `1.0` | Friction multiplier (e.g., 1.1 = 10% increase) |
+| `perturbation_seed` | `456` | Random seed for perturbations |
+
+## Experimental Design Matrix
+
+For rigorous testing, run a series of experiments with different perturbation configurations:
+
+| Experiment | Bathymetry | Friction | Purpose |
+|------------|------------|----------|---------|
+| Baseline | Same | Same | Sanity check (inverse crime) |
+| A | Perturbed | Same | Bathymetry error only |
+| B | Same | Perturbed | Friction error only |
+| C | Perturbed | Perturbed | Combined (realistic scenario) |
+
+### Example Configurations
+
+```python
+from experiments.twin_experiment import TwinExperiment, TwinExperimentConfig
+
+# Baseline: Inverse crime (no perturbation)
+config_baseline = TwinExperimentConfig(
+    method="4dvar",
+    perturb_bathymetry=False,
+    perturb_friction=False,
+)
+
+# Experiment A: Bathymetry error only (TidalProblem)
+config_A = TwinExperimentConfig(
+    method="4dvar",
+    perturb_bathymetry=True,
+    bathymetry_noise_std=0.5,  # 0.5m additive noise
+    bathymetry_noise_type="additive",
+    bathymetry_correlation_length=500.0,
+    perturb_friction=False,
+)
+
+# Experiment A: Bathymetry error only (Shinnecock - multiplicative)
+config_A_shinnecock = TwinExperimentConfig(
+    method="4dvar",
+    perturb_bathymetry=True,
+    bathymetry_noise_std=0.03,  # 3% multiplicative noise
+    bathymetry_noise_type="multiplicative",
+    bathymetry_correlation_length=200.0,
+    perturb_friction=False,
+)
+
+# Experiment B: Friction error only
+config_B = TwinExperimentConfig(
+    method="4dvar",
+    perturb_bathymetry=False,
+    perturb_friction=True,
+    friction_scale_factor=1.15,  # 15% increase in friction
+)
+
+# Experiment C: Combined (realistic)
+config_C = TwinExperimentConfig(
+    method="4dvar",
+    perturb_bathymetry=True,
+    bathymetry_noise_std=0.5,
+    bathymetry_noise_type="additive",
+    bathymetry_correlation_length=500.0,
+    perturb_friction=True,
+    friction_scale_factor=1.15,
+)
+```
+
+### Problem-Specific Recommendations
+
+| Problem | Bathymetry Type | Bathymetry Perturbation | Friction Perturbation |
+|---------|-----------------|-------------------------|----------------------|
+| TidalProblem | Constant (10m) | Uniform* (0.5-1.0m std) | Scale by 0.85-1.15 |
+| Shinnecock | Function (variable) | Spatially-varying (2-5% std) | Scale by 0.85-1.15 |
+| DamProblem | Constant (2m) | Uniform* (0.1-0.2m std) | N/A (frictionless) |
+
+*Note: TidalProblem and DamProblem use `Constant` bathymetry, so only uniform perturbation is applied (a single random value). For spatially-varying perturbation, the problem must use a `Function` for bathymetry (like Shinnecock/ADCIRC).
+
 ### Command-Line Options
 
 The `run_twin_experiment.py` script accepts:
@@ -246,10 +350,11 @@ Output:
 
 ### Step 1: Generate "Truth" Trajectory
 
-The framework runs the forward model with the default initial condition:
+The framework runs the forward model with the **original (true) physics parameters**:
 
 ```python
 # Inside TwinExperiment._generate_truth()
+# Uses TRUE bathymetry and friction
 solver.time_loop(
     solver_parameters=solver_params,
     save_state=True,
@@ -260,6 +365,27 @@ solver.time_loop(
 truth_trajectory = [state.copy() for state in solver.storage.saved_states]
 m_true = truth_trajectory[0]  # True initial condition
 ```
+
+### Step 1b: Apply Physics Perturbations (Optional)
+
+If inverse crime avoidance is enabled, physics parameters are perturbed **after** truth generation:
+
+```python
+# Inside TwinExperiment._apply_physics_perturbations()
+
+# Bathymetry perturbation
+if config.perturb_bathymetry:
+    if config.bathymetry_noise_type == "additive":
+        h_b.x.array[:] += smooth_noise  # Add noise field
+    else:  # multiplicative
+        h_b.x.array[:] *= (1.0 + smooth_noise)  # Scale by noise
+
+# Friction perturbation
+if config.perturb_friction:
+    friction *= config.friction_scale_factor  # Uniform scaling
+```
+
+The DA optimization will now use these **perturbed** parameters, while observations came from the **true** parameters.
 
 ### Step 2: Create Observation Points
 

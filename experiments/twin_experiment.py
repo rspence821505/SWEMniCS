@@ -78,6 +78,20 @@ class TwinExperimentConfig:
     # Covariance configuration
     component_aware_cov: bool = False
 
+    # Physics perturbation for inverse crime avoidance
+    # Bathymetry perturbation
+    perturb_bathymetry: bool = False
+    bathymetry_noise_std: float = 0.5  # Absolute (m) for additive, relative for multiplicative
+    bathymetry_noise_type: str = "additive"  # "additive" or "multiplicative"
+    bathymetry_correlation_length: float = 500.0  # meters
+
+    # Friction perturbation
+    perturb_friction: bool = False
+    friction_scale_factor: float = 1.0  # α: friction_perturbed = friction_true * α
+
+    # Perturbation seed for reproducibility
+    perturbation_seed: int = 456
+
     # Output configuration
     output_dir: str = "outputs/data"
     save_trajectories: bool = False
@@ -252,6 +266,8 @@ class TwinExperiment:
         self.rank = self.comm.Get_rank()
 
         # Default solver params if not provided
+        # Force direct solver (LU) for stability - GMRES+ILU can diverge
+        # on larger meshes or with physics perturbations
         self.solver_params = solver_params or get_default_solver_params(
             rtol=1e-5,
             atol=1e-6,
@@ -259,6 +275,9 @@ class TwinExperiment:
             relaxation_parameter=1.0,
             comm=self.comm,
             error_if_not_converged=True,
+            # Override to use direct solver for stability
+            ksp_type="preonly",
+            pc_type="lu",
         )
 
         # Extract problem name
@@ -291,9 +310,14 @@ class TwinExperiment:
 
         self._print_header()
 
-        # Step 1: Generate truth trajectory
+        # Step 1: Generate truth trajectory (with TRUE parameters)
         self.log("\nStep 1: Generating truth trajectory...")
         self._generate_truth()
+
+        # Step 1b: Apply physics perturbations (for inverse crime avoidance)
+        if self.config.perturb_bathymetry or self.config.perturb_friction:
+            self.log("\nStep 1b: Applying physics perturbations...")
+            self._apply_physics_perturbations()
 
         # Step 2: Setup observations
         self.log("\nStep 2: Setting up observations...")
@@ -327,17 +351,26 @@ class TwinExperiment:
         self.log("\nStep 8: Running optimization...")
         optimizer, opt_time = self._run_optimization(cost_function)
 
-        # Step 9: Evaluate results
-        self.log("\nStep 9: Evaluating results...")
-        analysis_error, error_reduction, innov_mean, innov_std = self._evaluate_results(
-            obs_operator, obs_times, background_error
-        )
-
         # Build results
         total_time = time.time() - start_time
 
         cost_history = [h["cost"] for h in optimizer.convergence_history]
         gradient_history = [h["grad_norm"] for h in optimizer.convergence_history]
+
+        # Step 9: Evaluate results
+        self.log("\nStep 9: Evaluating results...")
+        # If optimization failed (cost returned 1e20), skip forward evaluation
+        if cost_history and cost_history[-1] >= 1e19:
+            self.log("  Skipping forward evaluation due to optimization failure")
+            analysis_error = background_error
+            error_reduction = 0.0
+            innov_mean = 0.0
+            innov_std = 0.0
+            self.analysis_trajectory = None
+        else:
+            analysis_error, error_reduction, innov_mean, innov_std = self._evaluate_results(
+                obs_operator, obs_times, background_error
+            )
 
         results = TwinExperimentResults(
             method=self.config.method,
@@ -378,6 +411,21 @@ class TwinExperiment:
             print(f"Observation frequency: every {self.config.obs_frequency} timesteps")
             print(f"Noise level: {self.config.obs_noise_level}")
             print(f"Background error: {self.config.background_error_std}")
+
+            # Physics perturbation info
+            if self.config.perturb_bathymetry or self.config.perturb_friction:
+                print("-" * 70)
+                print("Physics Perturbation (Inverse Crime Avoidance):")
+                if self.config.perturb_bathymetry:
+                    print(f"  Bathymetry: {self.config.bathymetry_noise_type} noise, "
+                          f"std={self.config.bathymetry_noise_std}, "
+                          f"corr_len={self.config.bathymetry_correlation_length}m")
+                if self.config.perturb_friction:
+                    print(f"  Friction: scale factor = {self.config.friction_scale_factor}")
+            else:
+                print("-" * 70)
+                print("Physics Perturbation: None (inverse crime)")
+
             print("=" * 70)
 
     def _generate_truth(self):
@@ -403,6 +451,341 @@ class TwinExperiment:
         self.m_true = self.truth_trajectory[0].copy()
 
         self.log(f"  Truth trajectory: {len(self.truth_trajectory)} states")
+
+    def _apply_physics_perturbations(self):
+        """
+        Apply physics perturbations to avoid inverse crime.
+
+        This modifies the problem's bathymetry and/or friction parameters
+        AFTER truth generation, so the DA uses perturbed parameters while
+        the truth was generated with the original parameters.
+
+        For bathymetry perturbation with solution_var="h", we must also update
+        the solver's initial condition to maintain physical consistency:
+          h_new = h_old + (h_b_perturbed - h_b_old)
+        This ensures eta (surface elevation) remains unchanged.
+        """
+        rng = np.random.default_rng(self.config.perturbation_seed)
+
+        if self.config.perturb_bathymetry:
+            # Store old bathymetry values before perturbation
+            old_h_b_values = self._get_bathymetry_values()
+            self._perturb_bathymetry(rng)
+            new_h_b_values = self._get_bathymetry_values()
+
+            # For solution_var="h", update initial condition to maintain eta consistency
+            if hasattr(self.problem, 'solution_var') and self.problem.solution_var == "h":
+                self._adjust_initial_condition_for_bathymetry(old_h_b_values, new_h_b_values)
+
+        if self.config.perturb_friction:
+            self._perturb_friction()
+
+    def _get_bathymetry_values(self) -> np.ndarray:
+        """Get current bathymetry values as an array."""
+        h_b = self.problem.h_b
+        if hasattr(h_b, 'x'):
+            return h_b.x.array.copy()
+        elif hasattr(h_b, 'value'):
+            # Constant - return scalar as array
+            return np.array([float(h_b.value)])
+        else:
+            # Numeric value
+            return np.array([float(h_b)])
+
+    def _adjust_initial_condition_for_bathymetry(self, old_h_b: np.ndarray, new_h_b: np.ndarray):
+        """
+        Adjust solver initial condition when bathymetry is perturbed for solution_var="h".
+
+        For solution_var="h", the state variable is total water depth h = h_b + eta.
+        When bathymetry changes, we need to adjust h to keep eta consistent:
+          h_new = h_old + (h_b_new - h_b_old)
+
+        This also clears cached boundary conditions that depend on bathymetry.
+        """
+        self.log("  Adjusting initial condition for bathymetry change (solution_var=h)...")
+
+        # Get the delta in bathymetry
+        if len(old_h_b) == 1 and len(new_h_b) == 1:
+            # Constant bathymetry
+            delta_h_b = new_h_b[0] - old_h_b[0]
+            self.log(f"  Uniform bathymetry change: {delta_h_b:+.3f}m")
+        else:
+            # Spatially varying bathymetry
+            delta_h_b = new_h_b - old_h_b
+            self.log(f"  Bathymetry change: min={delta_h_b.min():+.3f}m, max={delta_h_b.max():+.3f}m, "
+                     f"mean={delta_h_b.mean():+.3f}m")
+
+        # Update solver state variables (u_n, u_n_old, u)
+        # For mixed elements, h is the first component
+        n_vars = 3  # h, ux, uy
+
+        for state_var in [self.solver.u_n, self.solver.u_n_old, self.solver.u]:
+            arr = state_var.x.array
+            n_dofs = len(arr)
+            n_nodes = n_dofs // n_vars
+
+            if isinstance(delta_h_b, np.ndarray) and len(delta_h_b) > 1:
+                # Spatially varying - delta_h_b aligns with mesh nodes
+                # But DOFs might be interlaced differently
+                # For CG elements, DOFs are typically grouped by component
+                h_dofs = np.arange(0, n_dofs, n_vars)  # Every n_vars DOF is h
+                if len(delta_h_b) == n_nodes:
+                    arr[h_dofs] += delta_h_b
+                else:
+                    # Size mismatch - use mean
+                    self.log(f"  Warning: Bathymetry array size {len(delta_h_b)} != n_nodes {n_nodes}, using mean")
+                    arr[h_dofs] += delta_h_b.mean()
+            else:
+                # Uniform change
+                h_dofs = np.arange(0, n_dofs, n_vars)
+                arr[h_dofs] += float(np.mean(delta_h_b))
+
+            state_var.x.scatter_forward()
+
+        # Update h_init if it exists
+        if hasattr(self.problem, 'h_init') and self.problem.h_init is not None:
+            h_init = self.problem.h_init
+            if hasattr(h_init, 'x'):
+                if isinstance(delta_h_b, np.ndarray) and len(delta_h_b) == len(h_init.x.array):
+                    h_init.x.array[:] += delta_h_b
+                else:
+                    h_init.x.array[:] += float(np.mean(delta_h_b))
+                h_init.x.scatter_forward()
+
+        # Clear cached boundary values that depend on bathymetry
+        if hasattr(self.problem, '_hb_boundary'):
+            delattr(self.problem, '_hb_boundary')
+            self.log("  Cleared cached boundary values")
+
+        # Update boundary conditions
+        if hasattr(self.problem, 'update_boundary'):
+            self.problem.update_boundary()
+            self.log("  Updated boundary conditions")
+
+    def _perturb_bathymetry(self, rng: np.random.Generator):
+        """
+        Perturb the bathymetry field.
+
+        For additive noise: b_perturbed = b_true + noise
+        For multiplicative noise: b_perturbed = b_true * (1 + noise)
+
+        If h_b is a Constant, only uniform perturbation is applied (mean of noise field).
+        For spatially-varying perturbation, h_b must be a Function.
+        """
+        from dolfinx import fem as fe
+
+        # Get the bathymetry field
+        if not hasattr(self.problem, 'h_b') or self.problem.h_b is None:
+            self.log("  Warning: No bathymetry field found, skipping perturbation")
+            return
+
+        h_b = self.problem.h_b
+
+        # Check if h_b is a Function or a Constant/Expression
+        if hasattr(h_b, 'x'):
+            # It's a Function - apply spatially-varying perturbation
+            n_points = len(h_b.x.array)
+
+            # Generate smooth noise field
+            noise = self._generate_smooth_noise(
+                rng,
+                n_points,
+                self.config.bathymetry_noise_std,
+                self.config.bathymetry_correlation_length,
+            )
+
+            if self.config.bathymetry_noise_type == "additive":
+                h_b.x.array[:] += noise
+                self.log(f"  Applied additive bathymetry noise (std={self.config.bathymetry_noise_std}m)")
+            elif self.config.bathymetry_noise_type == "multiplicative":
+                h_b.x.array[:] *= (1.0 + noise)
+                self.log(f"  Applied multiplicative bathymetry noise (std={self.config.bathymetry_noise_std*100:.1f}%)")
+            else:
+                raise ValueError(f"Unknown bathymetry noise type: {self.config.bathymetry_noise_type}")
+
+            # Ensure bathymetry stays positive (for stability)
+            min_depth = self.config.h_min
+            h_b.x.array[h_b.x.array < min_depth] = min_depth
+
+            # Log statistics
+            self.log(f"  Perturbed bathymetry: min={h_b.x.array.min():.2f}m, "
+                     f"max={h_b.x.array.max():.2f}m, mean={h_b.x.array.mean():.2f}m")
+
+            # Scatter forward to ensure consistency across processes
+            h_b.x.scatter_forward()
+
+        elif hasattr(h_b, 'value'):
+            # It's a Constant - apply uniform perturbation
+            # Generate a single random perturbation value
+            original_value = float(h_b.value)
+
+            if self.config.bathymetry_noise_type == "additive":
+                # Sample from normal distribution
+                perturbation = rng.normal(0, self.config.bathymetry_noise_std)
+                new_value = original_value + perturbation
+                self.log(f"  Bathymetry is Constant: applying uniform additive perturbation")
+                self.log(f"  Original: {original_value:.2f}m, Perturbation: {perturbation:+.3f}m, "
+                         f"New: {new_value:.2f}m")
+            elif self.config.bathymetry_noise_type == "multiplicative":
+                perturbation = rng.normal(0, self.config.bathymetry_noise_std)
+                new_value = original_value * (1.0 + perturbation)
+                self.log(f"  Bathymetry is Constant: applying uniform multiplicative perturbation")
+                self.log(f"  Original: {original_value:.2f}m, Factor: {1.0 + perturbation:.3f}, "
+                         f"New: {new_value:.2f}m")
+            else:
+                raise ValueError(f"Unknown bathymetry noise type: {self.config.bathymetry_noise_type}")
+
+            # Ensure bathymetry stays positive
+            new_value = max(new_value, self.config.h_min)
+            h_b.value = new_value
+
+        else:
+            # It's a UFL expression or something we can't handle
+            self.log("  Warning: Bathymetry is a UFL expression, cannot perturb")
+            self.log("  Consider using a Function or Constant for bathymetry to enable perturbation")
+
+    def _perturb_friction(self):
+        """
+        Perturb the friction coefficient by uniform scaling.
+
+        friction_perturbed = friction_true * scale_factor
+
+        Handles various friction representations:
+        - TAU_const as Constant (dolfinx Constant)
+        - TAU_const as float (set during make_Friction)
+        - mannings_n as Function (ADCIRCProblem)
+        - TAU as Constant or Function
+        """
+        from dolfinx import fem as fe
+        from petsc4py.PETSc import ScalarType
+
+        alpha = self.config.friction_scale_factor
+
+        if alpha == 1.0:
+            self.log("  Friction scale factor is 1.0, no perturbation applied")
+            return
+
+        # Check for different friction representations
+        friction_perturbed = False
+
+        # Case 1: TAU_const - should be a Constant after our fix to get_friction
+        if hasattr(self.problem, 'TAU_const') and self.problem.TAU_const is not None:
+            tau_const = self.problem.TAU_const
+
+            if hasattr(tau_const, 'value'):
+                # It's a dolfinx Constant
+                original = float(tau_const.value)
+                tau_const.value = original * alpha
+                self.log(f"  Scaled TAU_const: {original:.6f} -> {original * alpha:.6f} (factor={alpha})")
+                friction_perturbed = True
+            elif isinstance(tau_const, (int, float)):
+                # It's a plain number - create a new Constant
+                # Note: This won't affect the weak form that was already compiled
+                original = float(tau_const)
+                new_value = original * alpha
+                self.problem.TAU_const = fe.Constant(self.problem.mesh, ScalarType(new_value))
+                self.log(f"  Warning: TAU_const was a float, converted to Constant: {original:.6f} -> {new_value:.6f}")
+                self.log(f"  Note: This may not affect an already-compiled weak form")
+                friction_perturbed = True
+
+        # Case 2: mannings_n (Function) - used by ADCIRCProblem
+        if hasattr(self.problem, 'mannings_n') and self.problem.mannings_n is not None:
+            if hasattr(self.problem.mannings_n, 'x'):
+                original_mean = np.mean(self.problem.mannings_n.x.array)
+                self.problem.mannings_n.x.array[:] *= alpha
+                new_mean = np.mean(self.problem.mannings_n.x.array)
+                self.log(f"  Scaled Manning's n: mean {original_mean:.6f} -> {new_mean:.6f} (factor={alpha})")
+                friction_perturbed = True
+
+        # Case 3: TAU (could be a constant, function, or float)
+        if hasattr(self.problem, 'TAU') and self.problem.TAU is not None and not friction_perturbed:
+            tau = self.problem.TAU
+
+            if hasattr(tau, 'x'):
+                # It's a Function
+                original_mean = np.mean(tau.x.array)
+                tau.x.array[:] *= alpha
+                new_mean = np.mean(tau.x.array)
+                self.log(f"  Scaled TAU (Function): mean {original_mean:.6f} -> {new_mean:.6f} (factor={alpha})")
+                friction_perturbed = True
+            elif hasattr(tau, 'value'):
+                # It's a Constant
+                original = float(tau.value)
+                tau.value = original * alpha
+                self.log(f"  Scaled TAU (Constant): {original:.6f} -> {original * alpha:.6f} (factor={alpha})")
+                friction_perturbed = True
+            elif isinstance(tau, (int, float)):
+                # It's a plain number - create a new Constant
+                original = float(tau)
+                new_value = original * alpha
+                self.problem.TAU = fe.Constant(self.problem.mesh, ScalarType(new_value))
+                self.log(f"  Warning: TAU was a float, converted to Constant: {original:.6f} -> {new_value:.6f}")
+                friction_perturbed = True
+
+        if not friction_perturbed:
+            self.log("  Warning: No friction field found to perturb")
+
+    def _generate_smooth_noise(
+        self,
+        rng: np.random.Generator,
+        n_points: int,
+        std: float,
+        correlation_length: float,
+    ) -> np.ndarray:
+        """
+        Generate spatially correlated noise field.
+
+        Uses a simple moving average approach for smoothing.
+        For more sophisticated applications, consider using
+        Gaussian processes or FFT-based methods.
+        """
+        coords = self.problem.mesh.geometry.x[:, :2]  # x, y coordinates
+
+        if len(coords) != n_points:
+            # Fall back to white noise if coordinate mismatch
+            self.log(f"  Warning: Coordinate size mismatch, using white noise")
+            return rng.normal(0, std, n_points)
+
+        # Generate raw noise
+        raw_noise = rng.normal(0, std, n_points)
+
+        # Simple distance-weighted smoothing using a Gaussian kernel
+        # This is O(n^2) but acceptable for moderate mesh sizes
+        # For large meshes, consider using scipy.spatial.KDTree for efficiency
+
+        if n_points > 10000:
+            # For large meshes, use a KDTree-based approach
+            from scipy.spatial import KDTree
+
+            tree = KDTree(coords)
+            smoothed_noise = np.zeros(n_points)
+
+            # Query neighbors within correlation_length
+            for i in range(n_points):
+                # Find all points within 2*correlation_length
+                neighbors = tree.query_ball_point(coords[i], 2 * correlation_length)
+                if len(neighbors) > 0:
+                    distances = np.linalg.norm(coords[neighbors] - coords[i], axis=1)
+                    weights = np.exp(-distances**2 / (2 * correlation_length**2))
+                    weights /= weights.sum()
+                    smoothed_noise[i] = np.dot(weights, raw_noise[neighbors])
+                else:
+                    smoothed_noise[i] = raw_noise[i]
+        else:
+            # For smaller meshes, compute full distance matrix
+            from scipy.spatial.distance import cdist
+
+            dist_matrix = cdist(coords, coords)
+            weights = np.exp(-dist_matrix**2 / (2 * correlation_length**2))
+            weights /= weights.sum(axis=1, keepdims=True)
+            smoothed_noise = weights @ raw_noise
+
+        # Rescale to match desired standard deviation
+        current_std = np.std(smoothed_noise)
+        if current_std > 0:
+            smoothed_noise = smoothed_noise * (std / current_std)
+
+        return smoothed_noise
 
     def _setup_observations(self):
         """Setup observation points and operator."""
@@ -521,17 +904,82 @@ class TwinExperiment:
         self.log(f"  Observations generated with mean noise std: {np.mean(noise_stds):.6f}")
         return observations, np.array(noise_stds)
 
-    def _setup_background(self) -> float:
-        """Setup background state with perturbation from truth."""
+    def _get_component_dof_indices(self):
+        """Get DOF indices for each component (h, u, v) using function space structure.
+
+        Returns tuple of (h_indices, u_indices, v_indices) as numpy arrays.
+        """
+        V = self.solver.V
+        n_subspaces = V.ufl_element().num_sub_elements
+
+        if n_subspaces == 2:
+            # Mixed element (h, [u,v]) - common for DG/SUPG
+            h_dofs_sub = V.sub(0).dofmap.list.flatten()
+            uv_dofs_sub = V.sub(1).dofmap.list.flatten()
+
+            # uv has block size 2 (u, v interleaved)
+            # Get unique sorted indices
+            h_indices = np.unique(h_dofs_sub)
+            uv_indices = np.unique(uv_dofs_sub)
+
+            # Split uv into u and v (they're interleaved with block size 2)
+            u_indices = uv_indices[0::2]
+            v_indices = uv_indices[1::2]
+
+            return h_indices, u_indices, v_indices
+        else:
+            # Fallback: assume interleaved (h, u, v)
+            n_dofs = len(self.solver.u.x.array)
+            h_indices = np.arange(0, n_dofs, 3)
+            u_indices = np.arange(1, n_dofs, 3)
+            v_indices = np.arange(2, n_dofs, 3)
+            return h_indices, u_indices, v_indices
+
+    def _setup_background(self, n_vars: int = 3) -> float:
+        """Setup background state with component-aware perturbation from truth.
+
+        Uses different perturbation magnitudes for h vs u,v to avoid creating
+        unrealistic velocity perturbations that cause numerical instability.
+        """
         rng = np.random.default_rng(self.config.background_seed)
         truth_array = self.m_true.getArray()
 
-        truth_magnitude = np.abs(truth_array).mean() + 1e-10
-        error_magnitude = self.config.background_error_std * truth_magnitude
-        perturbation = rng.normal(0, error_magnitude, size=truth_array.shape)
+        # Get actual DOF indices for each component using function space
+        h_indices, u_indices, v_indices = self._get_component_dof_indices()
+
+        # Extract component values using proper indices
+        h_values = truth_array[h_indices]
+        u_values = truth_array[u_indices]
+        v_values = truth_array[v_indices]
+
+        h_magnitude = np.abs(h_values).mean() + 1e-10
+        # Use max velocity magnitude with a floor of 0.1 m/s to prevent huge relative errors
+        uv_magnitude = max(np.abs(u_values).max(), np.abs(v_values).max(), 0.1)
+
+        # Create component-specific perturbations
+        perturbation = np.zeros_like(truth_array)
+        h_error = self.config.background_error_std * h_magnitude
+        uv_error = self.config.background_error_std * uv_magnitude
+
+        self.log(f"  Component-aware perturbation: h_std={h_error:.4f}, uv_std={uv_error:.4f}")
+
+        # Perturb each component with appropriate magnitude
+        perturbation[h_indices] = rng.normal(0, h_error, len(h_indices))
+        perturbation[u_indices] = rng.normal(0, uv_error, len(u_indices))
+        perturbation[v_indices] = rng.normal(0, uv_error, len(v_indices))
+
+        background_array = truth_array + perturbation
+
+        # Enforce physical constraints on h (water depth must be positive)
+        # Use the h_indices from component analysis (not interleaved assumption)
+        h_min = self.config.h_min
+        n_clipped = np.sum(background_array[h_indices] < h_min)
+        if n_clipped > 0:
+            self.log(f"  Clipping {n_clipped} h values to h_min={h_min}")
+            background_array[h_indices] = np.maximum(background_array[h_indices], h_min)
 
         self.m_background = self.m_true.duplicate()
-        self.m_background.setArray(truth_array + perturbation)
+        self.m_background.setArray(background_array)
         self.m_background.assemble()
 
         # Compute background error
@@ -729,25 +1177,36 @@ class TwinExperiment:
         self.log(f"  Error reduction: {error_reduction:.1f}%")
 
         # Run analysis forward for innovation statistics
-        self.solver.storage.clear()
+        # Create a fresh solver to avoid state corruption from optimization
+        from swe4dvar.forward.solvers import get_solver
+        solver_type = type(self.solver).__name__
+        if "DG" in solver_type:
+            eval_solver = get_solver("DG")(self.problem, theta=0.5, p_degree=[1, 1], verbose=False)
+        else:
+            eval_solver = get_solver("SUPG")(self.problem, theta=0.5, p_degree=[1, 1], verbose=False)
+
         self.problem.t = 0.0
 
+        # Update boundary conditions for t=0
+        if hasattr(self.problem, 'update_boundary'):
+            self.problem.update_boundary()
+
         m_analysis_array = self.m_analysis.getArray()
-        u_owned_size = self.solver.V.dofmap.index_map.size_local
+        u_owned_size = eval_solver.V.dofmap.index_map.size_local
 
-        if len(m_analysis_array) == len(self.solver.u_n.x.array):
-            self.solver.u_n.x.array[:] = m_analysis_array
-            self.solver.u_n_old.x.array[:] = m_analysis_array
-            self.solver.u.x.array[:] = m_analysis_array
+        if len(m_analysis_array) == len(eval_solver.u_n.x.array):
+            eval_solver.u_n.x.array[:] = m_analysis_array
+            eval_solver.u_n_old.x.array[:] = m_analysis_array
+            eval_solver.u.x.array[:] = m_analysis_array
         else:
-            self.solver.u_n.x.array[:u_owned_size] = m_analysis_array
-            self.solver.u_n_old.x.array[:u_owned_size] = m_analysis_array
-            self.solver.u.x.array[:u_owned_size] = m_analysis_array
-            self.solver.u_n.x.scatter_forward()
-            self.solver.u_n_old.x.scatter_forward()
-            self.solver.u.x.scatter_forward()
+            eval_solver.u_n.x.array[:u_owned_size] = m_analysis_array
+            eval_solver.u_n_old.x.array[:u_owned_size] = m_analysis_array
+            eval_solver.u.x.array[:u_owned_size] = m_analysis_array
+            eval_solver.u_n.x.scatter_forward()
+            eval_solver.u_n_old.x.scatter_forward()
+            eval_solver.u.x.scatter_forward()
 
-        self.solver.time_loop(
+        eval_solver.time_loop(
             solver_parameters=self.solver_params,
             stations=np.array([[0.0, 0.0, 0.0]]),
             plot_every=9999,
@@ -756,7 +1215,7 @@ class TwinExperiment:
         )
 
         self.analysis_trajectory = []
-        for state_array in self.solver.storage.saved_states:
+        for state_array in eval_solver.storage.saved_states:
             vec = PETSc.Vec().createWithArray(state_array.copy(), comm=self.comm)
             self.analysis_trajectory.append(vec)
 
@@ -793,6 +1252,18 @@ class TwinExperiment:
             config["ny"] = self.problem.ny
         if hasattr(self.problem, "adios_file"):
             config["adios_file"] = self.problem.adios_file
+
+        # Add physics perturbation info
+        config["inverse_crime_avoidance"] = {
+            "perturb_bathymetry": self.config.perturb_bathymetry,
+            "perturb_friction": self.config.perturb_friction,
+        }
+        if self.config.perturb_bathymetry:
+            config["inverse_crime_avoidance"]["bathymetry_noise_type"] = self.config.bathymetry_noise_type
+            config["inverse_crime_avoidance"]["bathymetry_noise_std"] = self.config.bathymetry_noise_std
+            config["inverse_crime_avoidance"]["bathymetry_correlation_length"] = self.config.bathymetry_correlation_length
+        if self.config.perturb_friction:
+            config["inverse_crime_avoidance"]["friction_scale_factor"] = self.config.friction_scale_factor
 
         return config
 

@@ -247,9 +247,27 @@ class ObservationPointSelector:
         if event.inaxes != self.ax:
             return
 
+        # Check if toolbar is in zoom or pan mode - skip selection if so
+        toolbar = self.fig.canvas.toolbar
+        if toolbar is not None and toolbar.mode in ('zoom rect', 'pan/zoom'):
+            return
+
         if event.button == 1:  # Left click - select/deselect
             # Find nearest point
             dist, idx = self.tree.query([event.xdata, event.ydata])
+
+            # Compute a reasonable selection radius based on mesh spacing
+            # Use ~10x the average nearest neighbor distance as threshold (generous for easy clicking)
+            if not hasattr(self, '_selection_radius'):
+                # Compute once and cache
+                sample_size = min(100, len(self.coords))
+                sample_dists, _ = self.tree.query(self.coords[:sample_size], k=2)
+                avg_spacing = np.mean(sample_dists[:, 1])  # Distance to nearest neighbor
+                self._selection_radius = avg_spacing * 10.0
+
+            # Only select if click is close enough to a point
+            if dist > self._selection_radius:
+                return  # Click too far from any point
 
             # Toggle selection
             if idx in self.selected_indices:
@@ -362,19 +380,39 @@ def get_dof_coordinates(mesh, solver_type, p_degree):
 def load_shinnecock_mesh(adios_path="data/shinnecock_inlet", solver_type=None, p_degree=1):
     """Load Shinnecock mesh from ADIOS files."""
     try:
+        print(f"  Loading Shinnecock mesh from {adios_path}...", flush=True)
+        print(f"    → Importing adios4dolfinx...", flush=True)
         import adios4dolfinx
+        print(f"    → Importing dolfinx...", flush=True)
         from dolfinx import mesh as dmesh
         from mpi4py import MPI
 
-        print(f"  Loading Shinnecock mesh from {adios_path}...")
+        mesh_file = f"{adios_path}_mesh.bp"
+        print(f"    → Reading mesh file: {mesh_file}", flush=True)
 
-        # Read mesh
-        mesh = adios4dolfinx.read_mesh(
-            MPI.COMM_SELF,
-            f"{adios_path}_mesh.bp",
-            engine="BP5",
-            ghost_mode=dmesh.GhostMode.none,
-        )
+        # Try BP4 engine first (more stable), then BP5
+        # Note: adios4dolfinx API: filename first, then comm; use legacy=True for older files
+        engines = ["BP4", "BP5"]
+        mesh = None
+        for engine in engines:
+            try:
+                print(f"    → Trying {engine} engine...", flush=True)
+                mesh = adios4dolfinx.read_mesh(
+                    mesh_file,
+                    MPI.COMM_SELF,
+                    engine=engine,
+                    ghost_mode=dmesh.GhostMode.none,
+                    legacy=True,
+                )
+                print(f"    → Success with {engine} engine!", flush=True)
+                break
+            except Exception as e:
+                print(f"    → {engine} failed: {e}", flush=True)
+                continue
+
+        if mesh is None:
+            raise RuntimeError(f"Failed to read mesh with any engine: {engines}")
+        print(f"    → Mesh loaded, extracting topology...", flush=True)
 
         triangles = mesh.topology.connectivity(2, 0).array.reshape(-1, 3)
 

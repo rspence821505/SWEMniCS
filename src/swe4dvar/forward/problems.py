@@ -332,7 +332,10 @@ class BaseProblem(abc.ABC):
             vel_mag = conditional(
                 ux * ux + uy * uy < eps, eps, pow(ux * ux + uy * uy, 0.5)
             )
-            self.TAU_const = 0.003
+            # Use existing TAU_const if available, otherwise create a Constant
+            # Check for .value attribute to ensure it's a proper Constant (not a float)
+            if not hasattr(self, 'TAU_const') or not hasattr(self.TAU_const, 'value'):
+                self.TAU_const = fe.Constant(self.mesh, ScalarType(0.003))
             if momentum_form == "conservative":
                 return as_vector(
                     (0, vel_mag * ux * self.TAU_const, vel_mag * uy * self.TAU_const)
@@ -349,7 +352,10 @@ class BaseProblem(abc.ABC):
         elif friction_law == "mannings":
             # experimental but 1e-16 seems to be ok
             eps = 1e-8
-            self.TAU_const = 0.02
+            # Use existing TAU_const if available, otherwise create a Constant
+            # Check for .value attribute to ensure it's a proper Constant (not a float)
+            if not hasattr(self, 'TAU_const') or not hasattr(self.TAU_const, 'value'):
+                self.TAU_const = fe.Constant(self.mesh, ScalarType(0.02))
             mag_v = conditional(
                 pow(ux * ux + uy * uy, 0.5) < eps, 0, pow(ux * ux + uy * uy, 0.5)
             )

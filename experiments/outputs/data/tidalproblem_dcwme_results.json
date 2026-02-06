@@ -1,0 +1,56 @@
+{
+  "method": "dcwme",
+  "problem_name": "TidalProblem",
+  "cost_history": [
+    1e+20
+  ],
+  "gradient_norm_history": [
+    0.0
+  ],
+  "background_error": 0.3051307216409812,
+  "analysis_error": 0.30410691130485723,
+  "error_reduction": 0.33553171264367077,
+  "innovation_mean": 0.008967449066398977,
+  "innovation_std": 0.07753801492982376,
+  "num_iterations": 0,
+  "converged": true,
+  "wall_time": 0.27348875999450684,
+  "config": {
+    "method": "dcwme",
+    "obs_fraction": 0.5,
+    "obs_frequency": 1,
+    "obs_noise_level": 0.01,
+    "obs_points_file": null,
+    "interior_only": true,
+    "background_error_std": 0.1,
+    "max_iterations": 30,
+    "gradient_tolerance": 1e-06,
+    "cost_tolerance": 1e-08,
+    "use_bounds": true,
+    "h_min": 0.01,
+    "component_aware_cov": false,
+    "perturb_bathymetry": false,
+    "bathymetry_noise_std": 0.5,
+    "bathymetry_noise_type": "additive",
+    "bathymetry_correlation_length": 500.0,
+    "perturb_friction": false,
+    "friction_scale_factor": 1.0,
+    "perturbation_seed": 456,
+    "output_dir": "outputs/data",
+    "save_trajectories": false,
+    "verbose": false,
+    "obs_seed": 42,
+    "background_seed": 123
+  },
+  "problem_config": {
+    "problem_type": "TidalProblem",
+    "dt": 3600,
+    "nt": 12,
+    "nx": 5,
+    "ny": 3,
+    "inverse_crime_avoidance": {
+      "perturb_bathymetry": false,
+      "perturb_friction": false
+    }
+  }
+}
