@@ -174,6 +174,28 @@ class ForwardModelWrapper:
         self.comm = MPI.COMM_WORLD
         self.var_form = getattr(solver, "var_form", None)
 
+    def get_mass_matrix(self) -> PETSc.Mat:
+        """Assemble the mass matrix for the function space using UFL."""
+        if hasattr(self, '_mass_matrix_cache'):
+            return self._mass_matrix_cache
+
+        import os
+        os.environ.setdefault("CC", "/usr/bin/clang")
+
+        from ufl import TrialFunction, TestFunction, inner, dx
+        from dolfinx import fem
+
+        V = self.solver.V
+        u = TrialFunction(V)
+        v = TestFunction(V)
+        mass_form = inner(u, v) * dx
+
+        M = fem.petsc.assemble_matrix(fem.form(mass_form))
+        M.assemble()
+
+        self._mass_matrix_cache = M
+        return M
+
     def solve(
         self, m: PETSc.Vec, store_jacobians: bool = True
     ) -> Tuple[List[PETSc.Vec], Optional[List]]:
@@ -1087,6 +1109,12 @@ class TwinExperiment:
         else:
             raise ValueError(f"Unknown DA method: {self.config.method}")
 
+        # Precondition gradient by M^{-1} for DG elements
+        if hasattr(forward_model, 'get_mass_matrix'):
+            M = forward_model.get_mass_matrix()
+            cost_function = MassMatrixPreconditionedCost(cost_function, M)
+            self.log("  Applied M^{-1} gradient preconditioning")
+
         # Wrap with boundary gradient zeroing if needed
         if self.config.interior_only:
             boundary_dofs = self._get_boundary_dofs()
@@ -1339,6 +1367,47 @@ class TwinExperiment:
             self.m_background.destroy()
         if self.m_analysis:
             self.m_analysis.destroy()
+
+
+class MassMatrixPreconditionedCost:
+    """Wrapper that preconditions the gradient by M^{-1}.
+
+    For DG elements, the adjoint gradient includes the mass matrix M
+    (from ∂R/∂u₀ = -M/dt), which makes ||∇J|| ~ O(M). This prevents
+    the optimizer from finding a step size.
+
+    Preconditioning by M^{-1} converts the functional derivative to the
+    Riesz gradient in the L²-inner product, giving ||g|| ~ O(1).
+    The converged solution is identical (M is SPD so g=0 iff ∇J=0).
+    """
+
+    def __init__(self, base_cost, mass_matrix: PETSc.Mat):
+        self.base_cost = base_cost
+        self.M = mass_matrix
+        self._ksp = PETSc.KSP().create(mass_matrix.getComm())
+        self._ksp.setOperators(mass_matrix)
+        self._ksp.setType("preonly")
+        self._ksp.getPC().setType("lu")
+        self._ksp.setUp()
+
+    def value(self, m: PETSc.Vec) -> float:
+        return self.base_cost.value(m)
+
+    def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
+        grad = self.base_cost.gradient(m)
+        precond_grad = grad.duplicate()
+        self._ksp.solve(grad, precond_grad)
+        return precond_grad
+
+    def value_gradient(self, m: PETSc.Vec):
+        cost, grad = self.base_cost.value_gradient(m)
+        precond_grad = grad.duplicate()
+        self._ksp.solve(grad, precond_grad)
+        return cost, precond_grad
+
+    def clear_cache(self):
+        if hasattr(self.base_cost, "clear_cache"):
+            self.base_cost.clear_cache()
 
 
 class ZeroBoundaryGradientCost:

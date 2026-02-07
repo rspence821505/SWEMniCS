@@ -1149,7 +1149,9 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         self._wme_cache: Dict[str, PETSc.Vec] = {}
 
         # Pre-compute Q_wme(m_b) at initialization (computed once per assimilation window)
-        # This avoids the lazy computation on first value() call
+        # Note: We use store_jacobians=True because the optimizer typically starts at m_b
+        # and will need Jacobians for the initial gradient computation. Storing them now
+        # avoids a redundant forward solve.
         self._wme_cache["Q_wme_mb"] = self._compute_wme(self.m_b)
 
         # Share the trajectory from QoIMap back to cost function's cache
@@ -1255,7 +1257,12 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             )
             return float('inf')
 
-    def _compute_wme(self, m: PETSc.Vec) -> PETSc.Vec:
+    def _compute_wme(
+        self,
+        m: PETSc.Vec,
+        store_jacobians: bool = True,
+        obs_times_only: bool = False,
+    ) -> PETSc.Vec:
         """
         Compute WME QoI: Q_wme(m) = (1/√N) Σ_k R_k^{-1/2}(H_k(u_k) - y_k).
 
@@ -1263,6 +1270,12 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         ----------
         m : PETSc.Vec
             Control variable.
+        store_jacobians : bool
+            Whether to store Jacobians. Set to False for evaluation-only
+            (e.g., computing Q_wme(m_b) at initialization).
+        obs_times_only : bool
+            If True, only store trajectory at observation times.
+            Useful when Jacobians are not needed (saves memory/time).
 
         Returns
         -------
@@ -1271,7 +1284,9 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         """
         # Use final observation index K := max(I) for WME evaluation
         k_final = max(self.obs_times)
-        return self.qoi_map.evaluate(m, k_final)
+        return self.qoi_map.evaluate(
+            m, k_final, store_jacobians=store_jacobians, obs_times_only=obs_times_only
+        )
 
     def _compute_wme_predictability(self, m: PETSc.Vec, Q_wme_m: PETSc.Vec) -> float:
         """

@@ -101,9 +101,32 @@ class QoIMap(ABC):
         pass
 
     def _get_trajectory(
-        self, m: PETSc.Vec, store_jacobians: bool = True
+        self,
+        m: PETSc.Vec,
+        store_jacobians: bool = True,
+        obs_times_only: bool = False,
+        obs_times: Optional[List[int]] = None,
     ) -> Tuple[List[PETSc.Vec], Optional[List]]:
-        """Get or compute trajectory for given initial condition."""
+        """Get or compute trajectory for given initial condition.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Initial condition.
+        store_jacobians : bool
+            Whether to store Jacobians for adjoint computation.
+        obs_times_only : bool
+            If True, only store trajectory at observation times (memory optimization).
+            Requires obs_times to be provided.
+        obs_times : List[int], optional
+            Observation time indices. Required if obs_times_only=True.
+
+        Returns
+        -------
+        Tuple[List[PETSc.Vec], Optional[List]]
+            (trajectory, jacobians) tuple. If obs_times_only=True, trajectory
+            is a sparse dict-like list where only obs_times indices are populated.
+        """
         # Use robust hash based on vector contents to avoid collisions
         # Different vectors can have the same norm, so hash the full array
         # Use readonly=True to handle TAO's read-only vectors
@@ -114,10 +137,29 @@ class QoIMap(ABC):
             m_copy = m.copy()
             m_bytes = m_copy.getArray().tobytes()
             m_copy.destroy()
-        m_hash = hashlib.md5(m_bytes).hexdigest()
+
+        # Include obs_times_only in cache key to avoid conflicts
+        cache_suffix = "_obs_only" if obs_times_only else ""
+        m_hash = hashlib.md5(m_bytes).hexdigest() + cache_suffix
 
         if m_hash not in self._trajectory_cache:
-            trajectory, jacobians = self.forward_model.solve(m, store_jacobians)
+            if obs_times_only and obs_times is not None:
+                # Try optimized path: only store states at observation times
+                # Fall back to standard path if forward model doesn't support it
+                import inspect
+                sig = inspect.signature(self.forward_model.solve)
+                if 'observation_times' in sig.parameters:
+                    trajectory, jacobians = self.forward_model.solve(
+                        m,
+                        store_jacobians=store_jacobians,
+                        observation_times=obs_times,
+                    )
+                else:
+                    # Forward model doesn't support sparse storage
+                    # Still use store_jacobians=False for the Jacobian-free optimization
+                    trajectory, jacobians = self.forward_model.solve(m, store_jacobians)
+            else:
+                trajectory, jacobians = self.forward_model.solve(m, store_jacobians)
             self._trajectory_cache[m_hash] = (trajectory, jacobians)
 
         return self._trajectory_cache[m_hash]
@@ -259,14 +301,53 @@ class WeightedMeanErrorQoI(QoIMap):
             t: y for t, y in zip(self.obs_times, self.y_obs)
         }
 
-        # Cache for R^{-1/2} application
-        self._R_sqrt_inv_cache: Dict = {}
+        # Cache for R^{-1/2} scaling factor (pre-computed once)
+        self._R_sqrt_inv_scale: Optional[float] = None
+        self._R_sqrt_inv_diag: Optional[np.ndarray] = None
+        self._precompute_R_sqrt_inv()
 
-    def evaluate(self, m: PETSc.Vec, time_index: int) -> PETSc.Vec:
+        # Pre-allocate work vectors for WME accumulation (reduces allocations)
+        self._work_vec: Optional[PETSc.Vec] = None
+        self._wme_accumulator: Optional[PETSc.Vec] = None
+
+    def _precompute_R_sqrt_inv(self) -> None:
+        """Pre-compute R^{-1/2} scaling for efficient repeated application.
+
+        For diagonal R = σ²I, caches 1/σ as a scalar.
+        For general diagonal R, caches 1/sqrt(diag(R)) as an array.
+        """
+        R_cov = self.R_cov
+        if isinstance(R_cov, dict):
+            # Use first available covariance (assume time-invariant structure)
+            R_cov = list(R_cov.values())[0]
+
+        if hasattr(R_cov, "apply_sqrt_inverse"):
+            # Covariance has its own method, no caching needed
+            return
+
+        # Check for diagonal covariance with uniform variance (scalar scale)
+        if hasattr(R_cov, "variance"):
+            # DiagonalCovariance with uniform variance
+            self._R_sqrt_inv_scale = 1.0 / np.sqrt(R_cov.variance)
+        elif hasattr(R_cov, "is_diagonal") and R_cov.is_diagonal:
+            if hasattr(R_cov, "get_diagonal"):
+                diag = R_cov.get_diagonal()
+                diag_array = diag.getArray().copy()
+                self._R_sqrt_inv_diag = 1.0 / np.sqrt(diag_array)
+
+    def evaluate(
+        self,
+        m: PETSc.Vec,
+        time_index: int,
+        store_jacobians: bool = True,
+        obs_times_only: bool = False,
+    ) -> PETSc.Vec:
         """
         Evaluate WME QoI up to (and including) time index k.
 
         Computes: Q_wme,k = (1/√|I_k|) Σ_{j∈I_k} R_j^{-1/2}(H_j(u_j) - y_j)
+
+        Uses pre-allocated work vectors and cached R^{-1/2} for efficiency.
 
         Parameters
         ----------
@@ -274,6 +355,12 @@ class WeightedMeanErrorQoI(QoIMap):
             Initial condition.
         time_index : int
             Target time index k.
+        store_jacobians : bool
+            Whether to store Jacobians for gradient computation. Set to False
+            for evaluation-only (e.g., computing Q_wme(m_b) at init).
+        obs_times_only : bool
+            If True, only store trajectory at observation times (memory optimization).
+            Useful when Jacobians are not needed.
 
         Returns
         -------
@@ -283,60 +370,103 @@ class WeightedMeanErrorQoI(QoIMap):
         if time_index < 0:
             raise ValueError("time_index must be non-negative for WME")
 
-        # Run forward model (store Jacobians for gradient computation in DC-WME)
-        trajectory, _ = self._get_trajectory(m, store_jacobians=True)
+        # Run forward model with optional optimizations
+        trajectory, _ = self._get_trajectory(
+            m,
+            store_jacobians=store_jacobians,
+            obs_times_only=obs_times_only,
+            obs_times=self.obs_times if obs_times_only else None,
+        )
 
         # Observation indices up to (and including) time_index
         I_k = [t for t in self.obs_times if t <= time_index]
 
-        # Initialize accumulator
-        wme = None
-        num_obs = 0
+        # Filter valid observation times
+        valid_obs = [
+            (t_j, self._obs_by_time[t_j])
+            for t_j in I_k
+            if t_j < len(trajectory) and t_j in self._obs_by_time
+        ]
 
-        for t_j in I_k:
-            if t_j >= len(trajectory):
-                continue
+        if not valid_obs:
+            # Return zero vector if no observations
+            if len(self.y_obs) == 0:
+                raise ValueError("WME QoI requires at least one observation vector")
+            wme = self.y_obs[0].duplicate()
+            wme.zeroEntries()
+            return wme
 
-            y_j = self._obs_by_time.get(t_j)
-            if y_j is None:
-                continue
+        num_obs = len(valid_obs)
 
+        # Initialize/reuse work vectors on first use
+        first_y = valid_obs[0][1]
+        if self._work_vec is None:
+            self._work_vec = first_y.duplicate()
+        if self._wme_accumulator is None:
+            self._wme_accumulator = first_y.duplicate()
+
+        # Zero the accumulator
+        self._wme_accumulator.zeroEntries()
+
+        # Vectorized accumulation with reused work vector
+        for t_j, y_j in valid_obs:
             u_j = trajectory[t_j]
 
             # Apply observation operator: H_j(u_j)
             Hu_j = self.obs_op.forward(u_j)
 
-            # Innovation: d_j = H_j(u_j) - y_j
-            d_j = Hu_j.duplicate()
-            d_j.waxpy(-1.0, y_j, Hu_j)
+            # Innovation: d_j = H_j(u_j) - y_j (reuse work vector)
+            Hu_j.copy(self._work_vec)
+            self._work_vec.axpy(-1.0, y_j)
 
-            # Apply R_j^{-1/2}
-            R_sqrt_inv_d = self._apply_R_sqrt_inv(d_j, t_j)
+            # Apply R^{-1/2} in-place using cached scaling
+            self._apply_R_sqrt_inv_inplace(self._work_vec)
 
             # Accumulate
-            if wme is None:
-                wme = R_sqrt_inv_d.copy()
-            else:
-                wme.axpy(1.0, R_sqrt_inv_d)
-            num_obs += 1
+            self._wme_accumulator.axpy(1.0, self._work_vec)
 
-        # Scale by 1/√|I_k|
-        if wme is None:
-            # Return zero vector if no observations (size from any y if available)
-            if len(self.y_obs) == 0:
-                raise ValueError("WME QoI requires at least one observation vector")
-            wme = self.y_obs[0].duplicate()
-            wme.zeroEntries()
-        elif num_obs > 0:
-            wme.scale(1.0 / np.sqrt(num_obs))
+        # Scale by 1/√|I_k| and return a copy (accumulator is reused)
+        wme = self._wme_accumulator.copy()
+        wme.scale(1.0 / np.sqrt(num_obs))
 
         return wme
 
+    def _apply_R_sqrt_inv_inplace(self, v: PETSc.Vec) -> None:
+        """Apply R^{-1/2} to vector in-place using cached scaling.
+
+        This is more efficient than _apply_R_sqrt_inv as it:
+        1. Uses pre-computed scaling factors
+        2. Modifies the vector in-place (no allocation)
+        """
+        # Fast path: use cached scalar scale (uniform diagonal R)
+        if self._R_sqrt_inv_scale is not None:
+            v.scale(self._R_sqrt_inv_scale)
+            return
+
+        # Fast path: use cached diagonal array (non-uniform diagonal R)
+        if self._R_sqrt_inv_diag is not None:
+            v_array = v.getArray()
+            v_array[:] *= self._R_sqrt_inv_diag
+            v.setArray(v_array)
+            return
+
+        # Fallback: use the covariance's method (creates new vector, copy back)
+        R_cov = self.R_cov
+        if isinstance(R_cov, dict):
+            R_cov = list(R_cov.values())[0]
+
+        if hasattr(R_cov, "apply_sqrt_inverse"):
+            result = R_cov.apply_sqrt_inverse(v)
+            result.copy(v)
+            result.destroy()
+        # else: identity (no-op)
+
     def _apply_R_sqrt_inv(self, v: PETSc.Vec, time_index: int) -> PETSc.Vec:
         """
-        Apply R^{-1/2} to vector.
+        Apply R^{-1/2} to vector (returns new vector).
 
         For diagonal R = σ²I, this is simply v/σ.
+        Uses cached scaling factors when available for efficiency.
 
         Parameters
         ----------
@@ -350,7 +480,21 @@ class WeightedMeanErrorQoI(QoIMap):
         PETSc.Vec
             R^{-1/2} · v.
         """
-        # Get observation covariance for this time (supports dict or single object)
+        # Fast path: use cached scalar scale (uniform diagonal R)
+        if self._R_sqrt_inv_scale is not None:
+            result = v.copy()
+            result.scale(self._R_sqrt_inv_scale)
+            return result
+
+        # Fast path: use cached diagonal array (non-uniform diagonal R)
+        if self._R_sqrt_inv_diag is not None:
+            result = v.copy()
+            result_array = result.getArray()
+            result_array[:] *= self._R_sqrt_inv_diag
+            result.setArray(result_array)
+            return result
+
+        # Fallback: use covariance method or compute on-the-fly
         R_cov = self.R_cov
         if isinstance(R_cov, dict):
             R_cov = R_cov.get(time_index, R_cov.get(0, list(R_cov.values())[0]))
@@ -761,11 +905,12 @@ class LinearizedWMEQoI(LinearizedQoI):
 
     def apply_adjoint(self, delta_q: PETSc.Vec) -> PETSc.Vec:
         """
-        Apply adjoint of linearized WME.
+        Apply adjoint of linearized WME via single backward sweep.
 
         δm = (1/√|I_k|) Σ_{j∈I_k} ADJ_{j:0} · H_j^T · R_j^{-1/2} · δq_wme
 
-        Requires running adjoint from each observation time and accumulating.
+        Uses a single adjoint solve with accumulated forcings at each
+        observation time, matching the 4D-Var adjoint pattern.
 
         Parameters
         ----------
@@ -778,54 +923,66 @@ class LinearizedWMEQoI(LinearizedQoI):
             Perturbation in control space.
         """
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
+        from ..utils import get_boundary_dofs
 
         I_k = [t for t in self.obs_times if t <= self.k]
         num_obs = len(I_k)
 
+        if num_obs == 0:
+            result = self.m_bar.duplicate()
+            result.zeroEntries()
+            return result
+
         # Scale input by 1/√|I_k|
         delta_q_scaled = delta_q.duplicate()
         delta_q.copy(delta_q_scaled)
-        if num_obs > 0:
-            delta_q_scaled.scale(1.0 / np.sqrt(num_obs))
+        delta_q_scaled.scale(1.0 / np.sqrt(num_obs))
 
-        # Accumulate adjoint contributions
-        result = self.m_bar.duplicate()
-        result.zeroEntries()
+        # Build forcings array for all observation times (single sweep)
+        N = len(self._trajectory)
+        forcings = [None] * N
 
         for t_j in I_k:
-            if t_j >= len(self._trajectory):
+            if t_j >= N:
                 continue
 
             # Apply R^{-1/2}^T = R^{-1/2} (symmetric)
             scaled = self._apply_R_sqrt_inv(delta_q_scaled, t_j)
 
-            # Apply adjoint observation operator
-            delta_u_j = self.obs_op.adjoint(scaled)
+            # Apply adjoint observation operator: H_j^T · R_j^{-1/2} · δq
+            forcings[t_j] = self.obs_op.adjoint(scaled)
 
-            # Run adjoint from time j to 0
-            if t_j > 0:
-                adjoint_solver = ImplicitAdjointSolver(
-                    self.forward_model,
-                    self._trajectory[: t_j + 1],
-                    self._jacobians[:t_j] if self._jacobians else None,
-                    self.forward_model.dt,
-                )
+        # Get boundary DOFs and variational form for proper adjoint BCs
+        variational_form = getattr(self.forward_model, 'var_form', None)
+        if variational_form is None and hasattr(self.forward_model, 'solver'):
+            variational_form = getattr(self.forward_model.solver, 'var_form', None)
 
-                forcings = [None] * (t_j + 1)
-                forcings[t_j] = delta_u_j
+        bc_dof_indices = None
+        if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model, 'problem'):
+            V = self.forward_model.solver.V
+            mesh = self.forward_model.problem.mesh
+            boundary_dofs = get_boundary_dofs(V, mesh)
+            bc_dof_indices = set(boundary_dofs.tolist())
+        elif hasattr(self.forward_model, 'V') and hasattr(self.forward_model, 'mesh'):
+            V = self.forward_model.V
+            mesh = self.forward_model.mesh
+            boundary_dofs = get_boundary_dofs(V, mesh)
+            bc_dof_indices = set(boundary_dofs.tolist())
 
-                terminal = delta_u_j.duplicate()
-                terminal.zeroEntries()
+        # Single adjoint solve with all forcings
+        adjoint_solver = ImplicitAdjointSolver(
+            self.forward_model,
+            self._trajectory,
+            self._jacobians,
+            self.forward_model.dt,
+            variational_form=variational_form,
+            bc_dof_indices=bc_dof_indices,
+        )
 
-                delta_m_j = adjoint_solver.solve(terminal, forcings)
-            else:
-                # At j=0, delta_m = delta_u_0
-                delta_m_j = delta_u_j
+        terminal = self._trajectory[-1].duplicate()
+        terminal.zeroEntries()
 
-            # Accumulate
-            result.axpy(1.0, delta_m_j)
-
-        return result
+        return adjoint_solver.solve(terminal, forcings)
 
     def _apply_R_sqrt_inv(self, v: PETSc.Vec, time_index: int) -> PETSc.Vec:
         """Apply R^{-1/2} to vector."""

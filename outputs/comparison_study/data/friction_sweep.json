@@ -23,7 +23,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 13.863719940185547,
+      "wall_time": 13.99691390991211,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -84,7 +84,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.38739824295044
+    "wall_time": 19.587533950805664
   },
   "dcwme_friction_1.0": {
     "experiment_id": "dcwme_friction_1.0",
@@ -99,7 +99,7 @@
         53.261650196458135
       ],
       "gradient_norm_history": [
-        1.0459493954822048e-13
+        1.0459873231715113e-13
       ],
       "background_error": 0.5792954682286892,
       "analysis_error": 0.5792954682286892,
@@ -110,7 +110,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 37.574542760849,
+      "wall_time": 13.989519834518433,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -155,7 +155,7 @@
         53.261650196458135
       ],
       "gradient_norm_history": [
-        1.0459493954822048e-13
+        1.0459873231715113e-13
       ],
       "step_size_history": [],
       "background_term": null,
@@ -171,7 +171,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 43.06842613220215
+    "wall_time": 19.53507113456726
   },
   "4dvar_friction_1.1": {
     "experiment_id": "4dvar_friction_1.1",
@@ -197,7 +197,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 13.815966844558716,
+      "wall_time": 14.125427961349487,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -259,7 +259,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.316713094711304
+    "wall_time": 19.627915143966675
   },
   "dcwme_friction_1.1": {
     "experiment_id": "dcwme_friction_1.1",
@@ -274,7 +274,7 @@
         53.261867797592245
       ],
       "gradient_norm_history": [
-        1.0429563402627072e-13
+        1.042994087059299e-13
       ],
       "background_error": 0.5792954682286892,
       "analysis_error": 0.5792954682286892,
@@ -285,7 +285,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 37.94881319999695,
+      "wall_time": 13.852950096130371,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -331,7 +331,7 @@
         53.261867797592245
       ],
       "gradient_norm_history": [
-        1.0429563402627072e-13
+        1.042994087059299e-13
       ],
       "step_size_history": [],
       "background_term": null,
@@ -347,7 +347,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 43.47206902503967
+    "wall_time": 19.355059146881104
   },
   "4dvar_friction_1.15": {
     "experiment_id": "4dvar_friction_1.15",
@@ -373,7 +373,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 13.820266008377075,
+      "wall_time": 13.878304958343506,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -435,7 +435,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.403314352035522
+    "wall_time": 19.483604907989502
   },
   "dcwme_friction_1.15": {
     "experiment_id": "dcwme_friction_1.15",
@@ -450,7 +450,7 @@
         53.26197560162328
       ],
       "gradient_norm_history": [
-        1.0414676651655059e-13
+        1.0415053215454547e-13
       ],
       "background_error": 0.5792954682286892,
       "analysis_error": 0.5792954682286892,
@@ -461,7 +461,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 37.669421672821045,
+      "wall_time": 14.174706220626831,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -507,7 +507,7 @@
         53.26197560162328
       ],
       "gradient_norm_history": [
-        1.0414676651655059e-13
+        1.0415053215454547e-13
       ],
       "step_size_history": [],
       "background_term": null,
@@ -523,7 +523,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 43.13328719139099
+    "wall_time": 20.05121088027954
   },
   "4dvar_friction_1.2": {
     "experiment_id": "4dvar_friction_1.2",
@@ -549,7 +549,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 13.802266836166382,
+      "wall_time": 14.090466976165771,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -611,7 +611,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.261056900024414
+    "wall_time": 19.575584650039673
   },
   "dcwme_friction_1.2": {
     "experiment_id": "dcwme_friction_1.2",
@@ -626,7 +626,7 @@
         53.26208275007475
       ],
       "gradient_norm_history": [
-        1.0399841924955533e-13
+        1.0400217584848163e-13
       ],
       "background_error": 0.5792954682286892,
       "analysis_error": 0.5792954682286892,
@@ -637,7 +637,7 @@
       "innovation_std": 0.10461461875055504,
       "num_iterations": 0,
       "converged": true,
-      "wall_time": 37.89789891242981,
+      "wall_time": 13.801923990249634,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -683,7 +683,7 @@
         53.26208275007475
       ],
       "gradient_norm_history": [
-        1.0399841924955533e-13
+        1.0400217584848163e-13
       ],
       "step_size_history": [],
       "background_term": null,
@@ -699,7 +699,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 43.35019898414612
+    "wall_time": 19.295475006103516
   },
   "_metadata": {
     "base_config": {
@@ -728,6 +728,6 @@
       "diagnostic_level": "standard"
     },
     "sweep_name": "friction",
-    "timestamp": "2026-02-07 12:43:36"
+    "timestamp": "2026-02-07 15:15:02"
   }
 }

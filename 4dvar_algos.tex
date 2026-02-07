@@ -1,0 +1,223 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{bm}
+
+% Custom commands
+\newcommand{\mb}{m_b}
+\newcommand{\Binv}{B^{-1}}
+\newcommand{\Rinv}{R^{-1}}
+\newcommand{\Rsqrtinv}{R^{-1/2}}
+\newcommand{\Lwme}{L_{\text{wme}}}
+\newcommand{\Qwme}{Q_{\text{wme}}}
+
+\title{4D-Var and DC-WME Algorithms with Computational Cost Analysis}
+\author{SWEMniCS Implementation}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Standard 4D-Var Algorithm}
+
+The standard 4D-Var cost function is:
+\begin{equation}
+J(m) = \frac{1}{2}\langle m - \mb, \Binv(m - \mb)\rangle
+     + \frac{1}{2}\sum_{k \in I} \langle H_k(u_k) - y_k, \Rinv_k(H_k(u_k) - y_k)\rangle
+\end{equation}
+where $u_k = M_{k:0}(m)$ is the model state at time $k$ evolved from initial condition $m$.
+
+\begin{algorithm}[H]
+\caption{Standard 4D-Var}
+\label{alg:4dvar}
+\begin{algorithmic}[1]
+\Require Background state $\mb$, observations $\{y_k\}_{k \in I}$, tolerances
+\Ensure Analysis state $m^*$
+
+\State $m \gets \mb$ \Comment{Initialize at background}
+
+\While{not converged}
+
+    \State \textbf{--- Forward Model (with caching) ---}
+    \If{trajectory for $m$ not in cache}
+        \State $(u_0, u_1, \ldots, u_{N_t}) \gets \text{ForwardSolve}(m)$ \Comment{\textcolor{blue}{Cost: 1 forward solve}}
+        \State Store Jacobians $\{J_k\}$ and cache trajectory
+    \Else
+        \State Retrieve $(u_0, \ldots, u_{N_t})$ and $\{J_k\}$ from cache \Comment{\textcolor{blue}{Cost: $\mathcal{O}(1)$}}
+    \EndIf
+
+    \State \textbf{--- Cost Function Value ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(n)$ vector operations}}
+    \State $J_b \gets \frac{1}{2}\langle m - \mb, \Binv(m - \mb)\rangle$
+    \State $J_o \gets \frac{1}{2}\sum_{k \in I} \langle H_k(u_k) - y_k, \Rinv_k(H_k(u_k) - y_k)\rangle$
+    \State $J \gets J_b + J_o$
+
+    \State \textbf{--- Adjoint Solve ---} \Comment{\textcolor{blue}{Cost: 1 adjoint solve, $\mathcal{O}(N_t \cdot C_{\text{adjoint}})$}}
+    \State Compute observation forcings: $f_k \gets H_k^T \Rinv_k (H_k(u_k) - y_k)$ for $k \in I$
+    \State $\lambda_0 \gets \text{AdjointSolve}(\{f_k\}, \{J_k\})$ \Comment{Backward integration}
+
+    \State \textbf{--- Gradient ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(n)$ vector operations}}
+    \State $\nabla J \gets \Binv(m - \mb) + \lambda_0$
+
+    \State \textbf{--- Optimization Step ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(n)$ for L-BFGS}}
+    \State $m \gets \text{OptimizerUpdate}(m, \nabla J)$
+
+    \State Check convergence: $\|\nabla J\| < \text{tol}$
+
+\EndWhile
+
+\State \Return $m^* = m$
+
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Total cost per iteration:} 1 forward solve + 1 adjoint solve + $\mathcal{O}(n)$ vector operations
+
+\newpage
+\section{DC-WME 4D-Var Algorithm}
+
+The Weighted Mean Error QoI is:
+\begin{equation}
+\Qwme(m) = \frac{1}{\sqrt{|I|}} \sum_{k \in I} \Rsqrtinv_k \left( H_k(u_k) - y_k \right)
+\end{equation}
+
+The DC-WME cost function is:
+\begin{equation}
+J_{\text{WME}}(m) = \frac{1}{2}\langle m - \mb, \Binv(m - \mb)\rangle
+     + \frac{1}{2}\|\Qwme(m)\|^2
+     - \frac{1}{2}\langle \Qwme(m) - \Qwme(\mb), \Lwme^{-1}(\Qwme(m) - \Qwme(\mb))\rangle
+\end{equation}
+
+\begin{algorithm}[H]
+\caption{DC-WME 4D-Var}
+\label{alg:dcwme}
+\begin{algorithmic}[1]
+\Require Background state $\mb$, observations $\{y_k\}_{k \in I}$, tolerances
+\Ensure Analysis state $m^*$
+
+\State $m \gets \mb$ \Comment{Initialize at background}
+\State $\Qwme(\mb) \gets \text{None}$ \Comment{Will be computed and cached on first iteration}
+
+\While{not converged}
+
+    \State \textbf{--- Forward Model (with caching) ---}
+    \If{trajectory for $m$ not in cache}
+        \State $(u_0, u_1, \ldots, u_{N_t}) \gets \text{ForwardSolve}(m)$ \Comment{\textcolor{blue}{Cost: 1 forward solve}}
+        \State Store Jacobians $\{J_k\}$ and cache trajectory
+    \Else
+        \State Retrieve $(u_0, \ldots, u_{N_t})$ and $\{J_k\}$ from cache \Comment{\textcolor{blue}{Cost: $\mathcal{O}(1)$}}
+    \EndIf
+
+    \State \textbf{--- Compute WME QoI ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(|I| \cdot n)$ vector operations}}
+    \State $\Qwme(m) \gets \frac{1}{\sqrt{|I|}} \sum_{k \in I} \Rsqrtinv_k (H_k(u_k) - y_k)$
+
+    \State \textbf{--- Cache Background WME (first iteration only) ---}
+    \If{$\Qwme(\mb) = \text{None}$} \Comment{\textcolor{red}{First iteration: $m = \mb$}}
+        \State $\Qwme(\mb) \gets \Qwme(m)$ \Comment{Cache for all future iterations}
+    \EndIf
+
+    \State \textbf{--- Cost Function Value ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(n)$ vector operations}}
+    \State $J_b \gets \frac{1}{2}\langle m - \mb, \Binv(m - \mb)\rangle$
+    \State $J_{\text{data}} \gets \frac{1}{2}\|\Qwme(m)\|^2$
+    \State $\Delta Q \gets \Qwme(m) - \Qwme(\mb)$
+    \State $J_{\text{pred}} \gets \frac{1}{2}\langle \Delta Q, \Lwme^{-1} \Delta Q\rangle$ \Comment{Predictability term}
+    \State $J \gets J_b + J_{\text{data}} - J_{\text{pred}}$
+
+    \State \textbf{--- Compute WME Gradient Forcing ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(n)$ vector operations}}
+    \State $w \gets \Qwme(m) - \Lwme^{-1}\Delta Q$ \Comment{Modified forcing}
+
+    \State \textbf{--- Adjoint Solve for WME ---} \Comment{\textcolor{blue}{Cost: 1 adjoint solve, $\mathcal{O}(N_t \cdot C_{\text{adjoint}})$}}
+    \State Compute WME forcings: $f_k \gets \frac{1}{\sqrt{|I|}} H_k^T \Rsqrtinv_k w$ for $k \in I$
+    \State $\lambda_0^{\text{wme}} \gets \text{AdjointSolve}(\{f_k\}, \{J_k\})$
+
+    \State \textbf{--- Gradient ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(n)$ vector operations}}
+    \State $\nabla J \gets \Binv(m - \mb) + \lambda_0^{\text{wme}}$
+
+    \State \textbf{--- Optimization Step ---} \Comment{\textcolor{blue}{Cost: $\mathcal{O}(n)$ for L-BFGS}}
+    \State $m \gets \text{OptimizerUpdate}(m, \nabla J)$
+
+    \State Check convergence: $\|\nabla J\| < \text{tol}$
+
+\EndWhile
+
+\State \Return $m^* = m$
+
+\end{algorithmic}
+\end{algorithm}
+
+\newpage
+\section{Computational Cost Comparison}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{Operation} & \textbf{4D-Var} & \textbf{DC-WME} \\
+\hline
+\hline
+\multicolumn{3}{|l|}{\textit{Per iteration}} \\
+\hline
+Forward solve & 1 & 1 (cached) \\
+Adjoint solve & 1 & 1 \\
+Vector operations & $\mathcal{O}(n)$ & $\mathcal{O}(n)$ \\
+\hline
+\hline
+\multicolumn{3}{|l|}{\textit{Total for $K$ iterations}} \\
+\hline
+Forward solves & $K$ & $K$ \\
+Adjoint solves & $K$ & $K$ \\
+\hline
+\end{tabular}
+\caption{Computational cost comparison between 4D-Var and DC-WME (with trajectory caching)}
+\end{table}
+
+\section{Key Observations}
+
+\begin{enumerate}
+    \item \textbf{No initialization overhead with caching:} Since the optimizer starts at $m = \mb$, the first iteration's forward solve computes $\Qwme(\mb)$ as a byproduct. This value is cached and reused for all subsequent iterations. With proper trajectory caching, DC-WME has \textbf{identical} forward solve count to standard 4D-Var.
+
+    \item \textbf{Per-iteration cost:} Both methods have identical per-iteration costs:
+    \begin{itemize}
+        \item 1 forward solve (to compute trajectory and Jacobians)
+        \item 1 adjoint solve (to compute gradient)
+        \item $\mathcal{O}(n)$ vector operations
+    \end{itemize}
+
+    \item \textbf{First iteration special case:} On the first iteration when $m = \mb$:
+    \begin{itemize}
+        \item $\Qwme(m) = \Qwme(\mb)$ (same computation)
+        \item $\Delta Q = \Qwme(m) - \Qwme(\mb) = 0$
+        \item $J_{\text{pred}} = 0$ (no predictability penalty yet)
+    \end{itemize}
+    The cached $\Qwme(\mb)$ is then used to compute $\Delta Q$ in all subsequent iterations.
+
+    \item \textbf{Cost functions differ even when $J_{\text{pred}} = 0$:} Although the predictability term vanishes on the first iteration, the 4D-Var and DC-WME cost functions are \textit{not} equivalent. Let $d_k = \Rsqrtinv_k(H_k(u_k) - y_k)$ denote the normalized innovation at time $k$. Then:
+    \begin{itemize}
+        \item \textbf{4D-Var:} $J_o = \frac{1}{2}\sum_{k \in I} \|d_k\|^2$ \quad (sum of squared innovations)
+        \item \textbf{DC-WME:} $J_{\text{data}} = \frac{1}{2|I|}\left\|\sum_{k \in I} d_k\right\|^2$ \quad (squared sum of innovations)
+    \end{itemize}
+    The key difference: 4D-Var penalizes each observation independently, while DC-WME allows cancellation between positive and negative innovations. For example, if $d_1 = +1$ and $d_2 = -1$:
+    \begin{itemize}
+        \item 4D-Var: $J_o = \frac{1}{2}(1^2 + 1^2) = 1$
+        \item DC-WME: $J_{\text{data}} = \frac{1}{4}\|1 + (-1)\|^2 = 0$
+    \end{itemize}
+    DC-WME focuses on systematic bias (weighted mean error), not individual observation misfits.
+
+    \item \textbf{Parallelization:} Since both methods use the same forward/adjoint infrastructure, parallelization provides equal speedup to both.
+
+    \item \textbf{Why $\Qwme(\mb)$ is needed:} The predictability term in DC-WME measures the \textit{change} in weighted mean error from background:
+    \begin{equation}
+    J_{\text{pred}} = \frac{1}{2}\langle \Qwme(m) - \Qwme(\mb), \Lwme^{-1}(\Qwme(m) - \Qwme(\mb))\rangle
+    \end{equation}
+    This requires $\Qwme(\mb)$, but since the optimizer starts at $\mb$, it is computed for free on the first iteration.
+
+    \item \textbf{Single-sweep WME adjoint:} The WME gradient requires the adjoint of the linearized WME operator:
+    \begin{equation}
+    \delta m = \frac{1}{\sqrt{|I|}} \sum_{j \in I} \text{ADJ}_{j:0} \cdot H_j^T \cdot \Rsqrtinv_j \cdot w
+    \end{equation}
+    A naive implementation would run $|I|$ separate adjoint solves (one from each observation time $j$ back to $t=0$), costing $\mathcal{O}(\sum_{j \in I} j) \approx \mathcal{O}(|I|^2/2)$ adjoint timesteps. Instead, we compute WME forcings $f_j = \frac{1}{\sqrt{|I|}} H_j^T \Rsqrtinv_j w$ at each observation time and pass them to a \textbf{single backward sweep}, accumulating contributions as we go --- identical to the standard 4D-Var adjoint pattern. This reduces the cost from $|I|$ adjoint solves to exactly 1.
+\end{enumerate}
+
+\end{document}
