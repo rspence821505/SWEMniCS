@@ -1,0 +1,733 @@
+{
+  "4dvar_friction_1.0": {
+    "experiment_id": "4dvar_friction_1.0",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.0,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1022.4745871796177
+      ],
+      "gradient_norm_history": [
+        3.9688219135406406e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 13.863719940185547,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": false,
+        "friction_scale_factor": 1.0,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": false
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1022.4745871796177
+      ],
+      "gradient_norm_history": [
+        3.9688219135406406e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 19.38739824295044
+  },
+  "dcwme_friction_1.0": {
+    "experiment_id": "dcwme_friction_1.0",
+    "status": "success",
+    "method": "dcwme",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.0,
+    "result": {
+      "method": "dcwme",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        53.261650196458135
+      ],
+      "gradient_norm_history": [
+        1.0459493954822048e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 37.574542760849,
+      "config": {
+        "method": "dcwme",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": false,
+        "friction_scale_factor": 1.0,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": false
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        53.261650196458135
+      ],
+      "gradient_norm_history": [
+        1.0459493954822048e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 43.06842613220215
+  },
+  "4dvar_friction_1.1": {
+    "experiment_id": "4dvar_friction_1.1",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.1,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1022.4749642924687
+      ],
+      "gradient_norm_history": [
+        3.955062824571578e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 13.815966844558716,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1022.4749642924687
+      ],
+      "gradient_norm_history": [
+        3.955062824571578e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 19.316713094711304
+  },
+  "dcwme_friction_1.1": {
+    "experiment_id": "dcwme_friction_1.1",
+    "status": "success",
+    "method": "dcwme",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.1,
+    "result": {
+      "method": "dcwme",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        53.261867797592245
+      ],
+      "gradient_norm_history": [
+        1.0429563402627072e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 37.94881319999695,
+      "config": {
+        "method": "dcwme",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        53.261867797592245
+      ],
+      "gradient_norm_history": [
+        1.0429563402627072e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 43.47206902503967
+  },
+  "4dvar_friction_1.15": {
+    "experiment_id": "4dvar_friction_1.15",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.15,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1022.4751518202452
+      ],
+      "gradient_norm_history": [
+        3.9482225234173e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 13.820266008377075,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.15,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.15
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1022.4751518202452
+      ],
+      "gradient_norm_history": [
+        3.9482225234173e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 19.403314352035522
+  },
+  "dcwme_friction_1.15": {
+    "experiment_id": "dcwme_friction_1.15",
+    "status": "success",
+    "method": "dcwme",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.15,
+    "result": {
+      "method": "dcwme",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        53.26197560162328
+      ],
+      "gradient_norm_history": [
+        1.0414676651655059e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 37.669421672821045,
+      "config": {
+        "method": "dcwme",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.15,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.15
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        53.26197560162328
+      ],
+      "gradient_norm_history": [
+        1.0414676651655059e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 43.13328719139099
+  },
+  "4dvar_friction_1.2": {
+    "experiment_id": "4dvar_friction_1.2",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.2,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1022.4753386726677
+      ],
+      "gradient_norm_history": [
+        3.9414081882366597e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 13.802266836166382,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.2,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.2
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1022.4753386726677
+      ],
+      "gradient_norm_history": [
+        3.9414081882366597e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 19.261056900024414
+  },
+  "dcwme_friction_1.2": {
+    "experiment_id": "dcwme_friction_1.2",
+    "status": "success",
+    "method": "dcwme",
+    "sweep_parameter": "friction",
+    "sweep_value": 1.2,
+    "result": {
+      "method": "dcwme",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        53.26208275007475
+      ],
+      "gradient_norm_history": [
+        1.0399841924955533e-13
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792954682286892,
+      "error_reduction": 0.0,
+      "mean_rmse": 9.99456594635672,
+      "data_misfit": 101900.33841785775,
+      "innovation_mean": -9.99456594095366,
+      "innovation_std": 0.10461461875055504,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 37.89789891242981,
+      "config": {
+        "method": "dcwme",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.2,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.2
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        53.26208275007475
+      ],
+      "gradient_norm_history": [
+        1.0399841924955533e-13
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 43.35019898414612
+  },
+  "_metadata": {
+    "base_config": {
+      "nx": 20,
+      "ny": 10,
+      "dt": 1800.0,
+      "final_time": 172800.0,
+      "nt": 96,
+      "solver_type": "DG",
+      "p_degree": [
+        1,
+        1
+      ],
+      "obs_frequency": 4,
+      "obs_fraction": 0.5,
+      "obs_noise_level": 0.01,
+      "background_error_std": 0.1,
+      "friction_scale_factor": 1.1,
+      "bathymetry_noise_std": 0.0,
+      "max_iterations": 50,
+      "gradient_tolerance": 1e-06,
+      "obs_seed": 42,
+      "background_seed": 123,
+      "perturbation_seed": 456,
+      "output_dir": "outputs/comparison_study",
+      "diagnostic_level": "standard"
+    },
+    "sweep_name": "friction",
+    "timestamp": "2026-02-07 12:43:36"
+  }
+}

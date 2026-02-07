@@ -99,6 +99,7 @@ from __future__ import annotations
 from .covariance import (
     CovarianceMatrix,
     DiagonalCovariance,
+    ScaledCovariance,
     DenseCovariance,
     ImplicitCovariance,
     EnsembleCovariance,

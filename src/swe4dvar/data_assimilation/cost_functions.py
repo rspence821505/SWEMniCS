@@ -1110,7 +1110,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         obs_times : List[int]
             Observation time indices.
         predicted_cov_wme : CovarianceMatrix, optional
-            Predicted covariance for WME. If None, estimated.
+            Predicted covariance for WME. If None, uses analytical
+            approximation L_wme = R/N where N is the number of observations.
         comm : MPI.Comm, optional
             MPI communicator.
         checkpointer : CheckpointerBase, optional
@@ -1146,6 +1147,72 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         # Cache for WME accumulation
         self._wme_cache: Dict[str, PETSc.Vec] = {}
+
+        # Pre-compute Q_wme(m_b) at initialization (computed once per assimilation window)
+        # This avoids the lazy computation on first value() call
+        self._wme_cache["Q_wme_mb"] = self._compute_wme(self.m_b)
+
+        # Share the trajectory from QoIMap back to cost function's cache
+        # This prevents _run_forward_model from re-computing the m_b trajectory
+        self._sync_trajectory_from_qoi(self.m_b)
+
+    def _sync_trajectory_from_qoi(self, m: PETSc.Vec) -> None:
+        """
+        Sync trajectory from QoIMap cache to cost function's cache.
+
+        After QoIMap computes a trajectory (e.g., in _compute_wme), this method
+        retrieves it and populates the cost function's cache so that _run_forward_model
+        can reuse it instead of running another forward solve.
+        """
+        import hashlib
+
+        try:
+            m_bytes = m.getArray(readonly=True).tobytes()
+        except Exception:
+            m_copy = m.copy()
+            m_bytes = m_copy.getArray().tobytes()
+            m_copy.destroy()
+        m_hash = hashlib.md5(m_bytes).hexdigest()
+
+        # Check if QoIMap has the trajectory cached
+        if m_hash in self.qoi_map._trajectory_cache:
+            cached = self.qoi_map._trajectory_cache[m_hash]
+            self._trajectory, self._jacobians = cached
+            self._current_control = m.copy()
+            self._control_hash = m_hash
+
+    def _share_trajectory_with_qoi(
+        self, m: PETSc.Vec, trajectory: List[PETSc.Vec], jacobians: Optional[List]
+    ) -> None:
+        """
+        Share computed trajectory with QoIMap cache to avoid redundant forward solves.
+
+        When _run_forward_model computes a trajectory, this method populates the
+        QoIMap's trajectory cache so that subsequent _compute_wme calls can reuse
+        the trajectory instead of running another forward solve.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Control variable used for the trajectory.
+        trajectory : List[PETSc.Vec]
+            Computed trajectory.
+        jacobians : Optional[List]
+            Optional Jacobians (may be None).
+        """
+        import hashlib
+
+        # Compute hash matching QoIMap's caching scheme
+        try:
+            m_bytes = m.getArray(readonly=True).tobytes()
+        except Exception:
+            m_copy = m.copy()
+            m_bytes = m_copy.getArray().tobytes()
+            m_copy.destroy()
+        m_hash = hashlib.md5(m_bytes).hexdigest()
+
+        # Populate QoIMap's cache
+        self.qoi_map._trajectory_cache[m_hash] = (trajectory, jacobians)
 
     def value(self, m: PETSc.Vec) -> float:
         """
@@ -1231,13 +1298,27 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         return 0.5 * delta_Q.dot(L_inv_delta)
 
     def _ensure_wme_predicted_covariance(self):
-        """Ensure WME predicted covariance is available."""
-        if self._L_wme is None:
-            from .qoi_maps import QoICovarianceEstimator
+        """Ensure WME predicted covariance is available.
 
-            estimator = QoICovarianceEstimator(self.qoi_map, self.B, num_samples=100)
-            # Use final time for WME covariance
-            self._L_wme = estimator.estimate(self.m_b, max(self.obs_times))
+        For the WME formulation, the predicted covariance L_wme must satisfy
+        the predictability condition:
+            λ_max(R) < λ_min(L_wme)
+
+        This ensures that the model's predicted uncertainty (L_wme) is greater
+        than the observation uncertainty (R), which is required for the DC
+        formulation to properly weight the observations.
+
+        We use L_wme = 2 * R which satisfies:
+            λ_min(L_wme) = 2 * λ_min(R) ≥ 2 * λ_max(R) > λ_max(R)
+        for diagonal R with uniform entries.
+        """
+        if self._L_wme is None:
+            # Get observation covariance at first observation time
+            R = self._get_observation_covariance(self.obs_times[0])
+
+            # L_wme = 2 * R ensures predictability condition: λ_max(R) < λ_min(L_wme)
+            from .covariance import ScaledCovariance
+            self._L_wme = ScaledCovariance(R, scale_factor=2.0)
 
     def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
         """
@@ -1259,6 +1340,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         """
         # Run forward model for trajectory
         trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+        # Share trajectory with QoIMap to avoid redundant forward solve in _compute_wme
+        self._share_trajectory_with_qoi(m, trajectory, jacobians)
 
         # Background gradient: B⁻¹(m - m_b)
         delta_m = m.duplicate()
@@ -1284,8 +1367,10 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         forcing = Q_wme_m.copy()
         forcing.axpy(-1.0, L_inv_delta)
 
-        # Apply adjoint of WME Jacobian
-        linearized_wme = self.qoi_map.linearize(m, max(self.obs_times))
+        # Apply adjoint of WME Jacobian (pass trajectory to avoid redundant forward solve)
+        linearized_wme = self.qoi_map.linearize(
+            m, max(self.obs_times), trajectory=self._trajectory, jacobians=self._jacobians
+        )
         grad_wme = linearized_wme.apply_adjoint(forcing)
 
         # Accumulate
@@ -1317,6 +1402,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         # Run forward model once for trajectory and Jacobians
         try:
             trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+            # Share trajectory with QoIMap to avoid redundant forward solve in _compute_wme
+            self._share_trajectory_with_qoi(m, trajectory, jacobians)
         except Exception as e:
             import warnings
             warnings.warn(
@@ -1365,8 +1452,10 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         forcing = Q_wme_m.copy()
         forcing.axpy(-1.0, L_inv_delta)
 
-        # Apply adjoint of WME Jacobian
-        linearized_wme = self.qoi_map.linearize(m, max(self.obs_times))
+        # Apply adjoint of WME Jacobian (pass trajectory to avoid redundant forward solve)
+        linearized_wme = self.qoi_map.linearize(
+            m, max(self.obs_times), trajectory=self._trajectory, jacobians=self._jacobians
+        )
         grad_wme = linearized_wme.apply_adjoint(forcing)
 
         # Accumulate

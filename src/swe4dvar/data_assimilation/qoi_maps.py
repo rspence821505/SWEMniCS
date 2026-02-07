@@ -283,8 +283,8 @@ class WeightedMeanErrorQoI(QoIMap):
         if time_index < 0:
             raise ValueError("time_index must be non-negative for WME")
 
-        # Run forward model
-        trajectory, _ = self._get_trajectory(m, store_jacobians=False)
+        # Run forward model (store Jacobians for gradient computation in DC-WME)
+        trajectory, _ = self._get_trajectory(m, store_jacobians=True)
 
         # Observation indices up to (and including) time_index
         I_k = [t for t in self.obs_times if t <= time_index]
@@ -387,7 +387,13 @@ class WeightedMeanErrorQoI(QoIMap):
             )
             return v.copy()
 
-    def linearize(self, m: PETSc.Vec, time_index: int) -> "LinearizedQoI":
+    def linearize(
+        self,
+        m: PETSc.Vec,
+        time_index: int,
+        trajectory: Optional[List[PETSc.Vec]] = None,
+        jacobians: Optional[List] = None,
+    ) -> "LinearizedQoI":
         """
         Linearize WME QoI.
 
@@ -399,6 +405,10 @@ class WeightedMeanErrorQoI(QoIMap):
             Linearization point.
         time_index : int
             Time index k.
+        trajectory : List[PETSc.Vec], optional
+            Pre-computed trajectory. If provided, avoids running forward model.
+        jacobians : List, optional
+            Pre-computed Jacobians.
 
         Returns
         -------
@@ -413,6 +423,8 @@ class WeightedMeanErrorQoI(QoIMap):
             self.y_obs,
             self.R_cov,
             self.obs_times,
+            trajectory=trajectory,
+            jacobians=jacobians,
         )
 
 
@@ -627,6 +639,8 @@ class LinearizedWMEQoI(LinearizedQoI):
         observations: List[PETSc.Vec],
         observation_cov,
         obs_times: Optional[List[int]] = None,
+        trajectory: Optional[List[PETSc.Vec]] = None,
+        jacobians: Optional[List] = None,
     ):
         """
         Initialize linearized WME QoI.
@@ -649,6 +663,10 @@ class LinearizedWMEQoI(LinearizedQoI):
             Observation time indices I corresponding to `observations`.
             If None, assumes observations are provided for every time step
             in order: I = [0, 1, ..., len(observations)-1].
+        trajectory : List[PETSc.Vec], optional
+            Pre-computed trajectory. If provided, avoids running forward model.
+        jacobians : List, optional
+            Pre-computed Jacobians. Required if trajectory is provided.
         """
         self.forward_model = forward_model
         self.obs_op = observation_operator
@@ -670,9 +688,9 @@ class LinearizedWMEQoI(LinearizedQoI):
             t: y for t, y in zip(self.obs_times, self.y_obs)
         }
 
-        # Cache trajectory
-        self._trajectory: Optional[List[PETSc.Vec]] = None
-        self._jacobians: Optional[List[PETSc.Mat]] = None
+        # Cache trajectory - use pre-computed if provided
+        self._trajectory: Optional[List[PETSc.Vec]] = trajectory
+        self._jacobians: Optional[List[PETSc.Mat]] = jacobians
         self._ensure_linearization()
 
     def _ensure_linearization(self):

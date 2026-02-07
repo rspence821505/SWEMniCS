@@ -426,6 +426,73 @@ class DiagonalCovariance(CovarianceMatrix):
             self.inv_diagonal.destroy()
 
 
+class ScaledCovariance(CovarianceMatrix):
+    """Scaled wrapper for an existing covariance matrix.
+
+    Represents C_scaled = α · C where α is a scale factor and C is the
+    underlying covariance matrix.
+
+    This is useful for the WME formulation where L_wme = R/N, representing
+    the reduced variance from averaging N observations.
+
+    Operations:
+    - apply(v) = α · C·v
+    - apply_inverse(v) = (1/α) · C⁻¹·v
+
+    Parameters
+    ----------
+    base_cov : CovarianceMatrix
+        The underlying covariance matrix C.
+    scale_factor : float
+        The scale factor α.
+
+    Examples
+    --------
+    >>> R = DiagonalCovariance(comm, size=100, variance=0.01)
+    >>> L_wme = ScaledCovariance(R, scale_factor=1.0/24)  # 24 observations
+    """
+
+    def __init__(self, base_cov: CovarianceMatrix, scale_factor: float):
+        """Initialize scaled covariance wrapper.
+
+        Parameters
+        ----------
+        base_cov : CovarianceMatrix
+            The underlying covariance matrix.
+        scale_factor : float
+            Scale factor α (L_scaled = α * L_base).
+        """
+        super().__init__(base_cov.comm, base_cov.size)
+        self.base_cov = base_cov
+        self.scale_factor = scale_factor
+
+    def apply(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """Apply scaled covariance: out = α·C·v."""
+        result = self.base_cov.apply(v, out)
+        result.scale(self.scale_factor)
+        return result
+
+    def apply_inverse(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """Apply scaled inverse: out = (1/α)·C⁻¹·v."""
+        result = self.base_cov.apply_inverse(v, out)
+        result.scale(1.0 / self.scale_factor)
+        return result
+
+    def sqrt_apply(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
+        """Apply scaled square root: out = √α·C^(1/2)·v."""
+        result = self.base_cov.sqrt_apply(v, out)
+        result.scale(np.sqrt(self.scale_factor))
+        return result
+
+    def min_eigenvalue(self) -> float:
+        """Return minimum eigenvalue (scaled)."""
+        return self.scale_factor * self.base_cov.min_eigenvalue()
+
+    def max_eigenvalue(self) -> float:
+        """Return maximum eigenvalue (scaled)."""
+        return self.scale_factor * self.base_cov.max_eigenvalue()
+
+
 class DenseCovariance(CovarianceMatrix):
     """Dense covariance matrix stored as PETSc Mat.
 
