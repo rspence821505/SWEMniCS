@@ -123,6 +123,10 @@ class TwinExperimentResults:
     analysis_error: float = 0.0
     error_reduction: float = 0.0
 
+    # DAMetrics-computed metrics
+    mean_rmse: float = 0.0  # Mean RMSE across observation times
+    data_misfit: float = 0.0  # Total data misfit term
+
     # Innovation statistics
     innovation_mean: float = 0.0
     innovation_std: float = 0.0
@@ -366,9 +370,11 @@ class TwinExperiment:
             error_reduction = 0.0
             innov_mean = 0.0
             innov_std = 0.0
+            mean_rmse = 0.0
+            data_misfit = 0.0
             self.analysis_trajectory = None
         else:
-            analysis_error, error_reduction, innov_mean, innov_std = self._evaluate_results(
+            analysis_error, error_reduction, innov_mean, innov_std, mean_rmse, data_misfit = self._evaluate_results(
                 obs_operator, obs_times, background_error
             )
 
@@ -380,6 +386,8 @@ class TwinExperiment:
             background_error=background_error,
             analysis_error=analysis_error,
             error_reduction=error_reduction,
+            mean_rmse=mean_rmse,
+            data_misfit=data_misfit,
             innovation_mean=innov_mean,
             innovation_std=innov_std,
             num_iterations=optimizer.iteration,
@@ -1171,7 +1179,9 @@ class TwinExperiment:
         return lower, upper
 
     def _evaluate_results(self, obs_operator, obs_times, background_error):
-        """Evaluate analysis results."""
+        """Evaluate analysis results using DAMetrics."""
+        from swe4dvar.data_assimilation.metrics import DAMetrics
+
         # Analysis error
         diff = self.m_analysis.copy()
         diff.axpy(-1.0, self.m_true)
@@ -1226,7 +1236,20 @@ class TwinExperiment:
             vec = PETSc.Vec().createWithArray(state_array.copy(), comm=self.comm)
             self.analysis_trajectory.append(vec)
 
-        # Innovation statistics
+        # Create observation dictionaries for DAMetrics
+        obs_dict = {obs_times[i]: self.observations[i] for i in range(len(obs_times))}
+        obs_op_dict = {k: obs_operator for k in obs_times}
+
+        # Use DAMetrics for RMSE and data misfit
+        metrics = DAMetrics(obs_dict, obs_op_dict)
+        rmse_dict = metrics.compute_rmse(self.analysis_trajectory)
+        data_misfit = metrics.compute_data_misfit(self.analysis_trajectory)
+        mean_rmse = float(np.mean(list(rmse_dict.values()))) if rmse_dict else 0.0
+
+        self.log(f"  Mean RMSE: {mean_rmse:.6f}")
+        self.log(f"  Data misfit: {data_misfit:.6f}")
+
+        # Innovation statistics (keep existing calculation for backward compatibility)
         all_innovations = []
         for i, k in enumerate(obs_times):
             H_u = obs_operator.forward(self.analysis_trajectory[k])
@@ -1242,7 +1265,7 @@ class TwinExperiment:
         self.log(f"  Innovation mean: {innov_mean:.6f}")
         self.log(f"  Innovation std: {innov_std:.6f}")
 
-        return analysis_error, error_reduction, innov_mean, innov_std
+        return analysis_error, error_reduction, innov_mean, innov_std, mean_rmse, data_misfit
 
     def _get_problem_config(self) -> Dict[str, Any]:
         """Extract problem configuration for saving."""

@@ -66,6 +66,7 @@ class CostFunction(ABC):
         background_cov,
         observation_cov,
         comm: Optional[MPI.Comm] = None,
+        checkpointer=None,
     ):
         """
         Initialize cost function.
@@ -83,12 +84,16 @@ class CostFunction(ABC):
             for all times or a dictionary mapping time indices to covariances.
         comm : MPI.Comm, optional
             MPI communicator. Defaults to MPI.COMM_WORLD.
+        checkpointer : CheckpointerBase, optional
+            Custom checkpointer for managing forward trajectory storage.
+            If provided, overrides the forward model's default storage.
         """
         self.forward_model = forward_model
         self.obs_op = observation_operator
         self.B = background_cov
         self.R = observation_cov
         self.comm = comm if comm is not None else MPI.COMM_WORLD
+        self.checkpointer = checkpointer
 
         # Cache for forward trajectory and Jacobians
         self._trajectory: Optional[List[PETSc.Vec]] = None
@@ -279,6 +284,7 @@ class FourDVarCost(CostFunction):
         observations: List[PETSc.Vec],
         obs_times: List[int],
         comm: Optional[MPI.Comm] = None,
+        checkpointer=None,
     ):
         """
         Initialize standard 4D-Var cost function.
@@ -301,9 +307,12 @@ class FourDVarCost(CostFunction):
             List of observation time indices.
         comm : MPI.Comm, optional
             MPI communicator.
+        checkpointer : CheckpointerBase, optional
+            Custom checkpointer for managing forward trajectory storage.
+            If provided, overrides the forward model's default storage.
         """
         super().__init__(
-            forward_model, observation_operator, background_cov, observation_cov, comm
+            forward_model, observation_operator, background_cov, observation_cov, comm, checkpointer
         )
         self.m_b = m_background
         self.y_obs = observations
@@ -665,6 +674,7 @@ class DCFourDVarCost(FourDVarCost):
         predicted_cov: Optional[Dict] = None,
         gamma: float = 1.0,
         comm: Optional[MPI.Comm] = None,
+        checkpointer=None,
     ):
         """
         Initialize DC-4DVar cost function.
@@ -694,6 +704,8 @@ class DCFourDVarCost(FourDVarCost):
             Scaling factor for predictability check (default 1.0).
         comm : MPI.Comm, optional
             MPI communicator.
+        checkpointer : CheckpointerBase, optional
+            Custom checkpointer for managing forward trajectory storage.
         """
         super().__init__(
             forward_model,
@@ -704,6 +716,7 @@ class DCFourDVarCost(FourDVarCost):
             observations,
             obs_times,
             comm,
+            checkpointer,
         )
 
         # Set QoI map (default to standard: Q_k = H_k ∘ M_{k:0})
@@ -1075,6 +1088,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         obs_times: List[int],
         predicted_cov_wme=None,
         comm: Optional[MPI.Comm] = None,
+        checkpointer=None,
     ):
         """
         Initialize DC-WME cost function.
@@ -1099,6 +1113,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             Predicted covariance for WME. If None, estimated.
         comm : MPI.Comm, optional
             MPI communicator.
+        checkpointer : CheckpointerBase, optional
+            Custom checkpointer for managing forward trajectory storage.
         """
         # Create WME QoI map
         from .qoi_maps import WeightedMeanErrorQoI
@@ -1122,6 +1138,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             qoi_map=wme_qoi,
             predicted_cov=None,
             comm=comm,
+            checkpointer=checkpointer,
         )
 
         # WME-specific predicted covariance
