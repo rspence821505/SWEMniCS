@@ -27,10 +27,14 @@ class ComparisonStudyConfig:
     p_degree: List[int] = field(default_factory=lambda: [1, 1])
 
     # Base DA configuration (defaults when not being swept)
-    obs_frequency: int = 4
+    obs_frequency: int = 1
     obs_fraction: float = 0.5
-    obs_noise_level: float = 0.01
+    obs_noise_level: float = 0.001
     background_error_std: float = 0.1
+    component_aware_cov: bool = True
+
+    # Cycling 4D-Var
+    n_windows: int = 4  # Number of assimilation windows
 
     # Physics perturbation defaults
     friction_scale_factor: float = 1.1  # Default to 10% model error
@@ -38,7 +42,7 @@ class ComparisonStudyConfig:
 
     # Optimization configuration
     max_iterations: int = 50
-    gradient_tolerance: float = 1e-6
+    gradient_tolerance: float = 1e-10
 
     # Reproducibility
     obs_seed: int = 42
@@ -70,6 +74,8 @@ class ComparisonStudyConfig:
             "obs_fraction": self.obs_fraction,
             "obs_noise_level": self.obs_noise_level,
             "background_error_std": self.background_error_std,
+            "component_aware_cov": self.component_aware_cov,
+            "n_windows": self.n_windows,
             "friction_scale_factor": self.friction_scale_factor,
             "bathymetry_noise_std": self.bathymetry_noise_std,
             "max_iterations": self.max_iterations,

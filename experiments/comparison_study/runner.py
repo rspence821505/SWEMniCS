@@ -141,6 +141,8 @@ class ComparisonRunner:
             "interior_only": True,  # Critical for DG
             "use_bounds": True,
             "h_min": 0.01,
+            "component_aware_cov": self.base_config.component_aware_cov,
+            "n_windows": self.base_config.n_windows,
         }
 
         # Apply physics perturbation for non-friction sweeps

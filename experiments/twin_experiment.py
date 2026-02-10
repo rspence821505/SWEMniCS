@@ -89,6 +89,9 @@ class TwinExperimentConfig:
     perturb_friction: bool = False
     friction_scale_factor: float = 1.0  # α: friction_perturbed = friction_true * α
 
+    # Cycling 4D-Var
+    n_windows: int = 1  # Number of cycling windows (1 = single window)
+
     # Perturbation seed for reproducibility
     perturbation_seed: int = 456
 
@@ -165,12 +168,13 @@ class ForwardModelWrapper:
     expected by the cost functions.
     """
 
-    def __init__(self, solver, problem, solver_params: dict):
+    def __init__(self, solver, problem, solver_params: dict, t_start: float = 0.0):
         self.solver = solver
         self.problem = problem
         self.solver_params = solver_params
         self.dt = problem.dt
         self.nt = problem.nt
+        self.t_start = t_start
         self.comm = MPI.COMM_WORLD
         self.var_form = getattr(solver, "var_form", None)
 
@@ -225,7 +229,7 @@ class ForwardModelWrapper:
             )
         m_local.destroy()
 
-        self.problem.t = 0.0
+        self.problem.t = self.t_start
 
         self.solver.time_loop(
             solver_parameters=self.solver_params,
@@ -335,6 +339,10 @@ class TwinExperiment:
         start_time = time.time()
 
         self._print_header()
+
+        # Dispatch to cycling if n_windows > 1
+        if self.config.n_windows > 1:
+            return self._run_cycling(start_time)
 
         # Step 1: Generate truth trajectory (with TRUE parameters)
         self.log("\nStep 1: Generating truth trajectory...")
@@ -1075,11 +1083,11 @@ class TwinExperiment:
 
         return DiagonalCovariance(self.comm, state_size, diagonal=variances)
 
-    def _create_forward_model(self):
+    def _create_forward_model(self, t_start: float = 0.0):
         """Create forward model wrapper."""
         self.solver.storage.clear()
-        self.problem.t = 0.0
-        return ForwardModelWrapper(self.solver, self.problem, self.solver_params)
+        self.problem.t = t_start
+        return ForwardModelWrapper(self.solver, self.problem, self.solver_params, t_start=t_start)
 
     def _setup_cost_function(self, forward_model, obs_operator, B, R, obs_times):
         """Setup the DA cost function."""
@@ -1373,6 +1381,215 @@ class TwinExperiment:
             self.m_background.destroy()
         if self.m_analysis:
             self.m_analysis.destroy()
+
+    def _run_cycling(self, start_time: float) -> TwinExperimentResults:
+        """Run cycling 4D-Var with multiple assimilation windows.
+
+        Splits the total simulation into n_windows shorter windows.
+        The analysis from each window is propagated forward to provide
+        the background for the next window.
+        """
+        n_windows = self.config.n_windows
+        total_nt = self.problem.nt
+        window_nt = total_nt // n_windows
+
+        if total_nt % n_windows != 0:
+            raise ValueError(
+                f"total_nt ({total_nt}) must be divisible by n_windows ({n_windows})"
+            )
+
+        self.log(f"\n  Cycling 4D-Var: {n_windows} windows x {window_nt} timesteps "
+                 f"({window_nt * self.problem.dt / 3600:.1f}h each)")
+
+        # Step 1: Generate truth trajectory for FULL simulation
+        self.log("\nStep 1: Generating truth trajectory (full)...")
+        self._generate_truth()
+
+        # Step 1b: Apply physics perturbations
+        if self.config.perturb_bathymetry or self.config.perturb_friction:
+            self.log("\nStep 1b: Applying physics perturbations...")
+            self._apply_physics_perturbations()
+
+        # Step 2: Setup observations for FULL trajectory
+        self.log("\nStep 2: Setting up observations (full)...")
+        obs_points, obs_operator, global_obs_times = self._setup_observations()
+
+        # Step 3: Generate synthetic observations for FULL trajectory
+        self.log("\nStep 3: Generating synthetic observations (full)...")
+        self.observations, obs_noise_stds = self._generate_observations(
+            obs_operator, global_obs_times
+        )
+
+        # Step 4: Setup initial background state (perturbed IC at t=0)
+        self.log("\nStep 4: Setting up background state...")
+        background_error = self._setup_background()
+
+        # Step 5: Setup covariance matrices
+        self.log("\nStep 5: Setting up covariance matrices...")
+        B, R = self._setup_covariances(obs_operator, obs_noise_stds)
+
+        # Cycling loop
+        all_cost_history = []
+        all_gradient_history = []
+        total_iterations = 0
+        window_0_analysis_error = None
+        last_converged = False
+
+        for w in range(n_windows):
+            t_start_window = w * window_nt * self.problem.dt
+            self.log(f"\n{'='*60}")
+            self.log(f"  Window {w+1}/{n_windows}: t = {t_start_window/3600:.1f}h - "
+                     f"{(w+1) * window_nt * self.problem.dt / 3600:.1f}h")
+            self.log(f"{'='*60}")
+
+            # a) Temporarily set problem.nt to window length
+            self.problem.nt = window_nt
+
+            # b) Subset observations for this window
+            # Global obs times in range (w*window_nt, (w+1)*window_nt]
+            window_obs_indices = []
+            window_local_times = []
+            for i, gt in enumerate(global_obs_times):
+                if w * window_nt < gt <= (w + 1) * window_nt:
+                    window_obs_indices.append(i)
+                    window_local_times.append(gt - w * window_nt)
+
+            window_observations = [self.observations[i] for i in window_obs_indices]
+            self.log(f"  Window obs: {len(window_local_times)} observations at local times {window_local_times}")
+
+            if len(window_observations) == 0:
+                self.log(f"  WARNING: No observations in this window, skipping optimization")
+                # Propagate background forward to next window
+                if w < n_windows - 1:
+                    self.m_background = self._propagate_forward(
+                        self.m_background, window_nt, t_start_window
+                    )
+                continue
+
+            # c) Create forward model for this window
+            forward_model = self._create_forward_model(t_start=t_start_window)
+
+            # d) Setup cost function with window-specific observations
+            # Temporarily swap observations for cost function setup
+            orig_observations = self.observations
+            self.observations = window_observations
+            cost_function = self._setup_cost_function(
+                forward_model, obs_operator, B, R, window_local_times
+            )
+            self.observations = orig_observations
+
+            # e) Run optimization
+            self.log(f"  Running optimization for window {w+1}...")
+            optimizer, opt_time = self._run_optimization(cost_function)
+
+            # Accumulate history
+            window_cost = [h["cost"] for h in optimizer.convergence_history]
+            window_grad = [h["grad_norm"] for h in optimizer.convergence_history]
+            all_cost_history.extend(window_cost)
+            all_gradient_history.extend(window_grad)
+            total_iterations += optimizer.iteration
+            last_converged = optimizer.converged
+
+            self.log(f"  Window {w+1} result: {optimizer.iteration} iterations, "
+                     f"converged={optimizer.converged}")
+
+            # Compute window 0 analysis error (for comparison with single-window)
+            if w == 0:
+                diff = self.m_analysis.copy()
+                diff.axpy(-1.0, self.m_true)
+                window_0_analysis_error = np.sqrt(diff.dot(diff) / diff.getSize())
+                diff.destroy()
+                self.log(f"  Window 0 analysis error: {window_0_analysis_error:.6f}")
+
+            # f) Propagate analysis forward to get background for next window
+            if w < n_windows - 1:
+                self.log(f"  Propagating analysis forward to next window...")
+                next_background = self._propagate_forward(
+                    self.m_analysis, window_nt, t_start_window
+                )
+                self.m_background = next_background
+
+        # Restore problem.nt
+        self.problem.nt = total_nt
+
+        # Results: use window 0 analysis error as the primary metric
+        total_time = time.time() - start_time
+        analysis_error = window_0_analysis_error if window_0_analysis_error is not None else background_error
+        error_reduction = (background_error - analysis_error) / background_error * 100
+
+        self.log(f"\n  Cycling complete: {total_iterations} total iterations across {n_windows} windows")
+        self.log(f"  Background error: {background_error:.6f}")
+        self.log(f"  Analysis error (window 0): {analysis_error:.6f}")
+        self.log(f"  Error reduction: {error_reduction:.1f}%")
+
+        results = TwinExperimentResults(
+            method=self.config.method,
+            problem_name=self.problem_name,
+            cost_history=all_cost_history,
+            gradient_norm_history=all_gradient_history,
+            background_error=background_error,
+            analysis_error=analysis_error,
+            error_reduction=error_reduction,
+            mean_rmse=0.0,
+            data_misfit=0.0,
+            innovation_mean=0.0,
+            innovation_std=0.0,
+            num_iterations=total_iterations,
+            converged=last_converged,
+            wall_time=total_time,
+            config=self.config.to_dict(),
+            problem_config=self._get_problem_config(),
+        )
+
+        self._save_results(results)
+        self._print_summary(results)
+        self._cleanup()
+
+        return results
+
+    def _propagate_forward(
+        self, m: PETSc.Vec, nt: int, t_start: float
+    ) -> PETSc.Vec:
+        """Run the forward model from state m for nt timesteps starting at t_start.
+
+        Returns the final state as a PETSc Vec.
+        """
+        self.solver.storage.clear()
+
+        # Set initial condition
+        m_array = m.getArray()
+        u_owned_size = self.solver.V.dofmap.index_map.size_local
+        if len(m_array) == len(self.solver.u_n.x.array):
+            self.solver.u_n.x.array[:] = m_array
+            self.solver.u_n_old.x.array[:] = m_array
+            self.solver.u.x.array[:] = m_array
+        else:
+            self.solver.u_n.x.array[:u_owned_size] = m_array
+            self.solver.u_n_old.x.array[:u_owned_size] = m_array
+            self.solver.u.x.array[:u_owned_size] = m_array
+            self.solver.u_n.x.scatter_forward()
+            self.solver.u_n_old.x.scatter_forward()
+            self.solver.u.x.scatter_forward()
+
+        # Set time and nt for propagation
+        orig_nt = self.problem.nt
+        self.problem.nt = nt
+        self.problem.t = t_start
+
+        self.solver.time_loop(
+            solver_parameters=self.solver_params,
+            stations=np.array([[0.0, 0.0, 0.0]]),
+            plot_every=9999,
+            save_state=True,
+            enable_video=False,
+        )
+
+        # Get final state
+        final_state = self.solver.storage.saved_states[-1]
+        final_vec = PETSc.Vec().createWithArray(final_state.copy(), comm=self.comm)
+
+        self.problem.nt = orig_nt
+        return final_vec
 
 
 class MassMatrixPreconditionedCost:

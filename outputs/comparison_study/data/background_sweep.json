@@ -1,0 +1,655 @@
+{
+  "4dvar_background_0.05": {
+    "experiment_id": "4dvar_background_0.05",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "background",
+    "sweep_value": 0.05,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1022.4806042000831,
+        1022.4801834237006,
+        1022.4796819303442
+      ],
+      "gradient_norm_history": [
+        2.1611720322040913e-05,
+        1.2515498576133361e-05,
+        6.752982010711017e-06
+      ],
+      "background_error": 0.2896477341143445,
+      "analysis_error": 0.28964785718364633,
+      "error_reduction": -4.248930245609047e-05,
+      "mean_rmse": 9.994559346376017,
+      "data_misfit": 101900.20283887534,
+      "innovation_mean": -9.99455934076176,
+      "innovation_std": 0.10460989412116463,
+      "num_iterations": 2,
+      "converged": true,
+      "wall_time": 29.36684513092041,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.05,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1022.4806042000831,
+        1022.4801834237006,
+        1022.4796819303442
+      ],
+      "gradient_norm_history": [
+        2.1611720322040913e-05,
+        1.2515498576133361e-05,
+        6.752982010711017e-06
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 34.81164789199829
+  },
+  "dcwme_background_0.05": {
+    "experiment_id": "dcwme_background_0.05",
+    "status": "success",
+    "method": "dcwme",
+    "sweep_parameter": "background",
+    "sweep_value": 0.05,
+    "result": {
+      "method": "dcwme",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        53.25549562162565,
+        53.2552133948468,
+        53.25484294003839,
+        53.254805270137396,
+        53.25480477000181
+      ],
+      "gradient_norm_history": [
+        1.6856469144876755e-05,
+        1.0383420127740528e-05,
+        4.778957875293416e-06,
+        1.191064724172889e-06,
+        3.0611981240696674e-08
+      ],
+      "background_error": 0.2896477341143445,
+      "analysis_error": 0.28964758367265486,
+      "error_reduction": 5.193953618224913e-05,
+      "mean_rmse": 9.994559255509024,
+      "data_misfit": 101900.20097872871,
+      "innovation_mean": -9.994559249891857,
+      "innovation_std": 0.10460985940224751,
+      "num_iterations": 4,
+      "converged": true,
+      "wall_time": 44.37983322143555,
+      "config": {
+        "method": "dcwme",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.05,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        53.25549562162565,
+        53.2552133948468,
+        53.25484294003839,
+        53.254805270137396,
+        53.25480477000181
+      ],
+      "gradient_norm_history": [
+        1.6856469144876755e-05,
+        1.0383420127740528e-05,
+        4.778957875293416e-06,
+        1.191064724172889e-06,
+        3.0611981240696674e-08
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 49.796003103256226
+  },
+  "4dvar_background_0.1": {
+    "experiment_id": "4dvar_background_0.1",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "background",
+    "sweep_value": 0.1,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1022.4749642924687,
+        1022.4744791316979,
+        1022.4712801127279
+      ],
+      "gradient_norm_history": [
+        2.1709800486071517e-05,
+        1.8955426705194935e-05,
+        6.821039439635687e-06
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792959960844987,
+      "error_reduction": -9.112030707244867e-05,
+      "mean_rmse": 9.994565764329002,
+      "data_misfit": 101900.33471297659,
+      "innovation_mean": -9.99456575892852,
+      "innovation_std": 0.10461464880410622,
+      "num_iterations": 2,
+      "converged": true,
+      "wall_time": 28.96039390563965,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1022.4749642924687,
+        1022.4744791316979,
+        1022.4712801127279
+      ],
+      "gradient_norm_history": [
+        2.1709800486071517e-05,
+        1.8955426705194935e-05,
+        6.821039439635687e-06
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 34.38840579986572
+  },
+  "dcwme_background_0.1": {
+    "experiment_id": "dcwme_background_0.1",
+    "status": "success",
+    "method": "dcwme",
+    "sweep_parameter": "background",
+    "sweep_value": 0.1,
+    "result": {
+      "method": "dcwme",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        53.261867797592245,
+        53.26154683385024,
+        53.259252648139984,
+        53.259097723624826
+      ],
+      "gradient_norm_history": [
+        1.6875388327998847e-05,
+        1.4944978025175232e-05,
+        4.808566107695763e-06,
+        2.5671313648271494e-07
+      ],
+      "background_error": 0.5792954682286892,
+      "analysis_error": 0.5792949294937051,
+      "error_reduction": 9.29983080508584e-05,
+      "mean_rmse": 9.994565403184007,
+      "data_misfit": 101900.3273182815,
+      "innovation_mean": -9.994565397772488,
+      "innovation_std": 0.10461450300306464,
+      "num_iterations": 3,
+      "converged": true,
+      "wall_time": 36.644394874572754,
+      "config": {
+        "method": "dcwme",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.1,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        53.261867797592245,
+        53.26154683385024,
+        53.259252648139984,
+        53.259097723624826
+      ],
+      "gradient_norm_history": [
+        1.6875388327998847e-05,
+        1.4944978025175232e-05,
+        4.808566107695763e-06,
+        2.5671313648271494e-07
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 42.3296320438385
+  },
+  "4dvar_background_0.2": {
+    "experiment_id": "4dvar_background_0.2",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "background",
+    "sweep_value": 0.2,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1e+20
+      ],
+      "gradient_norm_history": [
+        0.0
+      ],
+      "background_error": 1.1585909364573783,
+      "analysis_error": 1.1585909364573783,
+      "error_reduction": 0.0,
+      "mean_rmse": 0.0,
+      "data_misfit": 0.0,
+      "innovation_mean": 0.0,
+      "innovation_std": 0.0,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 7.202650785446167,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.2,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1e+20
+      ],
+      "gradient_norm_history": [
+        0.0
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 7.2316060066223145
+  },
+  "dcwme_background_0.2": {
+    "experiment_id": "dcwme_background_0.2",
+    "status": "failed",
+    "method": "dcwme",
+    "sweep_parameter": "background",
+    "sweep_value": 0.2,
+    "result": null,
+    "diagnostics": {
+      "cost_history": [],
+      "gradient_norm_history": [],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": 0,
+      "failure_traceback": "Traceback (most recent call last):\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/comparison_study/runner.py\", line 202, in _run_single_experiment\n    result = experiment.run()\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/twin_experiment.py\", line 372, in run\n    cost_function = self._setup_cost_function(\n        forward_model, obs_operator, B, R, obs_times\n    )\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/twin_experiment.py\", line 1098, in _setup_cost_function\n    cost_function = DCWMEFourDVarCost(\n        forward_model=forward_model,\n    ...<7 lines>...\n        comm=self.comm,\n    )\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/cost_functions.py\", line 1155, in __init__\n    self._wme_cache[\"Q_wme_mb\"] = self._compute_wme(self.m_b)\n                                  ~~~~~~~~~~~~~~~~~^^^^^^^^^^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/cost_functions.py\", line 1287, in _compute_wme\n    return self.qoi_map.evaluate(\n           ~~~~~~~~~~~~~~~~~~~~~^\n        m, k_final, store_jacobians=store_jacobians, obs_times_only=obs_times_only\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/qoi_maps.py\", line 374, in evaluate\n    trajectory, _ = self._get_trajectory(\n                    ~~~~~~~~~~~~~~~~~~~~^\n        m,\n        ^^\n    ...<2 lines>...\n        obs_times=self.obs_times if obs_times_only else None,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/qoi_maps.py\", line 162, in _get_trajectory\n    trajectory, jacobians = self.forward_model.solve(m, store_jacobians)\n                            ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/twin_experiment.py\", line 230, in solve\n    self.solver.time_loop(\n    ~~~~~~~~~~~~~~~~~~~~~^\n        solver_parameters=self.solver_params,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<4 lines>...\n        enable_video=False,\n        ^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/forward/solvers/cg_implicit.py\", line 663, in time_loop\n    J = self.solve_timestep(\n        solver,\n    ...<2 lines>...\n        time=(a + 1) * self.problem.dt,\n    )\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/forward/solvers/cg_implicit.py\", line 277, in solve_timestep\n    _, J = solver.solve(\n           ~~~~~~~~~~~~^\n        self.u, return_jacobian=True, timestep=timestep, time=time\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/forward/newton.py\", line 214, in solve\n    solver.solve(L, dx.x.petsc_vec)\n    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^\n  File \"petsc4py/PETSc/KSP.pyx\", line 1782, in petsc4py.PETSc.KSP.solve\npetsc4py.PETSc.Error: error code 91\n[0] KSPSolve() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:1094\n[0] KSPSolve_Private() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:917\n[0] KSPSolve_GMRES() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:228\n[0] KSPGMRESCycle() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:111\n[0] KSPSolve has not converged due to Nan or Inf norm\n",
+      "has_last_valid_state": false
+    },
+    "error": "error code 91\n[0] KSPSolve() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:1094\n[0] KSPSolve_Private() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:917\n[0] KSPSolve_GMRES() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:228\n[0] KSPGMRESCycle() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:111\n[0] KSPSolve has not converged due to Nan or Inf norm",
+    "failure_type": "immediate_failure",
+    "wall_time": 7.16181492805481
+  },
+  "4dvar_background_0.5": {
+    "experiment_id": "4dvar_background_0.5",
+    "status": "success",
+    "method": "4dvar",
+    "sweep_parameter": "background",
+    "sweep_value": 0.5,
+    "result": {
+      "method": "4dvar",
+      "problem_name": "TidalProblem",
+      "cost_history": [
+        1e+20
+      ],
+      "gradient_norm_history": [
+        0.0
+      ],
+      "background_error": 2.8153003345159218,
+      "analysis_error": 2.8153003345159218,
+      "error_reduction": 0.0,
+      "mean_rmse": 0.0,
+      "data_misfit": 0.0,
+      "innovation_mean": 0.0,
+      "innovation_std": 0.0,
+      "num_iterations": 0,
+      "converged": true,
+      "wall_time": 5.787240028381348,
+      "config": {
+        "method": "4dvar",
+        "obs_fraction": 0.5,
+        "obs_frequency": 4,
+        "obs_noise_level": 0.01,
+        "obs_points_file": null,
+        "interior_only": true,
+        "background_error_std": 0.5,
+        "max_iterations": 50,
+        "gradient_tolerance": 1e-06,
+        "cost_tolerance": 1e-08,
+        "use_bounds": true,
+        "h_min": 0.01,
+        "component_aware_cov": false,
+        "perturb_bathymetry": false,
+        "bathymetry_noise_std": 0.5,
+        "bathymetry_noise_type": "additive",
+        "bathymetry_correlation_length": 500.0,
+        "perturb_friction": true,
+        "friction_scale_factor": 1.1,
+        "perturbation_seed": 456,
+        "output_dir": "outputs/data",
+        "save_trajectories": false,
+        "verbose": false,
+        "obs_seed": 42,
+        "background_seed": 123
+      },
+      "problem_config": {
+        "problem_type": "TidalProblem",
+        "dt": 1800.0,
+        "nt": 96,
+        "nx": 20,
+        "ny": 10,
+        "inverse_crime_avoidance": {
+          "perturb_bathymetry": false,
+          "perturb_friction": true,
+          "friction_scale_factor": 1.1
+        }
+      }
+    },
+    "diagnostics": {
+      "cost_history": [
+        1e+20
+      ],
+      "gradient_norm_history": [
+        0.0
+      ],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": null,
+      "failure_traceback": null,
+      "has_last_valid_state": false
+    },
+    "error": null,
+    "failure_type": null,
+    "wall_time": 5.816573858261108
+  },
+  "dcwme_background_0.5": {
+    "experiment_id": "dcwme_background_0.5",
+    "status": "failed",
+    "method": "dcwme",
+    "sweep_parameter": "background",
+    "sweep_value": 0.5,
+    "result": null,
+    "diagnostics": {
+      "cost_history": [],
+      "gradient_norm_history": [],
+      "step_size_history": [],
+      "background_term": null,
+      "observation_term": null,
+      "min_depth_per_timestep": [],
+      "max_velocity_per_timestep": [],
+      "forward_solver_iterations": [],
+      "estimated_condition_number": null,
+      "max_cfl_number": null,
+      "failure_iteration": 0,
+      "failure_traceback": "Traceback (most recent call last):\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/comparison_study/runner.py\", line 202, in _run_single_experiment\n    result = experiment.run()\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/twin_experiment.py\", line 372, in run\n    cost_function = self._setup_cost_function(\n        forward_model, obs_operator, B, R, obs_times\n    )\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/twin_experiment.py\", line 1098, in _setup_cost_function\n    cost_function = DCWMEFourDVarCost(\n        forward_model=forward_model,\n    ...<7 lines>...\n        comm=self.comm,\n    )\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/cost_functions.py\", line 1155, in __init__\n    self._wme_cache[\"Q_wme_mb\"] = self._compute_wme(self.m_b)\n                                  ~~~~~~~~~~~~~~~~~^^^^^^^^^^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/cost_functions.py\", line 1287, in _compute_wme\n    return self.qoi_map.evaluate(\n           ~~~~~~~~~~~~~~~~~~~~~^\n        m, k_final, store_jacobians=store_jacobians, obs_times_only=obs_times_only\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/qoi_maps.py\", line 374, in evaluate\n    trajectory, _ = self._get_trajectory(\n                    ~~~~~~~~~~~~~~~~~~~~^\n        m,\n        ^^\n    ...<2 lines>...\n        obs_times=self.obs_times if obs_times_only else None,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/data_assimilation/qoi_maps.py\", line 162, in _get_trajectory\n    trajectory, jacobians = self.forward_model.solve(m, store_jacobians)\n                            ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/experiments/twin_experiment.py\", line 230, in solve\n    self.solver.time_loop(\n    ~~~~~~~~~~~~~~~~~~~~~^\n        solver_parameters=self.solver_params,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<4 lines>...\n        enable_video=False,\n        ^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/forward/solvers/cg_implicit.py\", line 629, in time_loop\n    J = self.solve_timestep(\n        solver,\n    ...<2 lines>...\n        time=(a + 1) * self.problem.dt,\n    )\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/forward/solvers/cg_implicit.py\", line 277, in solve_timestep\n    _, J = solver.solve(\n           ~~~~~~~~~~~~^\n        self.u, return_jacobian=True, timestep=timestep, time=time\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/rylanspence/Desktop/Git/DC/Thesis/SWEMniCS/src/swe4dvar/forward/newton.py\", line 214, in solve\n    solver.solve(L, dx.x.petsc_vec)\n    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^\n  File \"petsc4py/PETSc/KSP.pyx\", line 1782, in petsc4py.PETSc.KSP.solve\npetsc4py.PETSc.Error: error code 91\n[0] KSPSolve() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:1094\n[0] KSPSolve_Private() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:917\n[0] KSPSolve_GMRES() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:228\n[0] KSPGMRESCycle() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:111\n[0] KSPSolve has not converged due to Nan or Inf norm\n",
+      "has_last_valid_state": false
+    },
+    "error": "error code 91\n[0] KSPSolve() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:1094\n[0] KSPSolve_Private() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/interface/itfunc.c:917\n[0] KSPSolve_GMRES() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:228\n[0] KSPGMRESCycle() at /Users/runner/miniforge3/conda-bld/bld/rattler-build_petsc_1741089177/work/src/ksp/ksp/impls/gmres/gmres.c:111\n[0] KSPSolve has not converged due to Nan or Inf norm",
+    "failure_type": "immediate_failure",
+    "wall_time": 5.8369526863098145
+  },
+  "_metadata": {
+    "base_config": {
+      "nx": 20,
+      "ny": 10,
+      "dt": 1800.0,
+      "final_time": 172800.0,
+      "nt": 96,
+      "solver_type": "DG",
+      "p_degree": [
+        1,
+        1
+      ],
+      "obs_frequency": 4,
+      "obs_fraction": 0.5,
+      "obs_noise_level": 0.01,
+      "background_error_std": 0.1,
+      "friction_scale_factor": 1.1,
+      "bathymetry_noise_std": 0.0,
+      "max_iterations": 50,
+      "gradient_tolerance": 1e-06,
+      "obs_seed": 42,
+      "background_seed": 123,
+      "perturbation_seed": 456,
+      "output_dir": "outputs/comparison_study",
+      "diagnostic_level": "standard"
+    },
+    "sweep_name": "background",
+    "timestamp": "2026-02-09 19:24:17"
+  }
+}
