@@ -6,14 +6,17 @@ required for adjoint of implicit BDF2 discretization.
 
 Mathematical Background
 -----------------------
-For implicit BDF2 discretization:
-    R(u^{n+1}; u^n, u^{n-1}) = (3u^{n+1} - 4u^n + u^{n-1})/(2Δt) + F(u^{n+1}) = 0
+For theta-blended BDF2/BE discretization:
+    dQdt = θ·(1/Δt)·(1.5Q - 2Qn + 0.5Qn_old) + (1-θ)·(1/Δt)·(Q - Qn)
 
-The Jacobian from Newton's method is:
-    J_n = ∂R/∂u^{n+1} = (3/(2Δt))·M + ∂F/∂u|_{u^{n+1}}
+The time derivative coefficients are:
+    α₀ = (0.5θ + 1)/Δt,  α₁ = -(θ + 1)/Δt,  α₂ = 0.5θ/Δt
+
+The Jacobian from Newton's method includes α₀:
+    J_n = ∂R/∂u^{n+1} = α₀·M + ∂F/∂u|_{u^{n+1}}
 
 The adjoint equation becomes:
-    J_n^T·λ^n = (4/(2Δt))·M·λ^{n+1} - (1/(2Δt))·M·λ^{n+2} + forcing
+    J_n^T·λ^n = (θ+1)/Δt·M·λ^{n+1} - 0.5θ/Δt·M·λ^{n+2} + forcing
 
 Key insight: Jacobian J is already computed and stored from
 forward Newton solve, so we just need to transpose it.
@@ -112,6 +115,7 @@ class ImplicitAdjointSolver:
         ux_dof_indices: Optional[set] = None,  # NEW: Indices of ux DOFs (for full (∂Q/∂u)^T)
         uy_dof_indices: Optional[set] = None,  # NEW: Indices of uy DOFs (for full (∂Q/∂u)^T)
         bc_dof_indices: Optional[set] = None,  # NEW: Indices of Dirichlet BC DOFs
+        theta: Optional[float] = None,  # NEW: Theta blending parameter for BDF2/BE
     ):
         """
         Initialize implicit adjoint solver.
@@ -165,6 +169,11 @@ class ImplicitAdjointSolver:
             time-coupling term is zeroed for these DOFs since the forward Jacobian
             has identity rows there and the dynamics don't propagate through BCs.
             Can be obtained from the problem's boundary condition setup.
+        theta : float, optional
+            Theta blending parameter for the BDF2/BE time stepping scheme.
+            The forward solver uses: dQdt = theta*(BDF2) + (1-theta)*(BE).
+            theta=1.0 gives pure BDF2, theta=0.5 gives blended scheme.
+            If None, auto-detected from forward_model.solver.theta.
 
         Raises
         ------
@@ -213,6 +222,18 @@ class ImplicitAdjointSolver:
 
         self.use_bdf2 = use_bdf2
         self.bdf2_start_step = bdf2_start_step
+
+        # Theta blending parameter for BDF2/BE time stepping
+        # theta=1.0 → pure BDF2, theta=0.5 → blended BDF2/BE (common default)
+        # Auto-detect from forward model if not provided
+        if theta is None:
+            if hasattr(forward_model, 'solver') and hasattr(forward_model.solver, 'theta'):
+                theta = forward_model.solver.theta
+            elif hasattr(forward_model, 'theta'):
+                theta = forward_model.theta
+            else:
+                theta = 1.0  # Default to pure BDF2 (backward compatible)
+        self.theta = theta
 
         # Flux formulation handling
         self.flux_formulation = flux_formulation
@@ -276,6 +297,153 @@ class ImplicitAdjointSolver:
         # Mass matrix for BDF2 time coupling (cached)
         self._mass_matrix = None
 
+        # UFL-based flux mass matrix action (replaces pointwise approximation)
+        self._flux_mass_form = None
+        self._flux_state_func = None
+        self._flux_lambda_func = None
+        if flux_formulation:
+            self._init_flux_mass_form()
+
+    def _init_flux_mass_form(self):
+        """
+        Initialize UFL form for computing M_Q^T * lambda using proper FE integration.
+
+        The flux mass matrix M_Q arises from the conservative time derivative:
+            R_time = integral (dQ/dt) . v dx
+
+        where Q = [h, h*ux, h*uy] and the state variables are [h, ux, uy].
+        The cross-time derivative dR^{n+1}/du^n = -(c) * M_Q|_{u^n}.
+
+        The transpose action M_Q^T * lambda is:
+            (M_Q^T * lambda)_h  = integral (lambda_h + ux_s * lambda_ux + uy_s * lambda_uy) * v_h dx
+            (M_Q^T * lambda)_ux = integral (h_s * lambda_ux) * v_ux dx
+            (M_Q^T * lambda)_uy = integral (h_s * lambda_uy) * v_uy dx
+
+        This proper integration eliminates the pointwise DOF approximation error
+        that compounds exponentially over time steps.
+        """
+        import os
+        os.environ.setdefault("CC", "/usr/bin/clang")
+
+        V = None
+        if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model.solver, 'V'):
+            V = self.forward_model.solver.V
+        elif hasattr(self.forward_model, 'V'):
+            V = self.forward_model.V
+
+        if V is None:
+            import warnings
+            warnings.warn(
+                "Cannot initialize UFL flux mass form: function space V not found. "
+                "Falling back to pointwise flux scaling.",
+                RuntimeWarning,
+            )
+            self.flux_formulation = False
+            return
+
+        try:
+            from dolfinx import fem
+            from ufl import TestFunction, split, inner, dx
+
+            self._flux_state_func = fem.Function(V)
+            self._flux_lambda_func = fem.Function(V)
+
+            v = TestFunction(V)
+            h_v = split(v)[0]
+            vel_v = split(v)[1]
+            ux_v, uy_v = vel_v[0], vel_v[1]
+
+            h_s = split(self._flux_state_func)[0]
+            vel_s = split(self._flux_state_func)[1]
+            ux_s, uy_s = vel_s[0], vel_s[1]
+
+            h_l = split(self._flux_lambda_func)[0]
+            vel_l = split(self._flux_lambda_func)[1]
+            ux_l, uy_l = vel_l[0], vel_l[1]
+
+            # M_Q^T * lambda as a linear form in v:
+            # (dQ/du)^T = [[1, ux, uy], [0, h, 0], [0, 0, h]]
+            L = (inner(h_l + ux_s * ux_l + uy_s * uy_l, h_v) * dx
+                 + inner(h_s * ux_l, ux_v) * dx
+                 + inner(h_s * uy_l, uy_v) * dx)
+
+            self._flux_mass_form = fem.form(L)
+        except Exception as e:
+            import warnings
+            warnings.warn(
+                f"Failed to initialize UFL flux mass form: {e}. "
+                "Falling back to pointwise flux scaling.",
+                RuntimeWarning,
+            )
+            self._flux_mass_form = None
+
+    def _compute_flux_mass_transpose_action(
+        self, state: PETSc.Vec, lambda_vec: PETSc.Vec
+    ) -> PETSc.Vec:
+        """
+        Compute M_Q^T * lambda using proper FE integration.
+
+        Parameters
+        ----------
+        state : PETSc.Vec
+            State vector at time n (provides h, ux, uy for flux scaling).
+        lambda_vec : PETSc.Vec
+            Adjoint vector to apply M_Q^T to.
+
+        Returns
+        -------
+        PETSc.Vec
+            Result of M_Q^T * lambda_vec.
+        """
+        if self._flux_mass_form is None:
+            # Fallback to old pointwise method
+            M = self._get_mass_matrix()
+            result = lambda_vec.duplicate()
+            M.mult(lambda_vec, result)
+            result = self._apply_flux_scaling(result, state)
+            return result
+
+        from dolfinx import fem
+        from dolfinx import la
+
+        V = self._flux_state_func.function_space
+
+        # Update state and lambda function values
+        u_owned = V.dofmap.index_map.size_local
+        state_arr = state.getArray()
+        lambda_arr = lambda_vec.getArray()
+
+        if len(state_arr) >= u_owned:
+            self._flux_state_func.x.array[:u_owned] = state_arr[:u_owned]
+        else:
+            self._flux_state_func.x.array[:len(state_arr)] = state_arr
+        self._flux_state_func.x.scatter_forward()
+
+        if len(lambda_arr) >= u_owned:
+            self._flux_lambda_func.x.array[:u_owned] = lambda_arr[:u_owned]
+        else:
+            self._flux_lambda_func.x.array[:len(lambda_arr)] = lambda_arr
+        self._flux_lambda_func.x.scatter_forward()
+
+        # Assemble linear form
+        result_petsc = fem.petsc.assemble_vector(self._flux_mass_form)
+        result_petsc.ghostUpdate(
+            addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE
+        )
+        result_petsc.ghostUpdate(
+            addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD
+        )
+
+        # Convert to owned-only PETSc Vec matching the adjoint vectors
+        result = la.create_petsc_vector(
+            V.dofmap.index_map, V.dofmap.index_map_bs
+        )
+        result.setArray(result_petsc.getArray()[:u_owned])
+        result.assemble()
+
+        result_petsc.destroy()
+        return result
+
     def _uses_bdf2_at_step(self, n: int) -> bool:
         """
         Determine if timestep n uses BDF2 or backward Euler.
@@ -322,11 +490,13 @@ class ImplicitAdjointSolver:
         # These depend on the time scheme used for R^{n+1} and R^{n+2}
 
         # Coefficient from R^{n+1} (sensitivity to u^n)
+        # The forward solver uses theta-blended time stepping:
+        #   dQdt = theta*(1/dt)*(1.5Q - 2Qn + 0.5Qn_old) + (1-theta)*(1/dt)*(Q - Qn)
+        # Coefficient of Qn: (-theta - 1)/dt
+        # So ∂R^{n+1}/∂u^n = (-theta-1)/dt * M_Q
+        # In adjoint: contributes (theta+1)/dt * M_Q * λ_{n+1} (sign flip)
         if self._uses_bdf2_at_step(n + 1):
-            # BDF2: R^{n+1} = (3u^{n+1} - 4u^n + u^{n-1})/(2dt) + F
-            # ∂R^{n+1}/∂u^n = -4/(2dt) * M = -2/dt * M
-            # In adjoint: contributes +2/dt * M * λ_{n+1} (sign flip)
-            c_next = 4.0 / (2.0 * dt)
+            c_next = (self.theta + 1.0) / dt
         else:
             # Backward Euler: R^{n+1} = (u^{n+1} - u^n)/dt + F
             # ∂R^{n+1}/∂u^n = -1/dt * M
@@ -334,11 +504,11 @@ class ImplicitAdjointSolver:
             c_next = 1.0 / dt
 
         # Coefficient from R^{n+2} (sensitivity to u^n, only for BDF2)
+        # Coefficient of Qn_old: 0.5*theta/dt
+        # So ∂R^{n+2}/∂u^n = 0.5*theta/dt * M_Q
+        # In adjoint: contributes -0.5*theta/dt * M_Q * λ_{n+2}
         if self._uses_bdf2_at_step(n + 2):
-            # BDF2: R^{n+2} = (3u^{n+2} - 4u^{n+1} + u^n)/(2dt) + F
-            # ∂R^{n+2}/∂u^n = +1/(2dt) * M
-            # In adjoint: contributes -1/(2dt) * M * λ_{n+2}
-            c_next_next = -1.0 / (2.0 * dt)
+            c_next_next = -0.5 * self.theta / dt
         else:
             # Backward Euler: R^{n+2} doesn't depend on u^n
             c_next_next = 0.0
@@ -712,38 +882,38 @@ class ImplicitAdjointSolver:
         """
         # Get time step size
         dt = self.dt if isinstance(self.dt, (float, int)) else self.dt[0]
-        M = self._get_mass_matrix()
 
         # Get initial state for flux scaling (∂R^1/∂u^0 is evaluated at u^0)
         state_0 = self.trajectory[0] if len(self.trajectory) > 0 else None
 
         # Coefficient for λ^1 from R^1
         # Step 1 is always backward Euler (1 < bdf2_start_step for any reasonable value)
-        # Backward Euler: R^1 = (u^1 - u^0)/dt + F(u^1) = 0
-        # ∂R^1/∂u^0 = -1/dt · (flux-scaled M)
+        # Backward Euler: R^1 = (Q^1 - Q^0)/dt + F(u^1) = 0
+        # ∂R^1/∂u^0 = -1/dt · M_Q|_{u^0}
         c_1 = -1.0 / dt
 
-        # Compute c_1·(flux-scaled M)·λ^1 = -(1/Δt)·(flux-scaled M)·λ^1
-        result = lambda_1.duplicate()
-        M.mult(lambda_1, result)
-
-        # Apply flux scaling if enabled
-        if self.flux_formulation and state_0 is not None:
-            result = self._apply_flux_scaling(result, state_0)
+        # Compute c_1·M_Q^T·λ^1 using proper FE integration
+        if self.flux_formulation and state_0 is not None and self._flux_mass_form is not None:
+            result = self._compute_flux_mass_transpose_action(state_0, lambda_1)
+        else:
+            M = self._get_mass_matrix()
+            result = lambda_1.duplicate()
+            M.mult(lambda_1, result)
 
         result.scale(c_1)
 
         # Coefficient for λ^2 from R^2 (only contributes if R^2 uses BDF2)
         if self.use_bdf2 and lambda_2 is not None and self._uses_bdf2_at_step(2):
-            # BDF2 at step 2: R^2 = (3u^2 - 4u^1 + u^0)/(2dt) + F(u^2) = 0
-            # ∂R^2/∂u^0 = +1/(2dt) · (flux-scaled M)
-            c_2 = 1.0 / (2.0 * dt)
-            temp = lambda_1.duplicate()
-            M.mult(lambda_2, temp)
-
-            # Apply flux scaling
-            if self.flux_formulation and state_0 is not None:
-                temp = self._apply_flux_scaling(temp, state_0)
+            # Theta-blended BDF2 at step 2:
+            # Coefficient of Qn_old (= Q^0): 0.5*theta/dt
+            # ∂R^2/∂u^0 = 0.5*theta/dt · M_Q|_{u^0}
+            c_2 = 0.5 * self.theta / dt
+            if self.flux_formulation and state_0 is not None and self._flux_mass_form is not None:
+                temp = self._compute_flux_mass_transpose_action(state_0, lambda_2)
+            else:
+                M = self._get_mass_matrix()
+                temp = lambda_1.duplicate()
+                M.mult(lambda_2, temp)
 
             result.axpy(c_2, temp)
             temp.destroy()
@@ -815,32 +985,31 @@ class ImplicitAdjointSolver:
         # This accounts for the backward Euler -> BDF2 transition in the forward solver
         c_next, c_next_next = self._get_adjoint_coeffs_for_step(n)
 
-        # Get mass matrix
-        M = self._get_mass_matrix()
-
         # Get state at time n for flux scaling (∂R^{n+1}/∂u^n is evaluated at u^n)
         state_n = self.trajectory[n] if n < len(self.trajectory) else None
 
-        # Time coupling: c_{n+1}·(flux-scaled M)·λ^{n+1}
-        # For flux formulation Q=[h, h*ux, h*uy], the sensitivity ∂Q/∂u
-        # has h scaling for momentum DOFs
-        forcing = lambda_next.duplicate()
-        M.mult(lambda_next, forcing)
-
-        # Apply flux scaling if enabled
-        if self.flux_formulation and state_n is not None:
-            forcing = self._apply_flux_scaling(forcing, state_n)
+        # Time coupling: c_{n+1}·M_Q^T·λ^{n+1}
+        # For flux formulation Q=[h, h*ux, h*uy], M_Q includes the state-dependent
+        # Jacobian ∂Q/∂u. Use proper FE integration for accuracy.
+        if self.flux_formulation and state_n is not None and self._flux_mass_form is not None:
+            # Proper UFL-based computation: M_Q^T * lambda
+            forcing = self._compute_flux_mass_transpose_action(state_n, lambda_next)
+        else:
+            # Standard mass matrix (no flux formulation or fallback)
+            M = self._get_mass_matrix()
+            forcing = lambda_next.duplicate()
+            M.mult(lambda_next, forcing)
 
         forcing.scale(c_next)
 
-        # Add c_{n+2}·M·λ^{n+2}
+        # Add c_{n+2}·M_Q^T·λ^{n+2}
         if lambda_next_next is not None and abs(c_next_next) > 1e-14:
-            temp = lambda_next.duplicate()
-            M.mult(lambda_next_next, temp)
-
-            # Apply flux scaling for the n+2 term as well (using state at n)
-            if self.flux_formulation and state_n is not None:
-                temp = self._apply_flux_scaling(temp, state_n)
+            if self.flux_formulation and state_n is not None and self._flux_mass_form is not None:
+                temp = self._compute_flux_mass_transpose_action(state_n, lambda_next_next)
+            else:
+                M = self._get_mass_matrix()
+                temp = lambda_next.duplicate()
+                M.mult(lambda_next_next, temp)
 
             forcing.axpy(c_next_next, temp)
             temp.destroy()

@@ -9,21 +9,25 @@
       "method": "4dvar",
       "problem_name": "TidalProblem",
       "cost_history": [
-        1022.4745871796177
+        1022.4745871796177,
+        1022.4740906651905,
+        1022.4708151206215
       ],
       "gradient_norm_history": [
-        3.9688219135406406e-13
+        2.1955004608894815e-05,
+        1.9171284182993808e-05,
+        6.89614462131608e-06
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.579296003895492,
+      "error_reduction": -9.24686679219634e-05,
+      "mean_rmse": 9.994565757864514,
+      "data_misfit": 101900.33458113087,
+      "innovation_mean": -9.994565752464062,
+      "innovation_std": 0.10461464860495716,
+      "num_iterations": 2,
       "converged": true,
-      "wall_time": 13.99691390991211,
+      "wall_time": 29.46615505218506,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -65,10 +69,14 @@
     },
     "diagnostics": {
       "cost_history": [
-        1022.4745871796177
+        1022.4745871796177,
+        1022.4740906651905,
+        1022.4708151206215
       ],
       "gradient_norm_history": [
-        3.9688219135406406e-13
+        2.1955004608894815e-05,
+        1.9171284182993808e-05,
+        6.89614462131608e-06
       ],
       "step_size_history": [],
       "background_term": null,
@@ -84,7 +92,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.587533950805664
+    "wall_time": 35.338757038116455
   },
   "dcwme_friction_1.0": {
     "experiment_id": "dcwme_friction_1.0",
@@ -96,21 +104,27 @@
       "method": "dcwme",
       "problem_name": "TidalProblem",
       "cost_history": [
-        53.261650196458135
+        53.261650196458135,
+        53.26131786792976,
+        53.25894145829279,
+        53.258782017742064
       ],
       "gradient_norm_history": [
-        1.0459873231715113e-13
+        1.7163905775331267e-05,
+        1.5202341955787137e-05,
+        4.881757795916945e-06,
+        2.6546120255302227e-07
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.5792949363342175,
+      "error_reduction": 9.181747499520294e-05,
+      "mean_rmse": 9.99456539562429,
+      "data_misfit": 101900.3271639558,
+      "innovation_mean": -9.994565390212735,
+      "innovation_std": 0.10461450211028508,
+      "num_iterations": 3,
       "converged": true,
-      "wall_time": 13.989519834518433,
+      "wall_time": 36.867993116378784,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -152,10 +166,16 @@
     },
     "diagnostics": {
       "cost_history": [
-        53.261650196458135
+        53.261650196458135,
+        53.26131786792976,
+        53.25894145829279,
+        53.258782017742064
       ],
       "gradient_norm_history": [
-        1.0459873231715113e-13
+        1.7163905775331267e-05,
+        1.5202341955787137e-05,
+        4.881757795916945e-06,
+        2.6546120255302227e-07
       ],
       "step_size_history": [],
       "background_term": null,
@@ -171,7 +191,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.53507113456726
+    "wall_time": 42.35822892189026
   },
   "4dvar_friction_1.1": {
     "experiment_id": "4dvar_friction_1.1",
@@ -183,21 +203,25 @@
       "method": "4dvar",
       "problem_name": "TidalProblem",
       "cost_history": [
-        1022.4749642924687
+        1022.4749642924687,
+        1022.4744791316979,
+        1022.4712801127279
       ],
       "gradient_norm_history": [
-        3.955062824571578e-13
+        2.1709800486071517e-05,
+        1.8955426705194935e-05,
+        6.821039439635687e-06
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.5792959960844987,
+      "error_reduction": -9.112030707244867e-05,
+      "mean_rmse": 9.994565764329002,
+      "data_misfit": 101900.33471297659,
+      "innovation_mean": -9.99456575892852,
+      "innovation_std": 0.10461464880410622,
+      "num_iterations": 2,
       "converged": true,
-      "wall_time": 14.125427961349487,
+      "wall_time": 29.754934072494507,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -240,10 +264,14 @@
     },
     "diagnostics": {
       "cost_history": [
-        1022.4749642924687
+        1022.4749642924687,
+        1022.4744791316979,
+        1022.4712801127279
       ],
       "gradient_norm_history": [
-        3.955062824571578e-13
+        2.1709800486071517e-05,
+        1.8955426705194935e-05,
+        6.821039439635687e-06
       ],
       "step_size_history": [],
       "background_term": null,
@@ -259,7 +287,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.627915143966675
+    "wall_time": 35.25161099433899
   },
   "dcwme_friction_1.1": {
     "experiment_id": "dcwme_friction_1.1",
@@ -271,21 +299,27 @@
       "method": "dcwme",
       "problem_name": "TidalProblem",
       "cost_history": [
-        53.261867797592245
+        53.261867797592245,
+        53.26154683385024,
+        53.259252648139984,
+        53.259097723624826
       ],
       "gradient_norm_history": [
-        1.042994087059299e-13
+        1.6875388327998847e-05,
+        1.4944978025175232e-05,
+        4.808566107695763e-06,
+        2.5671313648271494e-07
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.5792949294937051,
+      "error_reduction": 9.29983080508584e-05,
+      "mean_rmse": 9.994565403184007,
+      "data_misfit": 101900.3273182815,
+      "innovation_mean": -9.994565397772488,
+      "innovation_std": 0.10461450300306464,
+      "num_iterations": 3,
       "converged": true,
-      "wall_time": 13.852950096130371,
+      "wall_time": 37.19650602340698,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -328,10 +362,16 @@
     },
     "diagnostics": {
       "cost_history": [
-        53.261867797592245
+        53.261867797592245,
+        53.26154683385024,
+        53.259252648139984,
+        53.259097723624826
       ],
       "gradient_norm_history": [
-        1.042994087059299e-13
+        1.6875388327998847e-05,
+        1.4944978025175232e-05,
+        4.808566107695763e-06,
+        2.5671313648271494e-07
       ],
       "step_size_history": [],
       "background_term": null,
@@ -347,7 +387,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.355059146881104
+    "wall_time": 43.04086112976074
   },
   "4dvar_friction_1.15": {
     "experiment_id": "4dvar_friction_1.15",
@@ -359,21 +399,25 @@
       "method": "4dvar",
       "problem_name": "TidalProblem",
       "cost_history": [
-        1022.4751518202452
+        1022.4751518202452,
+        1022.47467206012,
+        1022.4715093966261
       ],
       "gradient_norm_history": [
-        3.9482225234173e-13
+        2.1591819928232467e-05,
+        1.8851635932448407e-05,
+        6.784730550777574e-06
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.5792959922948129,
+      "error_reduction": -9.046611832158706e-05,
+      "mean_rmse": 9.994565767366293,
+      "data_misfit": 101900.33477492328,
+      "innovation_mean": -9.994565761965795,
+      "innovation_std": 0.10461464889733126,
+      "num_iterations": 2,
       "converged": true,
-      "wall_time": 13.878304958343506,
+      "wall_time": 29.155452251434326,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -416,10 +460,14 @@
     },
     "diagnostics": {
       "cost_history": [
-        1022.4751518202452
+        1022.4751518202452,
+        1022.47467206012,
+        1022.4715093966261
       ],
       "gradient_norm_history": [
-        3.9482225234173e-13
+        2.1591819928232467e-05,
+        1.8851635932448407e-05,
+        6.784730550777574e-06
       ],
       "step_size_history": [],
       "background_term": null,
@@ -435,7 +483,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.483604907989502
+    "wall_time": 34.61549091339111
   },
   "dcwme_friction_1.15": {
     "experiment_id": "dcwme_friction_1.15",
@@ -447,21 +495,27 @@
       "method": "dcwme",
       "problem_name": "TidalProblem",
       "cost_history": [
-        53.26197560162328
+        53.26197560162328,
+        53.26166003345346,
+        53.25940492571683,
+        53.25925215268028
       ],
       "gradient_norm_history": [
-        1.0415053215454547e-13
+        1.6736633266160922e-05,
+        1.4821184860430021e-05,
+        4.773322543570615e-06,
+        2.5332856895190076e-07
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.5792949262228775,
+      "error_reduction": 9.356292969700388e-05,
+      "mean_rmse": 9.994565406893813,
+      "data_misfit": 101900.32739401315,
+      "innovation_mean": -9.994565401482312,
+      "innovation_std": 0.10461450343576667,
+      "num_iterations": 3,
       "converged": true,
-      "wall_time": 14.174706220626831,
+      "wall_time": 37.112009048461914,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -504,10 +558,16 @@
     },
     "diagnostics": {
       "cost_history": [
-        53.26197560162328
+        53.26197560162328,
+        53.26166003345346,
+        53.25940492571683,
+        53.25925215268028
       ],
       "gradient_norm_history": [
-        1.0415053215454547e-13
+        1.6736633266160922e-05,
+        1.4821184860430021e-05,
+        4.773322543570615e-06,
+        2.5332856895190076e-07
       ],
       "step_size_history": [],
       "background_term": null,
@@ -523,7 +583,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 20.05121088027954
+    "wall_time": 42.60368895530701
   },
   "4dvar_friction_1.2": {
     "experiment_id": "4dvar_friction_1.2",
@@ -535,21 +595,25 @@
       "method": "4dvar",
       "problem_name": "TidalProblem",
       "cost_history": [
-        1022.4753386726677
+        1022.4753386726677,
+        1022.4748641424313,
+        1022.4717366552692
       ],
       "gradient_norm_history": [
-        3.9414081882366597e-13
+        2.1476730171346965e-05,
+        1.8750431489875638e-05,
+        6.749211665620616e-06
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.5792959885789533,
+      "error_reduction": -8.982467370069896e-05,
+      "mean_rmse": 9.994565770281795,
+      "data_misfit": 101900.33483438593,
+      "innovation_mean": -9.994565764881283,
+      "innovation_std": 0.10461464898647112,
+      "num_iterations": 2,
       "converged": true,
-      "wall_time": 14.090466976165771,
+      "wall_time": 29.23624300956726,
       "config": {
         "method": "4dvar",
         "obs_fraction": 0.5,
@@ -592,10 +656,14 @@
     },
     "diagnostics": {
       "cost_history": [
-        1022.4753386726677
+        1022.4753386726677,
+        1022.4748641424313,
+        1022.4717366552692
       ],
       "gradient_norm_history": [
-        3.9414081882366597e-13
+        2.1476730171346965e-05,
+        1.8750431489875638e-05,
+        6.749211665620616e-06
       ],
       "step_size_history": [],
       "background_term": null,
@@ -611,7 +679,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.575584650039673
+    "wall_time": 34.681283712387085
   },
   "dcwme_friction_1.2": {
     "experiment_id": "dcwme_friction_1.2",
@@ -623,21 +691,27 @@
       "method": "dcwme",
       "problem_name": "TidalProblem",
       "cost_history": [
-        53.26208275007475
+        53.26208275007475,
+        53.26177239848231,
+        53.25955509709417,
+        53.259404408416145
       ],
       "gradient_norm_history": [
-        1.0400217584848163e-13
+        1.6601357502882355e-05,
+        1.4700482696585801e-05,
+        4.738936377727554e-06,
+        2.505345750411013e-07
       ],
       "background_error": 0.5792954682286892,
-      "analysis_error": 0.5792954682286892,
-      "error_reduction": 0.0,
-      "mean_rmse": 9.99456594635672,
-      "data_misfit": 101900.33841785775,
-      "innovation_mean": -9.99456594095366,
-      "innovation_std": 0.10461461875055504,
-      "num_iterations": 0,
+      "analysis_error": 0.5792949230476158,
+      "error_reduction": 9.411105442684718e-05,
+      "mean_rmse": 9.994565410555401,
+      "data_misfit": 101900.32746875979,
+      "innovation_mean": -9.994565405143916,
+      "innovation_std": 0.10461450385970755,
+      "num_iterations": 3,
       "converged": true,
-      "wall_time": 13.801923990249634,
+      "wall_time": 36.99250888824463,
       "config": {
         "method": "dcwme",
         "obs_fraction": 0.5,
@@ -680,10 +754,16 @@
     },
     "diagnostics": {
       "cost_history": [
-        53.26208275007475
+        53.26208275007475,
+        53.26177239848231,
+        53.25955509709417,
+        53.259404408416145
       ],
       "gradient_norm_history": [
-        1.0400217584848163e-13
+        1.6601357502882355e-05,
+        1.4700482696585801e-05,
+        4.738936377727554e-06,
+        2.505345750411013e-07
       ],
       "step_size_history": [],
       "background_term": null,
@@ -699,7 +779,7 @@
     },
     "error": null,
     "failure_type": null,
-    "wall_time": 19.295475006103516
+    "wall_time": 42.415762186050415
   },
   "_metadata": {
     "base_config": {
@@ -728,6 +808,6 @@
       "diagnostic_level": "standard"
     },
     "sweep_name": "friction",
-    "timestamp": "2026-02-07 15:15:02"
+    "timestamp": "2026-02-09 18:53:11"
   }
 }

@@ -455,8 +455,8 @@ class FourDVarCost(CostFunction):
         # Compute adjoint contribution via backward sweep
         lambda_0 = self._solve_adjoint(trajectory, jacobians)
 
-        # Total gradient
-        grad = grad_background.duplicate()
+        # Total gradient: ∇J = B⁻¹(m - m_b) + λ₀
+        grad = grad_background.copy()
         grad.axpy(1.0, lambda_0)
 
         return grad
@@ -519,8 +519,8 @@ class FourDVarCost(CostFunction):
         # Adjoint solve (uses cached jacobians)
         lambda_0 = self._solve_adjoint(trajectory, jacobians)
 
-        # Total gradient
-        grad = grad_background.duplicate()
+        # Total gradient: ∇J = B⁻¹(m - m_b) + λ₀
+        grad = grad_background.copy()
         grad.axpy(1.0, lambda_0)
 
         return cost, grad

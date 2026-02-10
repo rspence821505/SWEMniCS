@@ -1110,10 +1110,16 @@ class TwinExperiment:
             raise ValueError(f"Unknown DA method: {self.config.method}")
 
         # Precondition gradient by M^{-1} for DG elements
+        # The adjoint gradient includes M from ∂R/∂u₀ = -M/dt, making ||∇J|| ~ O(M).
+        # M⁻¹ converts to L² Riesz gradient. Both terms (background + adjoint) are
+        # transformed consistently so the result is a valid descent direction.
         if hasattr(forward_model, 'get_mass_matrix'):
             M = forward_model.get_mass_matrix()
             cost_function = MassMatrixPreconditionedCost(cost_function, M)
-            self.log("  Applied M^{-1} gradient preconditioning")
+            diag = M.getDiagonal()
+            diag_arr = diag.getArray()
+            self.log(f"  Applied M^{{-1}} gradient preconditioning (M diag: min={diag_arr.min():.2f}, max={diag_arr.max():.2f}, mean={diag_arr.mean():.2f})")
+            diag.destroy()
 
         # Wrap with boundary gradient zeroing if needed
         if self.config.interior_only:
@@ -1403,6 +1409,9 @@ class MassMatrixPreconditionedCost:
         cost, grad = self.base_cost.value_gradient(m)
         precond_grad = grad.duplicate()
         self._ksp.solve(grad, precond_grad)
+        if not hasattr(self, '_logged'):
+            self._logged = True
+            print(f"  [M⁻¹ precond] cost={cost:.4f}, ||grad_raw||={grad.norm():.4e}, ||grad_precond||={precond_grad.norm():.4e}, ratio={grad.norm()/(precond_grad.norm()+1e-30):.2f}")
         return cost, precond_grad
 
     def clear_cache(self):

@@ -131,6 +131,23 @@ class PETScTAOWrapper(Optimizer):
         max_iter = self.options.get("max_iterations", 100)
         self.tao.setMaximumIterations(max_iter)
 
+        # Configure line search
+        # Default More-Thuente requires Wolfe conditions which can fail on
+        # flat cost surfaces (e.g., 4D-Var with strong background penalty).
+        # Armijo (sufficient decrease only) is more robust for these cases.
+        ls_type = self.options.get("line_search_type", "armijo")
+        ls_max_funcs = self.options.get("line_search_max_funcs", 30)
+        ls_initial_step = self.options.get("line_search_initial_step", None)
+        try:
+            ls = self.tao.getLineSearch()
+            if ls is not None:
+                ls.setType(ls_type)
+                ls.setMaximumFunctionEvaluations(ls_max_funcs)
+                if ls_initial_step is not None:
+                    ls.setInitialStepLength(ls_initial_step)
+        except Exception:
+            pass  # Line search config not supported for all TAO types
+
         # Apply additional TAO-specific options
         self._apply_tao_options()
 
