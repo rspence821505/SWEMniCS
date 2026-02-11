@@ -143,6 +143,7 @@ class ComparisonRunner:
             "h_min": 0.01,
             "component_aware_cov": self.base_config.component_aware_cov,
             "n_windows": self.base_config.n_windows,
+            "background_correlation_length": self.base_config.background_correlation_length,
         }
 
         # Apply physics perturbation for non-friction sweeps

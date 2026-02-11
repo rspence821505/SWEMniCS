@@ -67,6 +67,7 @@ class TwinExperimentConfig:
 
     # Background error configuration
     background_error_std: float = 0.1
+    background_correlation_length: float = 0.0  # Spatial correlation length (m). 0 = white noise.
 
     # Optimization configuration
     max_iterations: int = 50
@@ -973,11 +974,56 @@ class TwinExperiment:
             v_indices = np.arange(2, n_dofs, 3)
             return h_indices, u_indices, v_indices
 
+    def _build_smoothing_matrix(self, component_indices: np.ndarray, correlation_length: float) -> np.ndarray:
+        """Build Gaussian spatial smoothing matrix for DOFs of one component.
+
+        Computes G_ij = exp(-d_ij^2 / (2*L^2)) and normalizes rows so that
+        G @ white_noise has unit variance. This produces spatially correlated
+        perturbations with correlation length L.
+
+        Args:
+            component_indices: DOF indices in the parent space for one component
+            correlation_length: Gaussian correlation length scale (meters)
+
+        Returns:
+            Smoothing matrix of shape (n_dofs, n_dofs)
+        """
+        from scipy.spatial.distance import cdist
+
+        # Get DOF coordinates via collapsed sub-space
+        V = self.solver.V
+        h_sub = V.sub(0)
+        h_space, h_map = h_sub.collapse()
+        all_coords = h_space.tabulate_dof_coordinates()[:, :2]  # (n_pts, 2)
+
+        # Map parent DOF indices to collapsed indices
+        parent_to_collapsed = np.full(max(h_map) + 1, -1, dtype=int)
+        for collapsed_i, parent_i in enumerate(h_map):
+            parent_to_collapsed[parent_i] = collapsed_i
+
+        # Get coordinates in the order of component_indices
+        collapsed_idx = parent_to_collapsed[component_indices]
+        coords = all_coords[collapsed_idx]  # (n_component_dofs, 2)
+
+        # Build Gaussian kernel matrix
+        dist_sq = cdist(coords, coords, metric='sqeuclidean')
+        G = np.exp(-dist_sq / (2.0 * correlation_length ** 2))
+
+        # Normalize rows so G @ white_noise has unit variance
+        # Var(G @ z) = G @ G^T (for z ~ N(0,I)), so normalize by sqrt(row sum of G^2)
+        row_norms = np.sqrt(np.sum(G ** 2, axis=1, keepdims=True))
+        G /= row_norms
+
+        return G
+
     def _setup_background(self, n_vars: int = 3) -> float:
         """Setup background state with component-aware perturbation from truth.
 
         Uses different perturbation magnitudes for h vs u,v to avoid creating
         unrealistic velocity perturbations that cause numerical instability.
+        When background_correlation_length > 0, applies Gaussian spatial smoothing
+        to produce spatially correlated perturbations that persist as coherent
+        structures under forward model integration.
         """
         rng = np.random.default_rng(self.config.background_seed)
         truth_array = self.m_true.getArray()
@@ -1001,10 +1047,24 @@ class TwinExperiment:
 
         self.log(f"  Component-aware perturbation: h_std={h_error:.4f}, uv_std={uv_error:.4f}")
 
-        # Perturb each component with appropriate magnitude
-        perturbation[h_indices] = rng.normal(0, h_error, len(h_indices))
-        perturbation[u_indices] = rng.normal(0, uv_error, len(u_indices))
-        perturbation[v_indices] = rng.normal(0, uv_error, len(v_indices))
+        # Generate white noise per component
+        h_noise = rng.normal(0, 1.0, len(h_indices))
+        u_noise = rng.normal(0, 1.0, len(u_indices))
+        v_noise = rng.normal(0, 1.0, len(v_indices))
+
+        # Apply spatial correlation if requested
+        L = self.config.background_correlation_length
+        if L > 0:
+            smoothing_matrix = self._build_smoothing_matrix(h_indices, L)
+            h_noise = smoothing_matrix @ h_noise
+            u_noise = smoothing_matrix @ u_noise
+            v_noise = smoothing_matrix @ v_noise
+            self.log(f"  Applied spatial correlation: L={L:.0f} m")
+
+        # Scale to desired standard deviation
+        perturbation[h_indices] = h_error * h_noise
+        perturbation[u_indices] = uv_error * u_noise
+        perturbation[v_indices] = uv_error * v_noise
 
         background_array = truth_array + perturbation
 

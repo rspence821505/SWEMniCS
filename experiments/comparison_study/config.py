@@ -32,6 +32,7 @@ class ComparisonStudyConfig:
     obs_noise_level: float = 0.001
     background_error_std: float = 0.1
     component_aware_cov: bool = True
+    background_correlation_length: float = 2000.0  # Spatial correlation length (m)
 
     # Cycling 4D-Var
     n_windows: int = 4  # Number of assimilation windows
@@ -75,6 +76,7 @@ class ComparisonStudyConfig:
             "obs_noise_level": self.obs_noise_level,
             "background_error_std": self.background_error_std,
             "component_aware_cov": self.component_aware_cov,
+            "background_correlation_length": self.background_correlation_length,
             "n_windows": self.n_windows,
             "friction_scale_factor": self.friction_scale_factor,
             "bathymetry_noise_std": self.bathymetry_noise_std,
