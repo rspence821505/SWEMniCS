@@ -1087,6 +1087,11 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         observations: List[PETSc.Vec],
         obs_times: List[int],
         predicted_cov_wme=None,
+        n_l_wme_samples: int = 100,
+        auto_inflate_B: bool = True,
+        max_inflate_factor: float = 2.0,
+        predictability_gamma: float = 0.1,
+        adaptive_gamma: bool = True,
         comm: Optional[MPI.Comm] = None,
         checkpointer=None,
     ):
@@ -1110,8 +1115,35 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         obs_times : List[int]
             Observation time indices.
         predicted_cov_wme : CovarianceMatrix, optional
-            Predicted covariance for WME. If None, uses analytical
-            approximation L_wme = R/N where N is the number of observations.
+            Predicted covariance for WME. If None and n_l_wme_samples > 0,
+            computes L_wme = J_wme B J_wme^T analytically via adjoint solves.
+            If None and n_l_wme_samples == 0, falls back to L_wme = 2R.
+        n_l_wme_samples : int, optional
+            Controls L_wme computation. Any value > 0 triggers analytical
+            computation of L_wme = J_wme B J_wme^T. Set to 0 to use the
+            2R fallback. Default 100.
+        auto_inflate_B : bool, optional
+            If True, estimate the minimum background variance bound from the
+            Gram matrix G = J_wme J_wme^T (paper eq. 38) and inflate B if
+            needed to satisfy the predictability condition. Default True.
+        max_inflate_factor : float, optional
+            Maximum allowed B inflation factor. Caps the inflation to prevent
+            weakening B⁻¹ too much, which can cause optimizer instability
+            (negative depths, Newton divergence). Default 2.0.
+        predictability_gamma : float, optional
+            Relaxation parameter γ for the predictability condition (paper eq. 36).
+            When adaptive_gamma=True (default), γ is spectrum-relative: the
+            eigenvalue floor is γ * λ_max(L_wme), so γ represents the minimum
+            fraction of the largest eigenvalue. Max amplification = 1/γ relative
+            to the best-conditioned direction.
+            When adaptive_gamma=False, γ is an absolute floor: λ_min(L_wme) ≥ γ.
+            Default 0.1.
+        adaptive_gamma : bool, optional
+            If True, use spectrum-relative regularization where the eigenvalue
+            floor adapts to the actual L_wme spectrum: γ_eff = γ * λ_max(L_wme).
+            This preserves the natural eigenvalue structure for well-conditioned
+            directions while stabilizing ill-conditioned ones.
+            If False, use absolute floor γ (original behavior). Default True.
         comm : MPI.Comm, optional
             MPI communicator.
         checkpointer : CheckpointerBase, optional
@@ -1144,6 +1176,16 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         # WME-specific predicted covariance
         self._L_wme = predicted_cov_wme
+        self._auto_inflate_B = auto_inflate_B
+        self._max_inflate_factor = max_inflate_factor
+        self._predictability_gamma = predictability_gamma
+        self._adaptive_gamma = adaptive_gamma
+
+        # Gram matrix diagnostics (populated during _compute_analytical_L_wme)
+        self._gram_eigenvalues = None
+        self._variance_bounds = None
+        self._b_inflation_factor = 1.0
+        self._B_original = None  # Store original B before inflation
 
         # Cache for WME accumulation
         self._wme_cache: Dict[str, PETSc.Vec] = {}
@@ -1157,6 +1199,10 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         # Share the trajectory from QoIMap back to cost function's cache
         # This prevents _run_forward_model from re-computing the m_b trajectory
         self._sync_trajectory_from_qoi(self.m_b)
+
+        # Compute proper L_wme analytically if not provided
+        if self._L_wme is None and n_l_wme_samples > 0:
+            self._L_wme = self._compute_analytical_L_wme()
 
     def _sync_trajectory_from_qoi(self, m: PETSc.Vec) -> None:
         """
@@ -1312,26 +1358,270 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         return 0.5 * delta_Q.dot(L_inv_delta)
 
+    def _compute_gram_and_inflate_B(self, adjoint_vectors: list) -> None:
+        """Compute Gram matrix G = J_wme J_wme^T and inflate B if needed.
+
+        Following Section 6.2.1 of Spence et al. (2025), the Gram matrix
+        G[i,j] = a_i^T a_j (where a_i = J_wme^T e_i) allows estimating
+        the minimum background variance needed for predictability:
+
+            σ²_b ≥ γ / λ_min(G)
+
+        Since L_wme = B^{1/2} G B^{1/2} (for isotropic B = σ²_b I), inflating
+        B by α scales all L_wme eigenvalues by α, restoring the predictability
+        condition λ_min(L_wme) ≥ γ.
+
+        Parameters
+        ----------
+        adjoint_vectors : list of PETSc.Vec
+            The adjoint vectors a_i = J_wme^T e_i already computed.
+        """
+        n_obs = len(adjoint_vectors)
+
+        # Form Gram matrix G[i,j] = a_i^T a_j (no B involved)
+        G = np.zeros((n_obs, n_obs))
+        for i in range(n_obs):
+            for j in range(i, n_obs):
+                val = adjoint_vectors[i].dot(adjoint_vectors[j])
+                G[i, j] = val
+                G[j, i] = val
+
+        gram_eigvals = np.linalg.eigvalsh(G)
+        self._gram_eigenvalues = gram_eigvals
+
+        print(f"  Gram matrix G eigenvalues: [{gram_eigvals.min():.6e}, {gram_eigvals.max():.6e}]")
+        print(f"  Gram matrix rank (>1e-10): {np.sum(gram_eigvals > 1e-10)}/{n_obs}")
+
+        # Compute variance bounds for different γ values
+        lambda_min_G = max(gram_eigvals.min(), 1e-30)  # Guard against zero
+        gamma_values = [0.01, 0.1, 1.0]
+        bounds = {}
+        print(f"  Variance bound (σ²_b ≥ γ/λ_min(G)):")
+        for gamma in gamma_values:
+            bound = gamma / lambda_min_G
+            bounds[gamma] = bound
+            print(f"    γ={gamma:.2f}: σ²_b ≥ {bound:.6e}")
+        self._variance_bounds = bounds
+
+        # Get current minimum variance from B
+        current_min_var = self.B.min_eigenvalue()
+        print(f"  Current min(B eigenvalue) = {current_min_var:.6e}")
+
+        # Auto-inflate B if needed (using γ matching regularization)
+        if self._auto_inflate_B:
+            from .covariance import ScaledCovariance
+
+            gamma_inflate = self._predictability_gamma
+            required_var = gamma_inflate / lambda_min_G
+            alpha_uncapped = required_var / current_min_var if current_min_var > 0 else 1.0
+            alpha_uncapped = max(1.0, alpha_uncapped)  # Never deflate
+            alpha = min(alpha_uncapped, self._max_inflate_factor)  # Cap inflation
+
+            if alpha_uncapped > 1.0:
+                if alpha < alpha_uncapped:
+                    print(f"  Inflation capped: α = {alpha_uncapped:.4f} → {alpha:.4f} (max_inflate_factor={self._max_inflate_factor})")
+
+            if alpha > 1.0:
+                # Store original B before inflation (for cycling windows)
+                if self._B_original is None:
+                    self._B_original = self.B
+                else:
+                    # Restore original B before re-inflating (cycling case)
+                    self.B = self._B_original
+
+                self.B = ScaledCovariance(self.B, alpha)
+                self._b_inflation_factor = alpha
+                new_min_var = self.B.min_eigenvalue()
+                print(f"  B INFLATION: α = {alpha:.4f} (new min variance = {new_min_var:.6e})")
+            else:
+                print(f"  No B inflation needed (current variance sufficient)")
+
+    def _compute_analytical_L_wme(self) -> 'CovarianceMatrix':
+        """Compute L_wme = J_wme B J_wme^T analytically.
+
+        Uses the observation-space column approach (exact, no sampling):
+          1. For each basis vector e_i in obs space, compute a_i = J_wme^T e_i
+          1b. Compute Gram matrix G[i,j] = a_i^T a_j and inflate B if needed
+              (paper Section 6.2.1, eq. 38)
+          2. Compute b_i = B a_i (using potentially inflated B)
+          3. Form L_wme[i,j] = a_i^T b_j  (= e_i^T J_wme B J_wme^T e_j)
+
+        This gives the exact predicted covariance. The cost is n_obs adjoint
+        solves (one per observation DOF), which is much cheaper than forming
+        the full n_state-column Jacobian. The Gram matrix computation adds
+        zero extra adjoint solves (just n_obs² dot products).
+
+        Regularization follows the relaxed predictability condition from
+        Spence et al. (2025), equation (36): λ_min(L_wme) ≥ γ · λ_max(R_eff)
+        where R_eff = I in the WME-normalized space, and γ << 1.
+
+        Returns
+        -------
+        DenseCovariance
+            Exact predicted covariance for WME QoI.
+        """
+        import time as _time
+
+        # Linearize WME at m_b (reuses cached trajectory/Jacobians from __init__)
+        linearized_wme = self.qoi_map.linearize(
+            self.m_b,
+            max(self.obs_times),
+            trajectory=self._trajectory,
+            jacobians=self._jacobians,
+        )
+
+        # Determine observation space dimension from cached Q_wme(m_b)
+        Q_wme_mb = self._wme_cache.get("Q_wme_mb")
+        if Q_wme_mb is None:
+            Q_wme_mb = self._compute_wme(self.m_b)
+        n_obs = Q_wme_mb.getSize()
+
+        print(f"  Computing L_wme analytically ({n_obs} adjoint solves)...")
+        t_start = _time.perf_counter()
+
+        # Step 1: Compute a_i = J_wme^T e_i for each observation basis vector
+        adjoint_vectors = []
+        e_i = Q_wme_mb.duplicate()
+
+        for i in range(n_obs):
+            e_i.zeroEntries()
+            e_i.setValue(i, 1.0)
+            e_i.assemblyBegin()
+            e_i.assemblyEnd()
+
+            a_i = linearized_wme.apply_adjoint(e_i)
+            adjoint_vectors.append(a_i)
+
+            if (i + 1) % 25 == 0 or i == 0:
+                elapsed = _time.perf_counter() - t_start
+                print(f"    Adjoint solve {i + 1}/{n_obs} ({elapsed:.1f}s)")
+
+        e_i.destroy()
+
+        # Step 1b: Compute Gram matrix G and inflate B if needed
+        self._compute_gram_and_inflate_B(adjoint_vectors)
+
+        # Step 2: Compute b_j = B a_j for each j (uses potentially inflated B)
+        B_adjoint_vectors = []
+        for j in range(n_obs):
+            b_j = self.B.apply(adjoint_vectors[j])
+            B_adjoint_vectors.append(b_j)
+
+        # Step 3: Form L_wme[i,j] = a_i^T b_j (exploit symmetry)
+        L_dense = np.zeros((n_obs, n_obs))
+        for i in range(n_obs):
+            for j in range(i, n_obs):
+                val = adjoint_vectors[i].dot(B_adjoint_vectors[j])
+                L_dense[i, j] = val
+                L_dense[j, i] = val
+
+        # Clean up PETSc vectors
+        for v in adjoint_vectors:
+            v.destroy()
+        for v in B_adjoint_vectors:
+            v.destroy()
+
+        elapsed = _time.perf_counter() - t_start
+        print(f"  L_wme matrix formed in {elapsed:.1f}s")
+
+        # Eigenvalue diagnostics
+        eigvals = np.linalg.eigvalsh(L_dense)
+        print(f"  L_wme eigenvalues: [{eigvals.min():.6e}, {eigvals.max():.6e}]")
+        print(f"  L_wme rank (>1e-10): {np.sum(eigvals > 1e-10)}/{n_obs}")
+        n_above_1 = np.sum(eigvals > 1.0)
+        print(f"  L_wme eigenvalues > 1.0: {n_above_1}/{n_obs} "
+              f"(these get proper DC-WME correction)")
+        if n_above_1 > 0:
+            above_1 = eigvals[eigvals > 1.0]
+            print(f"  Eigenvalues > 1: [{above_1.min():.6e}, {above_1.max():.6e}]")
+
+        # Regularization: hybrid predictability-aware approach
+        #
+        # In WME-normalized space, R_eff = I, so the predictability boundary
+        # is at λ = γ (paper eq. 36). Eigenvalues above γ are "well-predicted"
+        # and get proper DC-WME correction. Eigenvalues below γ are "poorly-predicted".
+        #
+        # Instead of flooring poorly-predicted eigenvalues to γ (which makes
+        # L_wme⁻¹ = 1/γ and causes the cost to ignore/invert data weight in
+        # those directions), we PROJECT them out by setting to a large value.
+        # This makes L_wme⁻¹ ≈ 0 in those directions, so the DC-WME cost
+        # naturally falls back to standard 4D-Var (full data weight preserved).
+        #
+        # Result: DC-WME correction only in well-predicted directions (mild, stable),
+        #         standard 4D-Var in poorly-predicted directions (preserves data signal).
+        gamma_base = self._predictability_gamma
+        lambda_max = eigvals.max()
+
+        if self._adaptive_gamma:
+            gamma_eff = gamma_base * lambda_max
+            print(f"  Adaptive γ: γ_base={gamma_base}, λ_max={lambda_max:.6e}, "
+                  f"γ_eff={gamma_eff:.6e}")
+        else:
+            gamma_eff = gamma_base
+            print(f"  Absolute γ: γ_eff={gamma_eff:.6e}")
+
+        # Count eigenvalues in each regime
+        n_well_predicted = np.sum(eigvals >= gamma_eff)
+        n_projected = np.sum(eigvals < gamma_eff)
+
+        if n_projected > 0:
+            eigvals_full, eigvecs = np.linalg.eigh(L_dense)
+            # Well-predicted: keep eigenvalue (DC-WME correction, L⁻¹ < 1/γ)
+            # Poorly-predicted: set to large value (L⁻¹ ≈ 0 → fall back to 4D-Var)
+            LARGE_EIGENVALUE = 1e4
+            eigvals_reg = np.where(eigvals_full >= gamma_eff, eigvals_full, LARGE_EIGENVALUE)
+            L_dense = eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
+
+            if n_well_predicted > 0:
+                well_pred = eigvals_full[eigvals_full >= gamma_eff]
+                print(f"  Hybrid regularization: {n_well_predicted}/{n_obs} well-predicted "
+                      f"(DC-WME, λ=[{well_pred.min():.4e}, {well_pred.max():.4e}]), "
+                      f"{n_projected}/{n_obs} projected out (→ 4D-Var)")
+                max_correction = 1.0 / well_pred.min()
+                print(f"  Max L_wme⁻¹ in well-predicted dirs: {max_correction:.4f} "
+                      f"(data weight factor: {1 - max_correction:.4f})")
+            else:
+                print(f"  All {n_obs} eigenvalues projected out (DC-WME → pure 4D-Var)")
+        else:
+            print(f"  All {n_obs} eigenvalues well-predicted (full DC-WME, no projection)")
+
+        # Create DenseCovariance from dense matrix
+        from .covariance import DenseCovariance
+        comm = self.comm if self.comm is not None else MPI.COMM_WORLD
+
+        mat = PETSc.Mat().create(comm=comm)
+        mat.setSizes((n_obs, n_obs))
+        mat.setType(PETSc.Mat.Type.DENSE)
+        mat.setUp()
+
+        if comm.rank == 0:
+            for i in range(n_obs):
+                mat.setValues(i, list(range(n_obs)), L_dense[i, :])
+
+        mat.assemblyBegin()
+        mat.assemblyEnd()
+
+        print(f"  L_wme computed: {n_obs}x{n_obs} dense matrix")
+
+        # Restore original B after L_wme computation.
+        # The inflation was only needed to compute L_wme = J_wme B_infl J_wme^T.
+        # The background term B⁻¹(m - m_b) should use the original (uninflated) B
+        # to maintain strong regularization.
+        if self._B_original is not None:
+            print(f"  Restoring original B for background term (inflation was for L_wme only)")
+            self.B = self._B_original
+            self._B_original = None
+
+        return DenseCovariance(comm, mat)
+
     def _ensure_wme_predicted_covariance(self):
         """Ensure WME predicted covariance is available.
 
-        For the WME formulation, the predicted covariance L_wme must satisfy
-        the predictability condition:
-            λ_max(R) < λ_min(L_wme)
-
-        This ensures that the model's predicted uncertainty (L_wme) is greater
-        than the observation uncertainty (R), which is required for the DC
-        formulation to properly weight the observations.
-
-        We use L_wme = 2 * R which satisfies:
-            λ_min(L_wme) = 2 * λ_min(R) ≥ 2 * λ_max(R) > λ_max(R)
-        for diagonal R with uniform entries.
+        Falls back to L_wme = 2R if no proper L_wme was computed.
         """
         if self._L_wme is None:
-            # Get observation covariance at first observation time
+            # Fallback: L_wme = 2 * R
             R = self._get_observation_covariance(self.obs_times[0])
-
-            # L_wme = 2 * R ensures predictability condition: λ_max(R) < λ_min(L_wme)
             from .covariance import ScaledCovariance
             self._L_wme = ScaledCovariance(R, scale_factor=2.0)
 
@@ -1599,6 +1889,10 @@ def create_cost_function(
             observations,
             obs_times,
             predicted_cov_wme=kwargs.get("predicted_cov_wme"),
+            auto_inflate_B=kwargs.get("auto_inflate_B", True),
+            max_inflate_factor=kwargs.get("max_inflate_factor", 2.0),
+            predictability_gamma=kwargs.get("predictability_gamma", 0.1),
+            adaptive_gamma=kwargs.get("adaptive_gamma", True),
         )
     else:
         raise ValueError(f"Unknown cost function variant: {variant}")

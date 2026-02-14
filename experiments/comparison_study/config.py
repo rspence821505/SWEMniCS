@@ -27,7 +27,7 @@ class ComparisonStudyConfig:
     p_degree: List[int] = field(default_factory=lambda: [1, 1])
 
     # Base DA configuration (defaults when not being swept)
-    obs_frequency: int = 1
+    obs_frequency: int = 4
     obs_fraction: float = 0.5
     obs_noise_level: float = 0.001
     background_error_std: float = 0.1
@@ -36,6 +36,13 @@ class ComparisonStudyConfig:
 
     # Cycling 4D-Var
     n_windows: int = 4  # Number of assimilation windows
+
+    # DC-WME L_wme estimation
+    l_wme_samples: int = 100  # >0 = analytical L_wme, 0 = 2R fallback
+    auto_inflate_B: bool = True  # Auto-inflate B based on Gram matrix bound (paper eq. 38)
+    max_inflate_factor: float = 3.0  # Maximum B inflation factor
+    predictability_gamma: float = 1.0  # Relaxation γ for predictability condition (paper eq. 36)
+    adaptive_gamma: bool = False  # Absolute γ=1.0 is the predictability boundary
 
     # Physics perturbation defaults
     friction_scale_factor: float = 1.1  # Default to 10% model error
@@ -78,6 +85,11 @@ class ComparisonStudyConfig:
             "component_aware_cov": self.component_aware_cov,
             "background_correlation_length": self.background_correlation_length,
             "n_windows": self.n_windows,
+            "l_wme_samples": self.l_wme_samples,
+            "auto_inflate_B": self.auto_inflate_B,
+            "max_inflate_factor": self.max_inflate_factor,
+            "predictability_gamma": self.predictability_gamma,
+            "adaptive_gamma": self.adaptive_gamma,
             "friction_scale_factor": self.friction_scale_factor,
             "bathymetry_noise_std": self.bathymetry_noise_std,
             "max_iterations": self.max_iterations,

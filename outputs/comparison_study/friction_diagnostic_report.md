@@ -17,11 +17,11 @@
 
 | Experiment | Method | Initial Grad | Final Grad | Ratio |
 |------------|--------|-------------|------------|-------|
-| 4dvar_friction_1.0 | 4dvar | 1.68e-02 | 8.95e-06 | 5.32e-04 |
-| 4dvar_friction_1.1 | 4dvar | 1.69e-02 | 7.54e-06 | 4.47e-04 |
-| 4dvar_friction_1.15 | 4dvar | 1.69e-02 | 6.72e-06 | 3.98e-04 |
-| 4dvar_friction_1.2 | 4dvar | 1.69e-02 | 8.06e-06 | 4.77e-04 |
-| dcwme_friction_1.0 | dcwme | 6.99e-04 | 8.68e+04 | 1.24e+08 |
-| dcwme_friction_1.1 | dcwme | 6.97e-04 | 2.03e+03 | 2.91e+06 |
-| dcwme_friction_1.15 | dcwme | 6.96e-04 | 1.67e+07 | 2.40e+10 |
-| dcwme_friction_1.2 | dcwme | 6.96e-04 | 1.00e+03 | 1.44e+06 |
+| 4dvar_friction_1.0 | 4dvar | 3.28e-04 | 1.21e-06 | 3.69e-03 |
+| 4dvar_friction_1.1 | 4dvar | 3.27e-04 | 9.30e-07 | 2.85e-03 |
+| 4dvar_friction_1.15 | 4dvar | 3.26e-04 | 1.48e-06 | 4.54e-03 |
+| 4dvar_friction_1.2 | 4dvar | 3.26e-04 | 1.15e-06 | 3.55e-03 |
+| dcwme_friction_1.0 | dcwme | 1.82e-04 | 3.86e-07 | 2.12e-03 |
+| dcwme_friction_1.1 | dcwme | 1.81e-04 | 3.71e-07 | 2.05e-03 |
+| dcwme_friction_1.15 | dcwme | 1.81e-04 | 3.64e-07 | 2.02e-03 |
+| dcwme_friction_1.2 | dcwme | 1.80e-04 | 3.58e-07 | 1.99e-03 |

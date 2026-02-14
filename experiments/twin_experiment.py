@@ -93,6 +93,13 @@ class TwinExperimentConfig:
     # Cycling 4D-Var
     n_windows: int = 1  # Number of cycling windows (1 = single window)
 
+    # DC-WME L_wme estimation
+    l_wme_samples: int = 100  # >0 = analytical L_wme via adjoint, 0 = 2R fallback
+    auto_inflate_B: bool = True  # Auto-inflate B based on Gram matrix bound (paper eq. 38)
+    max_inflate_factor: float = 2.0  # Maximum B inflation factor to prevent optimizer instability
+    predictability_gamma: float = 0.1  # Relaxation γ for predictability condition (paper eq. 36)
+    adaptive_gamma: bool = True  # Spectrum-relative γ: floor = γ * λ_max(L_wme)
+
     # Perturbation seed for reproducibility
     perturbation_seed: int = 456
 
@@ -1172,6 +1179,11 @@ class TwinExperiment:
                 observations=self.observations,
                 obs_times=obs_times,
                 predicted_cov_wme=None,
+                n_l_wme_samples=self.config.l_wme_samples,
+                auto_inflate_B=self.config.auto_inflate_B,
+                max_inflate_factor=self.config.max_inflate_factor,
+                predictability_gamma=self.config.predictability_gamma,
+                adaptive_gamma=self.config.adaptive_gamma,
                 comm=self.comm,
             )
         else:
