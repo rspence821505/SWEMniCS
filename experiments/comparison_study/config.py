@@ -40,7 +40,7 @@ class ComparisonStudyConfig:
     # DC-WME L_wme estimation
     l_wme_samples: int = 100  # >0 = analytical L_wme, 0 = 2R fallback
     auto_inflate_B: bool = True  # Auto-inflate B based on Gram matrix bound (paper eq. 38)
-    max_inflate_factor: float = 3.0  # Maximum B inflation factor
+    max_inflate_factor: float = 100.0  # Maximum B inflation factor
     predictability_gamma: float = 1.0  # Relaxation γ for predictability condition (paper eq. 36)
     adaptive_gamma: bool = False  # Absolute γ=1.0 is the predictability boundary
 

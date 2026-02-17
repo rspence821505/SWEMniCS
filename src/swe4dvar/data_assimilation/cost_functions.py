@@ -1092,6 +1092,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         max_inflate_factor: float = 2.0,
         predictability_gamma: float = 0.1,
         adaptive_gamma: bool = True,
+        B_lwme=None,
         comm: Optional[MPI.Comm] = None,
         checkpointer=None,
     ):
@@ -1105,7 +1106,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         observation_operator : ObservationOperator
             Observation operator.
         background_cov : CovarianceMatrix
-            Background covariance B.
+            Background covariance B (used for B^{-1} in background term).
         observation_cov : CovarianceMatrix
             Observation covariance R.
         m_background : PETSc.Vec
@@ -1144,6 +1145,12 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             This preserves the natural eigenvalue structure for well-conditioned
             directions while stabilizing ill-conditioned ones.
             If False, use absolute floor γ (original behavior). Default True.
+        B_lwme : CovarianceMatrix, optional
+            Separate covariance for L_wme computation (L_wme = J B_lwme J^T).
+            When provided, this is used instead of background_cov for L_wme,
+            while background_cov is still used for B^{-1} in the background term.
+            This allows using a spatially correlated B for L_wme amplification
+            while keeping a well-conditioned diagonal B for the background term.
         comm : MPI.Comm, optional
             MPI communicator.
         checkpointer : CheckpointerBase, optional
@@ -1180,6 +1187,9 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         self._max_inflate_factor = max_inflate_factor
         self._predictability_gamma = predictability_gamma
         self._adaptive_gamma = adaptive_gamma
+
+        # Separate B for L_wme computation (None = use self.B)
+        self._B_lwme = B_lwme
 
         # Gram matrix diagnostics (populated during _compute_analytical_L_wme)
         self._gram_eigenvalues = None
@@ -1403,11 +1413,15 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             print(f"    γ={gamma:.2f}: σ²_b ≥ {bound:.6e}")
         self._variance_bounds = bounds
 
-        # Get current minimum variance from B
-        current_min_var = self.B.min_eigenvalue()
-        print(f"  Current min(B eigenvalue) = {current_min_var:.6e}")
+        # Determine which B to use for L_wme computation
+        B_for_lwme = self._B_lwme if self._B_lwme is not None else self.B
+        if self._B_lwme is not None:
+            print(f"  Using separate B_lwme for L_wme computation")
 
-        # Auto-inflate B if needed (using γ matching regularization)
+        current_min_var = B_for_lwme.min_eigenvalue()
+        print(f"  Current min(B_lwme eigenvalue) = {current_min_var:.6e}")
+
+        # Auto-inflate B_lwme if needed (using γ matching regularization)
         if self._auto_inflate_B:
             from .covariance import ScaledCovariance
 
@@ -1422,16 +1436,24 @@ class DCWMEFourDVarCost(DCFourDVarCost):
                     print(f"  Inflation capped: α = {alpha_uncapped:.4f} → {alpha:.4f} (max_inflate_factor={self._max_inflate_factor})")
 
             if alpha > 1.0:
-                # Store original B before inflation (for cycling windows)
-                if self._B_original is None:
-                    self._B_original = self.B
+                if self._B_lwme is not None:
+                    # Inflate B_lwme only (self.B untouched for background term)
+                    if self._B_original is None:
+                        self._B_original = self._B_lwme
+                    else:
+                        self._B_lwme = self._B_original
+                    self._B_lwme = ScaledCovariance(self._B_lwme, alpha)
                 else:
-                    # Restore original B before re-inflating (cycling case)
-                    self.B = self._B_original
+                    # No separate B_lwme: inflate self.B (original behavior)
+                    if self._B_original is None:
+                        self._B_original = self.B
+                    else:
+                        self.B = self._B_original
+                    self.B = ScaledCovariance(self.B, alpha)
 
-                self.B = ScaledCovariance(self.B, alpha)
                 self._b_inflation_factor = alpha
-                new_min_var = self.B.min_eigenvalue()
+                B_for_lwme_inflated = self._B_lwme if self._B_lwme is not None else self.B
+                new_min_var = B_for_lwme_inflated.min_eigenvalue()
                 print(f"  B INFLATION: α = {alpha:.4f} (new min variance = {new_min_var:.6e})")
             else:
                 print(f"  No B inflation needed (current variance sufficient)")
@@ -1501,10 +1523,11 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         # Step 1b: Compute Gram matrix G and inflate B if needed
         self._compute_gram_and_inflate_B(adjoint_vectors)
 
-        # Step 2: Compute b_j = B a_j for each j (uses potentially inflated B)
+        # Step 2: Compute b_j = B_lwme a_j for each j (uses potentially inflated B_lwme)
+        B_for_lwme = self._B_lwme if self._B_lwme is not None else self.B
         B_adjoint_vectors = []
         for j in range(n_obs):
-            b_j = self.B.apply(adjoint_vectors[j])
+            b_j = B_for_lwme.apply(adjoint_vectors[j])
             B_adjoint_vectors.append(b_j)
 
         # Step 3: Form L_wme[i,j] = a_i^T b_j (exploit symmetry)
@@ -1535,55 +1558,54 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             above_1 = eigvals[eigvals > 1.0]
             print(f"  Eigenvalues > 1: [{above_1.min():.6e}, {above_1.max():.6e}]")
 
-        # Regularization: hybrid predictability-aware approach
+        # Regularization: eigenvalue flooring with configurable floor
         #
-        # In WME-normalized space, R_eff = I, so the predictability boundary
-        # is at λ = γ (paper eq. 36). Eigenvalues above γ are "well-predicted"
-        # and get proper DC-WME correction. Eigenvalues below γ are "poorly-predicted".
+        # In WME-normalized space, R_eff = I. The effective data weight per
+        # eigendirection is:  w_i = 1 - 1/λ_i  (where λ_i = L_wme eigenvalue)
         #
-        # Instead of flooring poorly-predicted eigenvalues to γ (which makes
-        # L_wme⁻¹ = 1/γ and causes the cost to ignore/invert data weight in
-        # those directions), we PROJECT them out by setting to a large value.
-        # This makes L_wme⁻¹ ≈ 0 in those directions, so the DC-WME cost
-        # naturally falls back to standard 4D-Var (full data weight preserved).
+        # Floor eigenvalues at γ (predictability_gamma) to cap L⁻¹ at 1/γ:
+        #   γ = 1:   L⁻¹ ≤ 1.0, weight ≥ 0   (full DC removal allowed)
+        #   γ = 2:   L⁻¹ ≤ 0.5, weight ≥ 0.5  (at most 50% data removed)
+        #   γ = 5:   L⁻¹ ≤ 0.2, weight ≥ 0.8  (at most 20% data removed)
+        #   γ = 10:  L⁻¹ ≤ 0.1, weight ≥ 0.9  (at most 10% data removed)
         #
-        # Result: DC-WME correction only in well-predicted directions (mild, stable),
-        #         standard 4D-Var in poorly-predicted directions (preserves data signal).
-        gamma_base = self._predictability_gamma
-        lambda_max = eigvals.max()
+        # Higher γ = more conservative DC correction, more stable optimization.
+        # The cost function data contribution has weight w_i = 1 - 1/λ_i ≥ 1 - 1/γ > 0
+        # for γ > 1, ensuring the cost is strictly bounded below.
+        eigvals_full, eigvecs = np.linalg.eigh(L_dense)
 
         if self._adaptive_gamma:
-            gamma_eff = gamma_base * lambda_max
-            print(f"  Adaptive γ: γ_base={gamma_base}, λ_max={lambda_max:.6e}, "
-                  f"γ_eff={gamma_eff:.6e}")
+            # Spectrum-relative: floor = γ * λ_max(L_wme)
+            gamma_floor = self._predictability_gamma * eigvals_full.max()
+            print(f"  Adaptive γ: {self._predictability_gamma} × λ_max={eigvals_full.max():.4e} → γ_eff={gamma_floor:.4e}")
         else:
-            gamma_eff = gamma_base
-            print(f"  Absolute γ: γ_eff={gamma_eff:.6e}")
+            # Absolute floor
+            gamma_floor = self._predictability_gamma
 
-        # Count eigenvalues in each regime
-        n_well_predicted = np.sum(eigvals >= gamma_eff)
-        n_projected = np.sum(eigvals < gamma_eff)
+        n_floored = np.sum(eigvals_full < gamma_floor)
+        n_natural = np.sum(eigvals_full >= gamma_floor)
 
-        if n_projected > 0:
-            eigvals_full, eigvecs = np.linalg.eigh(L_dense)
-            # Well-predicted: keep eigenvalue (DC-WME correction, L⁻¹ < 1/γ)
-            # Poorly-predicted: set to large value (L⁻¹ ≈ 0 → fall back to 4D-Var)
-            LARGE_EIGENVALUE = 1e4
-            eigvals_reg = np.where(eigvals_full >= gamma_eff, eigvals_full, LARGE_EIGENVALUE)
-            L_dense = eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
+        eigvals_reg = np.maximum(eigvals_full, gamma_floor)
+        L_dense = eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
 
-            if n_well_predicted > 0:
-                well_pred = eigvals_full[eigvals_full >= gamma_eff]
-                print(f"  Hybrid regularization: {n_well_predicted}/{n_obs} well-predicted "
-                      f"(DC-WME, λ=[{well_pred.min():.4e}, {well_pred.max():.4e}]), "
-                      f"{n_projected}/{n_obs} projected out (→ 4D-Var)")
-                max_correction = 1.0 / well_pred.min()
-                print(f"  Max L_wme⁻¹ in well-predicted dirs: {max_correction:.4f} "
-                      f"(data weight factor: {1 - max_correction:.4f})")
-            else:
-                print(f"  All {n_obs} eigenvalues projected out (DC-WME → pure 4D-Var)")
+        max_L_inv = 1.0 / gamma_floor
+        min_weight = 1.0 - max_L_inv
+
+        if n_natural > 0:
+            natural = eigvals_full[eigvals_full >= gamma_floor]
+            nat_min_weight = 1.0 - 1.0 / natural.min()
+            nat_max_weight = 1.0 - 1.0 / natural.max()
+            print(f"  Eigenvalue floor γ={gamma_floor:.1f}: "
+                  f"{n_natural}/{n_obs} natural "
+                  f"(λ=[{natural.min():.4e}, {natural.max():.4e}], "
+                  f"weight=[{nat_min_weight:.4f}, {nat_max_weight:.4f}]), "
+                  f"{n_floored}/{n_obs} floored "
+                  f"(weight={min_weight:.4f}, max L⁻¹={max_L_inv:.4f})")
         else:
-            print(f"  All {n_obs} eigenvalues well-predicted (full DC-WME, no projection)")
+            print(f"  Eigenvalue floor γ={gamma_floor:.1f}: "
+                  f"all {n_obs} floored "
+                  f"(max raw λ={eigvals_full.max():.4e}, "
+                  f"weight={min_weight:.4f}, max L⁻¹={max_L_inv:.4f})")
 
         # Create DenseCovariance from dense matrix
         from .covariance import DenseCovariance
@@ -1603,13 +1625,17 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         print(f"  L_wme computed: {n_obs}x{n_obs} dense matrix")
 
-        # Restore original B after L_wme computation.
+        # Restore original B/B_lwme after L_wme computation.
         # The inflation was only needed to compute L_wme = J_wme B_infl J_wme^T.
         # The background term B⁻¹(m - m_b) should use the original (uninflated) B
         # to maintain strong regularization.
         if self._B_original is not None:
-            print(f"  Restoring original B for background term (inflation was for L_wme only)")
-            self.B = self._B_original
+            if self._B_lwme is not None:
+                print(f"  Restoring original B_lwme (background B was never modified)")
+                self._B_lwme = self._B_original
+            else:
+                print(f"  Restoring original B for background term (inflation was for L_wme only)")
+                self.B = self._B_original
             self._B_original = None
 
         return DenseCovariance(comm, mat)
@@ -1893,6 +1919,7 @@ def create_cost_function(
             max_inflate_factor=kwargs.get("max_inflate_factor", 2.0),
             predictability_gamma=kwargs.get("predictability_gamma", 0.1),
             adaptive_gamma=kwargs.get("adaptive_gamma", True),
+            B_lwme=kwargs.get("B_lwme"),
         )
     else:
         raise ValueError(f"Unknown cost function variant: {variant}")

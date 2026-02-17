@@ -141,6 +141,18 @@ Examples:
         default=172800.0,
         help="Final simulation time (seconds)",
     )
+    parser.add_argument(
+        "--obs-frequency",
+        type=int,
+        default=4,
+        help="Observation frequency (observe every N timesteps)",
+    )
+    parser.add_argument(
+        "--friction-scale-factor",
+        type=float,
+        default=1.1,
+        help="Friction scale factor for non-friction sweeps (model error)",
+    )
 
     return parser.parse_args()
 
@@ -174,6 +186,8 @@ def run_experiments(args):
         nx=args.nx,
         ny=args.ny,
         final_time=args.final_time,
+        obs_frequency=args.obs_frequency,
+        friction_scale_factor=args.friction_scale_factor,
         output_dir=Path(args.output_dir),
         diagnostic_level=args.diagnostic_level,
     )

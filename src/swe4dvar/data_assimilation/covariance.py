@@ -583,6 +583,22 @@ class DenseCovariance(CovarianceMatrix):
             "sqrt_apply for DenseCovariance requires eigendecomposition"
         )
 
+    def min_eigenvalue(self) -> float:
+        """Return minimum eigenvalue of the dense covariance matrix."""
+        if not hasattr(self, '_min_eigenvalue'):
+            # Extract dense matrix to numpy and compute eigenvalues
+            n = self.size
+            dense = np.zeros((n, n))
+            rstart, rend = self.mat.getOwnershipRange()
+            for i in range(rstart, rend):
+                cols, vals = self.mat.getRow(i)
+                for c, v in zip(cols, vals):
+                    dense[i, c] = v
+            eigvals = np.linalg.eigvalsh(dense)
+            # Guard against tiny negative eigenvalues from numerical noise
+            self._min_eigenvalue = float(max(eigvals[0], eigvals[-1] * 1e-14))
+        return self._min_eigenvalue
+
     @classmethod
     def from_correlation(
         cls,

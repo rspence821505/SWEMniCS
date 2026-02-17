@@ -377,7 +377,7 @@ class TwinExperiment:
 
         # Step 5: Setup covariance matrices
         self.log("\nStep 5: Setting up covariance matrices...")
-        B, R = self._setup_covariances(obs_operator, obs_noise_stds)
+        B, R, B_lwme = self._setup_covariances(obs_operator, obs_noise_stds)
 
         # Step 6: Create forward model wrapper
         self.log("\nStep 6: Creating forward model wrapper...")
@@ -386,7 +386,7 @@ class TwinExperiment:
         # Step 7: Setup cost function
         self.log(f"\nStep 7: Setting up {self.config.method.upper()} cost function...")
         cost_function = self._setup_cost_function(
-            forward_model, obs_operator, B, R, obs_times
+            forward_model, obs_operator, B, R, obs_times, B_lwme=B_lwme
         )
 
         # Step 8: Run optimization
@@ -1115,13 +1115,87 @@ class TwinExperiment:
             B = DiagonalCovariance(self.comm, state_size, variance=background_variance)
             self.log(f"  Background covariance: diagonal, variance = {background_variance:.6e}")
 
+        # Add spatial correlation if requested (for L_wme computation only)
+        B_lwme = None
+        corr_len = self.config.background_correlation_length
+        if corr_len > 0:
+            B_lwme = self._add_spatial_correlation(B, corr_len)
+
         # Observation covariance
         n_obs = obs_operator.get_num_observations()
         obs_variance = obs_noise_stds.mean() ** 2
         R = DiagonalCovariance(self.comm, n_obs, variance=obs_variance)
         self.log(f"  Observation covariance: diagonal, variance = {obs_variance:.6e}")
 
-        return B, R
+        return B, R, B_lwme
+
+    def _add_spatial_correlation(self, B_diag, correlation_length: float):
+        """Convert diagonal B to spatially correlated B using Gaussian kernel.
+
+        Builds B_corr = D^{1/2} C D^{1/2} where D is the diagonal variance
+        and C is a Gaussian correlation matrix based on DOF distances.
+
+        Parameters
+        ----------
+        B_diag : DiagonalCovariance
+            Original diagonal background covariance.
+        correlation_length : float
+            Gaussian correlation length scale (meters).
+
+        Returns
+        -------
+        DenseCovariance
+            Spatially correlated background covariance.
+        """
+        from scipy.spatial.distance import cdist
+        from swe4dvar.data_assimilation.covariance import DenseCovariance
+
+        state_size = B_diag.size
+
+        # Get DOF coordinates via cell centroids.
+        # For DG elements, DOFs within a cell share the centroid position.
+        # This creates rank deficiency in the correlation matrix, but the
+        # regularization parameter ε controls the minimum eigenvalue.
+        mesh = self.problem.mesh
+        tdim = mesh.topology.dim
+        num_cells = mesh.topology.index_map(tdim).size_local
+        geom = mesh.geometry.x
+
+        cell_centroids = np.zeros((num_cells, 2))
+        for cell_idx in range(num_cells):
+            cell_verts = mesh.geometry.dofmap[cell_idx]
+            cell_centroids[cell_idx] = geom[cell_verts, :2].mean(axis=0)
+
+        dofmap = self.solver.V.dofmap
+        dof_coords = np.zeros((state_size, 2))
+        for cell_idx in range(num_cells):
+            for dof in dofmap.cell_dofs(cell_idx):
+                dof_coords[dof] = cell_centroids[cell_idx]
+
+        # Build Gaussian correlation matrix with regularization.
+        # ε controls the minimum eigenvalue of the correlation matrix.
+        # Larger ε = better conditioned but weaker correlation effect.
+        dist_matrix = cdist(dof_coords, dof_coords, metric='euclidean')
+        correlation = np.exp(-dist_matrix**2 / (2 * correlation_length**2))
+        eps = 1e-6
+        correlation = (1 - eps) * correlation + eps * np.eye(state_size)
+
+        # Get variances from diagonal B
+        if hasattr(B_diag, 'diagonal'):
+            variances = B_diag.diagonal.getArray().copy()
+        else:
+            # Uniform variance fallback
+            variances = np.full(state_size, B_diag.min_eigenvalue())
+
+        B_corr = DenseCovariance.from_correlation(
+            self.comm, correlation, variances, inverse_method="cholesky"
+        )
+
+        self.log(f"  Spatial correlation: Gaussian L={correlation_length:.0f}m")
+        self.log(f"    Dense B: {state_size}x{state_size}, "
+                 f"min eigenvalue ≈ {B_corr.min_eigenvalue():.4e}")
+
+        return B_corr
 
     def _estimate_component_variances(self, n_vars: int = 3):
         """Estimate component-specific variances from truth state."""
@@ -1156,7 +1230,7 @@ class TwinExperiment:
         self.problem.t = t_start
         return ForwardModelWrapper(self.solver, self.problem, self.solver_params, t_start=t_start)
 
-    def _setup_cost_function(self, forward_model, obs_operator, B, R, obs_times):
+    def _setup_cost_function(self, forward_model, obs_operator, B, R, obs_times, B_lwme=None):
         """Setup the DA cost function."""
         if self.config.method == "4dvar":
             cost_function = FourDVarCost(
@@ -1184,6 +1258,7 @@ class TwinExperiment:
                 max_inflate_factor=self.config.max_inflate_factor,
                 predictability_gamma=self.config.predictability_gamma,
                 adaptive_gamma=self.config.adaptive_gamma,
+                B_lwme=B_lwme,
                 comm=self.comm,
             )
         else:
@@ -1232,6 +1307,7 @@ class TwinExperiment:
         opt_options = {
             "max_iterations": self.config.max_iterations,
             "gradient_tolerance": self.config.gradient_tolerance,
+            "gradient_relative_tolerance": 0.0,  # Disable grtol; use gatol only
             "cost_tolerance": self.config.cost_tolerance,
             "verbose": (self.rank == 0),
         }
@@ -1498,7 +1574,7 @@ class TwinExperiment:
 
         # Step 5: Setup covariance matrices
         self.log("\nStep 5: Setting up covariance matrices...")
-        B, R = self._setup_covariances(obs_operator, obs_noise_stds)
+        B, R, B_lwme = self._setup_covariances(obs_operator, obs_noise_stds)
 
         # Cycling loop
         all_cost_history = []
@@ -1546,7 +1622,7 @@ class TwinExperiment:
             orig_observations = self.observations
             self.observations = window_observations
             cost_function = self._setup_cost_function(
-                forward_model, obs_operator, B, R, window_local_times
+                forward_model, obs_operator, B, R, window_local_times, B_lwme=B_lwme
             )
             self.observations = orig_observations
 
@@ -1692,15 +1768,25 @@ class MassMatrixPreconditionedCost:
         grad = self.base_cost.gradient(m)
         precond_grad = grad.duplicate()
         self._ksp.solve(grad, precond_grad)
+        # Scale to preserve original gradient magnitude (M^{-1} direction, ||grad|| magnitude)
+        raw_norm = grad.norm()
+        precond_norm = precond_grad.norm()
+        if precond_norm > 0:
+            precond_grad.scale(raw_norm / precond_norm)
         return precond_grad
 
     def value_gradient(self, m: PETSc.Vec):
         cost, grad = self.base_cost.value_gradient(m)
         precond_grad = grad.duplicate()
         self._ksp.solve(grad, precond_grad)
+        # Scale to preserve original gradient magnitude
+        raw_norm = grad.norm()
+        precond_norm = precond_grad.norm()
+        if precond_norm > 0:
+            precond_grad.scale(raw_norm / precond_norm)
         if not hasattr(self, '_logged'):
             self._logged = True
-            print(f"  [M⁻¹ precond] cost={cost:.4f}, ||grad_raw||={grad.norm():.4e}, ||grad_precond||={precond_grad.norm():.4e}, ratio={grad.norm()/(precond_grad.norm()+1e-30):.2f}")
+            print(f"  [M⁻¹ precond] cost={cost:.4f}, ||grad_raw||={raw_norm:.4e}, ||grad_precond||={precond_grad.norm():.4e}")
         return cost, precond_grad
 
     def clear_cache(self):
