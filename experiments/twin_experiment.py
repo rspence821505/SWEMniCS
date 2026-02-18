@@ -99,6 +99,8 @@ class TwinExperimentConfig:
     max_inflate_factor: float = 2.0  # Maximum B inflation factor to prevent optimizer instability
     predictability_gamma: float = 0.1  # Relaxation γ for predictability condition (paper eq. 36)
     adaptive_gamma: bool = True  # Spectrum-relative γ: floor = γ * λ_max(L_wme)
+    nonuniform_inflate: bool = False  # Per-eigenvalue boosting for sub-threshold L_wme eigenvalues
+    eigenvalue_boost_target: float = 2.0  # Target eigenvalue as multiple of γ
 
     # Perturbation seed for reproducibility
     perturbation_seed: int = 456
@@ -1259,6 +1261,8 @@ class TwinExperiment:
                 predictability_gamma=self.config.predictability_gamma,
                 adaptive_gamma=self.config.adaptive_gamma,
                 B_lwme=B_lwme,
+                nonuniform_inflate=self.config.nonuniform_inflate,
+                eigenvalue_boost_target=self.config.eigenvalue_boost_target,
                 comm=self.comm,
             )
         else:

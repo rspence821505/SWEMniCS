@@ -1093,6 +1093,8 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         predictability_gamma: float = 0.1,
         adaptive_gamma: bool = True,
         B_lwme=None,
+        nonuniform_inflate: bool = False,
+        eigenvalue_boost_target: float = 2.0,
         comm: Optional[MPI.Comm] = None,
         checkpointer=None,
     ):
@@ -1190,6 +1192,10 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         # Separate B for L_wme computation (None = use self.B)
         self._B_lwme = B_lwme
+
+        # Non-uniform eigenvalue inflation
+        self._nonuniform_inflate = nonuniform_inflate
+        self._eigenvalue_boost_target = eigenvalue_boost_target
 
         # Gram matrix diagnostics (populated during _compute_analytical_L_wme)
         self._gram_eigenvalues = None
@@ -1585,7 +1591,23 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         n_floored = np.sum(eigvals_full < gamma_floor)
         n_natural = np.sum(eigvals_full >= gamma_floor)
 
-        eigvals_reg = np.maximum(eigvals_full, gamma_floor)
+        if self._nonuniform_inflate:
+            # Non-uniform per-eigenvalue boosting: boost sub-threshold eigenvalues
+            # towards a target above γ, capped by max multiplicative boost per eigenvalue.
+            # Natural eigenvalues (already ≥ γ) are left untouched.
+            target = self._eigenvalue_boost_target * gamma_floor
+            eigvals_reg = eigvals_full.copy()
+            for i in range(len(eigvals_full)):
+                if eigvals_full[i] < gamma_floor:
+                    boosted = min(eigvals_full[i] * self._max_inflate_factor, target)
+                    eigvals_reg[i] = max(boosted, gamma_floor)
+            n_boosted = int(np.sum((eigvals_reg > gamma_floor) & (eigvals_full < gamma_floor)))
+            n_still_floored = int(np.sum(eigvals_reg <= gamma_floor))
+        else:
+            eigvals_reg = np.maximum(eigvals_full, gamma_floor)
+            n_boosted = 0
+            n_still_floored = n_floored
+
         L_dense = eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
 
         max_L_inv = 1.0 / gamma_floor
@@ -1606,6 +1628,22 @@ class DCWMEFourDVarCost(DCFourDVarCost):
                   f"all {n_obs} floored "
                   f"(max raw λ={eigvals_full.max():.4e}, "
                   f"weight={min_weight:.4f}, max L⁻¹={max_L_inv:.4f})")
+
+        if self._nonuniform_inflate:
+            boosted_vals = eigvals_reg[(eigvals_reg > gamma_floor) & (eigvals_full < gamma_floor)]
+            if n_boosted > 0:
+                boosted_weights = 1.0 - 1.0 / boosted_vals
+                print(f"  Non-uniform boost: {n_boosted} eigenvalues boosted above γ "
+                      f"(target={target:.2f}, max_boost={self._max_inflate_factor:.0f}x), "
+                      f"{n_still_floored} still floored")
+                print(f"    Boosted λ range: [{boosted_vals.min():.4e}, {boosted_vals.max():.4e}], "
+                      f"weight range: [{boosted_weights.min():.4f}, {boosted_weights.max():.4f}]")
+            else:
+                print(f"  Non-uniform boost: 0 eigenvalues boosted above γ "
+                      f"(all {n_floored} below γ/{self._max_inflate_factor:.0f}={gamma_floor/self._max_inflate_factor:.4e})")
+            n_effective = n_natural + n_boosted
+            print(f"  Effective predictable directions: {n_effective}/{n_obs} "
+                  f"({n_natural} natural + {n_boosted} boosted)")
 
         # Create DenseCovariance from dense matrix
         from .covariance import DenseCovariance
@@ -1920,6 +1958,8 @@ def create_cost_function(
             predictability_gamma=kwargs.get("predictability_gamma", 0.1),
             adaptive_gamma=kwargs.get("adaptive_gamma", True),
             B_lwme=kwargs.get("B_lwme"),
+            nonuniform_inflate=kwargs.get("nonuniform_inflate", False),
+            eigenvalue_boost_target=kwargs.get("eigenvalue_boost_target", 2.0),
         )
     else:
         raise ValueError(f"Unknown cost function variant: {variant}")
