@@ -121,9 +121,20 @@ class StationManager:
             # h_b is a Function - evaluate it directly
             self.station_bathy = self.h_b.eval(points_on_proc, self.cells).flatten()
         elif callable(self.h_b):
-            # h_b is a Python callable - interpolate it to a Function first
+            # h_b might be a UFL expression or a Python callable.
+            # UFL expressions (e.g. Function + Constant) are callable but
+            # cannot be passed directly to Function.interpolate() in newer
+            # DOLFINx versions.  Use fe.Expression as the bridge.
+            import ufl
             bathy_func = fe.Function(self.V_scalar)
-            bathy_func.interpolate(self.h_b)
+            if isinstance(self.h_b, ufl.core.expr.Expr):
+                expr = fe.Expression(
+                    self.h_b,
+                    self.V_scalar.element.interpolation_points(),
+                )
+                bathy_func.interpolate(expr)
+            else:
+                bathy_func.interpolate(self.h_b)
             self.station_bathy = bathy_func.eval(points_on_proc, self.cells).flatten()
         else:
             # h_b might be a scalar value

@@ -1,0 +1,32 @@
+{
+  "phase": 0.5,
+  "status": "success",
+  "overall_pass": true,
+  "pass_count": 9,
+  "fail_count": 0,
+  "total_dofs_tested": 9,
+  "config": {
+    "nt": 6,
+    "dt": 600.0,
+    "n_obs": 19,
+    "obs_times": [1, 2, 3, 4, 5, 6],
+    "epsilons": [0.001, 0.0001, 1e-05, 1e-06, 1e-07, 1e-08],
+    "reference_epsilon": 1e-05
+  },
+  "timing": {
+    "adjoint_s": 14.0,
+    "fd_total_s": 666.9
+  },
+  "evaluation_point": "m_true (truth IC, not background)",
+  "dof_results": [
+    {"dof": 20350, "component": "h", "region": "deep water (depth=50.2m)", "ratio_at_ref_eps": 1.0000, "status": "PASS"},
+    {"dof": 30872, "component": "h", "region": "deep water mid (depth=37.3m)", "ratio_at_ref_eps": 1.0000, "status": "PASS"},
+    {"dof": 3439, "component": "h", "region": "shallow/WD (depth=1.2m)", "ratio_at_ref_eps": 0.9997, "status": "PASS"},
+    {"dof": 35110, "component": "h", "region": "open boundary (depth=52.9m)", "ratio_at_ref_eps": 1.0000, "status": "PASS"},
+    {"dof": 23997, "component": "ux", "region": "deep water (depth=27.8m)", "ratio_at_ref_eps": 1.0005, "status": "PASS"},
+    {"dof": 4017, "component": "ux", "region": "shallow (depth=3.0m)", "ratio_at_ref_eps": 1.0185, "status": "PASS"},
+    {"dof": 23998, "component": "uy", "region": "deep water (depth=27.8m)", "ratio_at_ref_eps": 0.9953, "status": "PASS"},
+    {"dof": 3444, "component": "uy", "region": "shallow/WD (depth=1.2m)", "ratio_at_ref_eps": 1.0072, "status": "PASS"},
+    {"dof": 4624, "component": "ux", "region": "random (depth=1.7m)", "ratio_at_ref_eps": 1.0040, "status": "PASS"}
+  ]
+}

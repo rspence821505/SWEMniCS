@@ -1,0 +1,52 @@
+{
+  "phase": 0,
+  "status": "success",
+  "mesh_stats": {
+    "num_nodes": 3070,
+    "num_cells": 5780,
+    "num_boundary_facets": 358,
+    "h_dofs": 17340,
+    "total_dofs": 52020,
+    "open_boundary_dofs": 218,
+    "negative_depth_nodes": 14,
+    "has_mannings_n": false,
+    "n_tidal_constituents": 5
+  },
+  "bathymetry_stats": {
+    "depth_min": -2.3421907425,
+    "depth_max": 57.560005188,
+    "depth_mean": 27.422450094134728
+  },
+  "simulation_config": {
+    "dt": 600.0,
+    "T_hours": 12.0,
+    "nt": 72,
+    "solver_type": "DG",
+    "theta": 1.0,
+    "wd_alpha": 1.5,
+    "dramp": 2.0
+  },
+  "timing": {
+    "problem_setup_s": 0.06131696701049805,
+    "solver_setup_s": 0.5732717514038086,
+    "simulation_s": 79.10383319854736,
+    "time_per_step_s": 1.0986643499798245,
+    "total_s": 79.73842191696167
+  },
+  "newton_convergence": {
+    "min_iterations": -1,
+    "max_iterations": -1,
+    "mean_iterations": -1,
+    "total_timesteps": 72,
+    "converged_timesteps": 72,
+    "all_converged": true
+  },
+  "station_results": {},
+  "wd_stability": {
+    "h_min_global": -2.267503389445595,
+    "h_max_global": 57.61283126328053,
+    "n_wd_active_dofs": 803,
+    "h_dofs_total": 17340,
+    "wd_fraction": 0.04630911188004613
+  }
+}
