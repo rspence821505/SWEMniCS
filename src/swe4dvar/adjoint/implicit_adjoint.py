@@ -311,16 +311,16 @@ class ImplicitAdjointSolver:
         The flux mass matrix M_Q arises from the conservative time derivative:
             R_time = integral (dQ/dt) . v dx
 
-        where Q = [h, h*ux, h*uy] and the state variables are [h, ux, uy].
-        The cross-time derivative dR^{n+1}/du^n = -(c) * M_Q|_{u^n}.
+        where Q = [h_wd, h_wd*ux, h_wd*uy] and the state variables are [h, ux, uy].
+        Here h_wd = h + f(h) is the wetting-drying corrected depth (h_wd = h when
+        WD is disabled). The cross-time derivative dR^{n+1}/du^n = -(c) * M_Q|_{u^n}.
 
         The transpose action M_Q^T * lambda is:
-            (M_Q^T * lambda)_h  = integral (lambda_h + ux_s * lambda_ux + uy_s * lambda_uy) * v_h dx
-            (M_Q^T * lambda)_ux = integral (h_s * lambda_ux) * v_ux dx
-            (M_Q^T * lambda)_uy = integral (h_s * lambda_uy) * v_uy dx
+            (M_Q^T * lambda)_h  = integral dh_wd * (lambda_h + ux_s * lambda_ux + uy_s * lambda_uy) * v_h dx
+            (M_Q^T * lambda)_ux = integral (h_wd * lambda_ux) * v_ux dx
+            (M_Q^T * lambda)_uy = integral (h_wd * lambda_uy) * v_uy dx
 
-        This proper integration eliminates the pointwise DOF approximation error
-        that compounds exponentially over time steps.
+        where dh_wd = dh_wd/dh is the derivative of the WD correction (1 when WD disabled).
         """
         import os
         os.environ.setdefault("CC", "/usr/bin/clang")
@@ -341,9 +341,19 @@ class ImplicitAdjointSolver:
             self.flux_formulation = False
             return
 
+        # Detect wetting-drying from the forward model's problem
+        problem = None
+        if hasattr(self.forward_model, 'problem'):
+            problem = self.forward_model.problem
+        elif hasattr(self.forward_model, 'solver') and hasattr(self.forward_model.solver, 'problem'):
+            problem = self.forward_model.solver.problem
+        self._wd_active = problem is not None and hasattr(problem, 'wd') and problem.wd
+        self._wd_alpha = getattr(problem, 'wd_alpha', 0.05) if self._wd_active else None
+
         try:
             from dolfinx import fem
-            from ufl import TestFunction, split, inner, dx
+            from ufl import TestFunction, split, inner, dx, sqrt as ufl_sqrt
+            from petsc4py import PETSc
 
             self._flux_state_func = fem.Function(V)
             self._flux_lambda_func = fem.Function(V)
@@ -361,11 +371,26 @@ class ImplicitAdjointSolver:
             vel_l = split(self._flux_lambda_func)[1]
             ux_l, uy_l = vel_l[0], vel_l[1]
 
+            # Compute WD-corrected depth and its derivative
+            # The forward solver uses Q = [h_wd, h_wd*ux, h_wd*uy] where:
+            #   h_wd = h + 0.5*(sqrt(h^2 + alpha^2) - h)
+            #   dh_wd/dh = 0.5 + 0.5*h/sqrt(h^2 + alpha^2)
+            # Without WD: h_wd = h, dh_wd/dh = 1
+            if self._wd_active:
+                wd_alpha_sq = fem.Constant(V.mesh, PETSc.ScalarType(self._wd_alpha**2))
+                h_wd = h_s + 0.5 * (ufl_sqrt(h_s**2 + wd_alpha_sq) - h_s)
+                dh_wd = 0.5 + 0.5 * h_s / ufl_sqrt(h_s**2 + wd_alpha_sq)
+            else:
+                h_wd = h_s
+                dh_wd = 1.0
+
             # M_Q^T * lambda as a linear form in v:
-            # (dQ/du)^T = [[1, ux, uy], [0, h, 0], [0, 0, h]]
-            L = (inner(h_l + ux_s * ux_l + uy_s * uy_l, h_v) * dx
-                 + inner(h_s * ux_l, ux_v) * dx
-                 + inner(h_s * uy_l, uy_v) * dx)
+            # (dQ/du)^T = [[dh_wd,      dh_wd*ux, dh_wd*uy],
+            #              [0,           h_wd,     0        ],
+            #              [0,           0,        h_wd     ]]
+            L = (inner(dh_wd * (h_l + ux_s * ux_l + uy_s * uy_l), h_v) * dx
+                 + inner(h_wd * ux_l, ux_v) * dx
+                 + inner(h_wd * uy_l, uy_v) * dx)
 
             self._flux_mass_form = fem.form(L)
         except Exception as e:

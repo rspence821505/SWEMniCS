@@ -529,10 +529,14 @@ def run_phase_1(args):
     obs_fraction = 0.05     # ~135 obs points
     obs_frequency = 6       # Every 6 timesteps (= every hour)
     obs_noise_level = 0.01  # 1% noise
-    background_error_std = 0.02  # Reduced from 0.1 to keep perturbation physical
-    # 0.02 × mean(|h|)≈28.6m → h_std≈0.57m (vs 2.86m at 0.1 which
-    # clips 600 DOFs and causes Newton divergence in shallow regions)
-    max_iterations = 50
+    background_error_std = 0.02  # 2% perturbation (safe for forward solver; 0.05 crashes, 0.1 crashes worse)
+    cov_inflation_factor = 5000.0  # Inflate B so B^{-1} doesn't dominate
+    # With diagonal B and 52k DOFs, J_b(m_true) = 0.5*n_dofs/alpha ≈ 26010/alpha.
+    # Obs signal is only ~6 (J_o(m_b) - J_o(m_true) ≈ 924 - 918).
+    # Need alpha >> 26010/6 ≈ 4335 for optimizer to move toward truth.
+    # 4x inflation: J_b(m_true) ≈ 6503, cost barely changed (0.024% after 13 evals).
+    # 5000x inflation: J_b(m_true) ≈ 5.2, comparable to obs signal.
+    max_iterations = 20
 
     if rank == 0:
         print("=" * 70)
@@ -666,6 +670,13 @@ def run_phase_1(args):
     exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, obs_times)
     background_error = exp._setup_background()
     B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
+
+    # Inflate B to weaken B^{-1} penalty without increasing perturbation size
+    if cov_inflation_factor != 1.0:
+        B.diagonal.scale(cov_inflation_factor)
+        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
+        if rank == 0:
+            print(f"  B covariance inflated by {cov_inflation_factor}x")
 
     n_obs = obs_operator.get_num_observations()
     if rank == 0:

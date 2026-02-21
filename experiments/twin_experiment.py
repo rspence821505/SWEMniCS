@@ -1279,6 +1279,8 @@ class TwinExperiment:
             diag_arr = diag.getArray()
             self.log(f"  Applied M^{{-1}} gradient preconditioning (M diag: min={diag_arr.min():.2f}, max={diag_arr.max():.2f}, mean={diag_arr.mean():.2f})")
             diag.destroy()
+        else:
+            self.log(f"  No mass matrix available; M^{{-1}} preconditioning skipped")
 
         # Wrap with boundary gradient zeroing if needed
         if self.config.interior_only:
@@ -1314,6 +1316,7 @@ class TwinExperiment:
             "gradient_relative_tolerance": 0.0,  # Disable grtol; use gatol only
             "cost_tolerance": self.config.cost_tolerance,
             "verbose": (self.rank == 0),
+            "line_search_initial_step": 1.0,  # Standard for L-BFGS (direction already scaled by approx inverse Hessian)
         }
 
         if self.config.use_bounds:
@@ -1754,16 +1757,23 @@ class MassMatrixPreconditionedCost:
     Preconditioning by M^{-1} converts the functional derivative to the
     Riesz gradient in the L²-inner product, giving ||g|| ~ O(1).
     The converged solution is identical (M is SPD so g=0 iff ∇J=0).
+
+    Uses diagonal M^{-1} scaling (lumped mass) instead of full M^{-1}
+    to preserve the gradient direction more faithfully. The diagonal
+    mass matrix handles per-element scaling without the severe direction
+    distortion that can occur with full M^{-1} on meshes with highly
+    variable element sizes.
     """
 
     def __init__(self, base_cost, mass_matrix: PETSc.Mat):
         self.base_cost = base_cost
         self.M = mass_matrix
-        self._ksp = PETSc.KSP().create(mass_matrix.getComm())
-        self._ksp.setOperators(mass_matrix)
-        self._ksp.setType("preonly")
-        self._ksp.getPC().setType("lu")
-        self._ksp.setUp()
+        # Use diagonal (lumped) mass matrix for scaling
+        self._M_diag = mass_matrix.getDiagonal()
+        self._M_diag_inv = self._M_diag.duplicate()
+        diag_arr = self._M_diag.getArray()
+        inv_arr = np.where(diag_arr > 0, 1.0 / diag_arr, 0.0)
+        self._M_diag_inv.setArray(inv_arr)
 
     def value(self, m: PETSc.Vec) -> float:
         return self.base_cost.value(m)
@@ -1771,26 +1781,18 @@ class MassMatrixPreconditionedCost:
     def gradient(self, m: PETSc.Vec) -> PETSc.Vec:
         grad = self.base_cost.gradient(m)
         precond_grad = grad.duplicate()
-        self._ksp.solve(grad, precond_grad)
-        # Scale to preserve original gradient magnitude (M^{-1} direction, ||grad|| magnitude)
-        raw_norm = grad.norm()
-        precond_norm = precond_grad.norm()
-        if precond_norm > 0:
-            precond_grad.scale(raw_norm / precond_norm)
+        precond_grad.pointwiseMult(grad, self._M_diag_inv)
         return precond_grad
 
     def value_gradient(self, m: PETSc.Vec):
         cost, grad = self.base_cost.value_gradient(m)
         precond_grad = grad.duplicate()
-        self._ksp.solve(grad, precond_grad)
-        # Scale to preserve original gradient magnitude
-        raw_norm = grad.norm()
-        precond_norm = precond_grad.norm()
-        if precond_norm > 0:
-            precond_grad.scale(raw_norm / precond_norm)
+        precond_grad.pointwiseMult(grad, self._M_diag_inv)
         if not hasattr(self, '_logged'):
             self._logged = True
-            print(f"  [M⁻¹ precond] cost={cost:.4f}, ||grad_raw||={raw_norm:.4e}, ||grad_precond||={precond_grad.norm():.4e}")
+            raw_norm = grad.norm()
+            precond_norm = precond_grad.norm()
+            print(f"  [diag M⁻¹ precond] cost={cost:.4f}, ||grad_raw||={raw_norm:.4e}, ||grad_precond||={precond_norm:.4e}")
         return cost, precond_grad
 
     def clear_cache(self):

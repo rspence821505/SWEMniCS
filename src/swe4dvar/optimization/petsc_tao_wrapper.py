@@ -218,8 +218,14 @@ class PETScTAOWrapper(Optimizer):
 
                 # Check for infinity (forward model failure)
                 if not np.isfinite(f):
+                    if self.verbose and self.comm.rank == 0:
+                        print(f"  [TAO callback] eval #{self.n_func_evals}: cost=inf (forward model failure)")
                     g.zeroEntries()
                     return 1e20
+
+                gnorm = grad.norm()
+                if self.verbose and self.comm.rank == 0:
+                    print(f"  [TAO callback] eval #{self.n_func_evals}: cost={f:.6f}, ||grad||={gnorm:.4e}")
 
                 # Copy gradient values into output vector g
                 # PETSc copy: source.copy(dest) copies FROM source TO dest

@@ -558,22 +558,27 @@ class FourDVarCost(CostFunction):
             variational_form = getattr(self.forward_model.solver, 'var_form', None)
 
         # Get boundary DOFs for proper adjoint BC handling
-        # For discrete adjoint (DTO), we need to zero the adjoint at all boundary DOFs
-        # This uses topological detection to find ALL boundary DOFs, including
-        # those from wall BCs (velocity) that the problem may not explicitly track
+        # Only zero boundary DOF gradients when there are STRONG Dirichlet BCs.
+        # For DG with weakly-enforced BCs (dirichlet_bcs=[]), all DOFs are
+        # part of the control space and should NOT be zeroed.
         bc_dof_indices = None
-        if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model, 'problem'):
-            # ForwardModelWrapper provides access to solver and problem
-            V = self.forward_model.solver.V
-            mesh = self.forward_model.problem.mesh
-            boundary_dofs = get_boundary_dofs(V, mesh)
-            bc_dof_indices = set(boundary_dofs.tolist())
-        elif hasattr(self.forward_model, 'V') and hasattr(self.forward_model, 'mesh'):
-            # Direct solver access
-            V = self.forward_model.V
-            mesh = self.forward_model.mesh
-            boundary_dofs = get_boundary_dofs(V, mesh)
-            bc_dof_indices = set(boundary_dofs.tolist())
+        problem = getattr(self.forward_model, 'problem', None)
+        has_strong_bcs = (
+            problem is not None
+            and hasattr(problem, 'dirichlet_bcs')
+            and len(problem.dirichlet_bcs) > 0
+        )
+        if has_strong_bcs:
+            if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model, 'problem'):
+                V = self.forward_model.solver.V
+                mesh = self.forward_model.problem.mesh
+                boundary_dofs = get_boundary_dofs(V, mesh)
+                bc_dof_indices = set(boundary_dofs.tolist())
+            elif hasattr(self.forward_model, 'V') and hasattr(self.forward_model, 'mesh'):
+                V = self.forward_model.V
+                mesh = self.forward_model.mesh
+                boundary_dofs = get_boundary_dofs(V, mesh)
+                bc_dof_indices = set(boundary_dofs.tolist())
 
         adjoint_solver = ImplicitAdjointSolver(
             self.forward_model,
@@ -581,7 +586,8 @@ class FourDVarCost(CostFunction):
             jacobians,
             self.forward_model.dt,
             variational_form=variational_form,
-            bc_dof_indices=bc_dof_indices  # Pass boundary DOFs for proper adjoint BCs
+            bc_dof_indices=bc_dof_indices,  # Pass boundary DOFs for proper adjoint BCs
+            flux_formulation=True,  # SWE uses conservative variables Q=[h, h*ux, h*uy]
         )
 
         # Terminal condition (usually zero)
