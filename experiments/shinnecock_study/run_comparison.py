@@ -519,24 +519,21 @@ def run_phase_1(args):
     comm.Barrier()
 
     # ================================================================
-    # Configuration
+    # Configuration - FULL PHASE 1 (2-3 hour runtime)
     # ================================================================
     dt = 600.0          # 10-min timestep
-    nt_ramp = 288       # 48h ramp (288 × 600s = 172800s)
-    nt_da = 72          # 12h DA window (72 × 600s = 43200s)
+    nt_ramp = 288       # 48h ramp (288 × 600s = 172800s) - FULL CONFIG
+    nt_da = 72          # 12h DA window (72 × 600s = 43200s) - FULL CONFIG
     nt_total = nt_ramp + nt_da  # 360 timesteps = 60h
 
-    obs_fraction = 0.05     # ~135 obs points
-    obs_frequency = 6       # Every 6 timesteps (= every hour)
+    obs_fraction = 0.5      # 50% obs points for Phase 1 (4D-Var only, no DC-WME cost)
+    obs_frequency = 2       # Every 2 timesteps (= every 20 min)
     obs_noise_level = 0.01  # 1% noise
-    background_error_std = 0.02  # 2% perturbation (safe for forward solver; 0.05 crashes, 0.1 crashes worse)
-    cov_inflation_factor = 5000.0  # Inflate B so B^{-1} doesn't dominate
-    # With diagonal B and 52k DOFs, J_b(m_true) = 0.5*n_dofs/alpha ≈ 26010/alpha.
-    # Obs signal is only ~6 (J_o(m_b) - J_o(m_true) ≈ 924 - 918).
-    # Need alpha >> 26010/6 ≈ 4335 for optimizer to move toward truth.
-    # 4x inflation: J_b(m_true) ≈ 6503, cost barely changed (0.024% after 13 evals).
-    # 5000x inflation: J_b(m_true) ≈ 5.2, comparable to obs signal.
-    max_iterations = 20
+    background_error_std = 0.01  # 1.0% perturbation (1.5% fails at full scale due to WD regions)
+    cov_inflation_factor = 10.0  # Balance J_b and J_o (2000x caused overfitting to noisy obs)
+    # With inflation=2000, J_b~0.37 << J_o~4600 → severe imbalance, overfits to noise
+    # With inflation=10, J_b~74 ~ 0.1*J_o → better balance, prevents overfitting
+    max_iterations = 25     # Full config for production run
 
     if rank == 0:
         print("=" * 70)

@@ -148,8 +148,13 @@ class PETScTAOWrapper(Optimizer):
         except Exception:
             pass  # Line search config not supported for all TAO types
 
-        # Apply additional TAO-specific options
+        # Apply additional TAO-specific options (calls setFromOptions())
         self._apply_tao_options()
+
+        # Re-apply max iterations and tolerances AFTER setFromOptions(),
+        # which may override programmatic settings from the options database
+        self.tao.setMaximumIterations(max_iter)
+        self.tao.setTolerances(gatol=gatol, grtol=grtol, gttol=gttol)
 
         # Set up monitoring
         if self.use_tao_monitor:
@@ -220,7 +225,15 @@ class PETScTAOWrapper(Optimizer):
                 if not np.isfinite(f):
                     if self.verbose and self.comm.rank == 0:
                         print(f"  [TAO callback] eval #{self.n_func_evals}: cost=inf (forward model failure)")
-                    g.zeroEntries()
+                    # CRITICAL FIX: Don't set gradient to zero! TAO will think it converged.
+                    # Instead, return background penalty gradient to push back toward m_b
+                    if hasattr(self.cost_function, 'compute_background_gradient'):
+                        grad_b = self.cost_function.compute_background_gradient(x)
+                        grad_b.copy(g)
+                        grad_b.destroy()
+                    else:
+                        # Fallback: set small non-zero gradient to prevent TAO from thinking it converged
+                        g.set(1e-10)
                     return 1e20
 
                 gnorm = grad.norm()
@@ -239,7 +252,15 @@ class PETScTAOWrapper(Optimizer):
 
                 # Check for infinity (forward model failure)
                 if not np.isfinite(f):
-                    g.zeroEntries()
+                    # CRITICAL FIX: Don't set gradient to zero! TAO will think it converged.
+                    # Instead, return background penalty gradient to push back toward m_b
+                    if hasattr(self.cost_function, 'compute_background_gradient'):
+                        grad_b = self.cost_function.compute_background_gradient(x)
+                        grad_b.copy(g)
+                        grad_b.destroy()
+                    else:
+                        # Fallback: set small non-zero gradient to prevent TAO from thinking it converged
+                        g.set(1e-10)
                     return 1e20
 
                 # Compute gradient
@@ -251,7 +272,7 @@ class PETScTAOWrapper(Optimizer):
 
                 return f
         except Exception as e:
-            # Forward model failed - return large cost and zero gradient
+            # Forward model failed - return large cost and background gradient
             import warnings
             warnings.warn(
                 f"TAO callback: forward model failed: {e}. "
@@ -259,7 +280,14 @@ class PETScTAOWrapper(Optimizer):
                 RuntimeWarning,
                 stacklevel=2
             )
-            g.zeroEntries()
+            # CRITICAL FIX: Don't set gradient to zero! TAO will think it converged.
+            if hasattr(self.cost_function, 'compute_background_gradient'):
+                grad_b = self.cost_function.compute_background_gradient(x)
+                grad_b.copy(g)
+                grad_b.destroy()
+            else:
+                # Fallback: set small non-zero gradient to prevent TAO from thinking it converged
+                g.set(1e-10)
             return 1e20
 
     def _tao_monitor_callback(self, tao: PETSc.TAO):

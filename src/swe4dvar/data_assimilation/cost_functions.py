@@ -525,6 +525,33 @@ class FourDVarCost(CostFunction):
 
         return cost, grad
 
+    def compute_background_gradient(self, m: PETSc.Vec) -> PETSc.Vec:
+        """
+        Compute only the background penalty gradient B⁻¹(m - m_b).
+
+        This is useful when the forward model fails - we can still
+        return a valid gradient pointing back toward the background,
+        preventing TAO from thinking it has converged.
+
+        Parameters
+        ----------
+        m : PETSc.Vec
+            Current control variable.
+
+        Returns
+        -------
+        PETSc.Vec
+            Background gradient B⁻¹(m - m_b).
+        """
+        # Compute deviation from background
+        delta_m = m.duplicate()
+        delta_m.waxpy(-1.0, self.m_b, m)  # delta_m = m - m_b
+
+        # Apply B⁻¹
+        grad_background = self.B.apply_inverse(delta_m)
+
+        return grad_background
+
     def _solve_adjoint(
         self, trajectory: List[PETSc.Vec], jacobians: List[PETSc.Mat]
     ) -> PETSc.Vec:

@@ -478,6 +478,9 @@ class TwinExperiment:
 
     def _generate_truth(self):
         """Generate truth trajectory by running forward model."""
+        # Store DA window start time (after warmup) for correct evaluation
+        self.t_da_start = self.problem.t
+
         # Run forward model
         self.solver.time_loop(
             solver_parameters=self.solver_params,
@@ -891,34 +894,51 @@ class TwinExperiment:
     def _generate_interior_observation_points(
         self, boundary_tol: float = 1e-10
     ) -> np.ndarray:
-        """Generate observation points from interior mesh nodes only."""
-        rng = np.random.default_rng(self.config.obs_seed)
-        coords = self.problem.mesh.geometry.x
+        """Generate observation points from interior mesh nodes only.
 
-        # Domain bounds
-        x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
-        y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+        IMPORTANT: In parallel, mesh.geometry.x is LOCAL to each rank.
+        We must gather ALL coordinates to rank 0, generate points there,
+        then broadcast to all ranks for consistency.
+        """
+        # Gather all coordinates to rank 0
+        local_coords = self.problem.mesh.geometry.x
+        all_coords = self.comm.gather(local_coords, root=0)
 
-        # Interior nodes mask
-        interior_mask = (
-            (coords[:, 0] > x_min + boundary_tol)
-            & (coords[:, 0] < x_max - boundary_tol)
-            & (coords[:, 1] > y_min + boundary_tol)
-            & (coords[:, 1] < y_max - boundary_tol)
-        )
-        interior_indices = np.where(interior_mask)[0]
+        if self.comm.rank == 0:
+            # Concatenate all coordinates from all ranks
+            coords = np.vstack(all_coords)
 
-        if len(interior_indices) == 0:
-            raise ValueError("No interior nodes found. Mesh may be too coarse.")
+            rng = np.random.default_rng(self.config.obs_seed)
 
-        n_obs = max(1, int(len(interior_indices) * self.config.obs_fraction))
-        selected = rng.choice(
-            len(interior_indices), size=min(n_obs, len(interior_indices)), replace=False
-        )
-        selected_indices = interior_indices[selected]
+            # Domain bounds (now using GLOBAL coordinates)
+            x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+            y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
 
-        obs_points = np.zeros((len(selected_indices), 3))
-        obs_points[:, : coords.shape[1]] = coords[selected_indices, :]
+            # Interior nodes mask
+            interior_mask = (
+                (coords[:, 0] > x_min + boundary_tol)
+                & (coords[:, 0] < x_max - boundary_tol)
+                & (coords[:, 1] > y_min + boundary_tol)
+                & (coords[:, 1] < y_max - boundary_tol)
+            )
+            interior_indices = np.where(interior_mask)[0]
+
+            if len(interior_indices) == 0:
+                raise ValueError("No interior nodes found. Mesh may be too coarse.")
+
+            n_obs = max(1, int(len(interior_indices) * self.config.obs_fraction))
+            selected = rng.choice(
+                len(interior_indices), size=min(n_obs, len(interior_indices)), replace=False
+            )
+            selected_indices = interior_indices[selected]
+
+            obs_points = np.zeros((len(selected_indices), 3))
+            obs_points[:, : coords.shape[1]] = coords[selected_indices, :]
+        else:
+            obs_points = None
+
+        # Broadcast observation points from rank 0 to all ranks
+        obs_points = self.comm.bcast(obs_points, root=0)
         return obs_points
 
     def _generate_observations(self, obs_operator, obs_times):
@@ -1268,11 +1288,11 @@ class TwinExperiment:
         else:
             raise ValueError(f"Unknown DA method: {self.config.method}")
 
-        # Precondition gradient by M^{-1} for DG elements
-        # The adjoint gradient includes M from ∂R/∂u₀ = -M/dt, making ||∇J|| ~ O(M).
-        # M⁻¹ converts to L² Riesz gradient. Both terms (background + adjoint) are
-        # transformed consistently so the result is a valid descent direction.
-        if hasattr(forward_model, 'get_mass_matrix'):
+        # DISABLE M^{-1} preconditioning - causes ill-conditioning with DG
+        # Mass matrix range [187, 460513] creates 2450x scaling variation
+        # This makes gradients tiny and optimizer stuck
+        # TODO: Investigate proper preconditioning (maybe scaled M^{-1} or different approach)
+        if False and hasattr(forward_model, 'get_mass_matrix'):
             M = forward_model.get_mass_matrix()
             cost_function = MassMatrixPreconditionedCost(cost_function, M)
             diag = M.getDiagonal()
@@ -1280,7 +1300,7 @@ class TwinExperiment:
             self.log(f"  Applied M^{{-1}} gradient preconditioning (M diag: min={diag_arr.min():.2f}, max={diag_arr.max():.2f}, mean={diag_arr.mean():.2f})")
             diag.destroy()
         else:
-            self.log(f"  No mass matrix available; M^{{-1}} preconditioning skipped")
+            self.log(f"  M^{{-1}} preconditioning DISABLED (causes ill-conditioning)")
 
         # Wrap with boundary gradient zeroing if needed
         if self.config.interior_only:
@@ -1399,9 +1419,12 @@ class TwinExperiment:
         else:
             eval_solver = get_solver("SUPG")(self.problem, theta=0.5, p_degree=[1, 1], verbose=False)
 
-        self.problem.t = 0.0
+        # CRITICAL FIX: Use the same start time as truth generation (not t=0!)
+        # The truth was generated after warmup at t=t_da_start
+        # Analysis must start from the same time to match observations
+        self.problem.t = getattr(self, 't_da_start', 0.0)
 
-        # Update boundary conditions for t=0
+        # Update boundary conditions for the CORRECT time (t_da_start, not t=0!)
         if hasattr(self.problem, 'update_boundary'):
             self.problem.update_boundary()
 
