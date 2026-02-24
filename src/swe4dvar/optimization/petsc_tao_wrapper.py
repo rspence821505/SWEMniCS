@@ -218,6 +218,7 @@ class PETScTAOWrapper(Optimizer):
             # Use efficient combined method if available (avoids double forward solve)
             if hasattr(self.cost_function, 'value_gradient'):
                 f, grad = self.cost_function.value_gradient(x)
+
                 self.n_func_evals += 1
                 self.n_grad_evals += 1
 
@@ -244,6 +245,7 @@ class PETScTAOWrapper(Optimizer):
                 # PETSc copy: source.copy(dest) copies FROM source TO dest
                 grad.copy(g)
                 grad.destroy()
+
                 return f
             else:
                 # Fallback to separate calls (less efficient, but works with any cost function)

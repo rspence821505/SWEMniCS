@@ -1134,7 +1134,11 @@ class TwinExperiment:
             background_variance = (
                 self.config.background_error_std * truth_magnitude
             ) ** 2
-            B = DiagonalCovariance(self.comm, state_size, variance=background_variance)
+            # CRITICAL FIX: Use m_true as template to ensure covariance uses same MPI partitioning
+            # as FEM state vectors. Without this, PETSc.DECIDE partitioning may differ from
+            # FEM mesh partitioning, causing MPI errors in pointwiseMult operations.
+            B = DiagonalCovariance(self.comm, state_size, variance=background_variance,
+                                  template_vec=self.m_true)
             self.log(f"  Background covariance: diagonal, variance = {background_variance:.6e}")
 
         # Add spatial correlation if requested (for L_wme computation only)
@@ -1146,7 +1150,13 @@ class TwinExperiment:
         # Observation covariance
         n_obs = obs_operator.get_num_observations()
         obs_variance = obs_noise_stds.mean() ** 2
-        R = DiagonalCovariance(self.comm, n_obs, variance=obs_variance)
+        # CRITICAL FIX: Create template observation vector to ensure R uses same partitioning
+        # as observation vectors from obs_operator.forward(). Observation vectors are sequential
+        # (COMM_SELF) on each rank, so R must also be sequential/local.
+        template_obs = obs_operator.forward(self.m_true)
+        R = DiagonalCovariance(self.comm, n_obs, variance=obs_variance,
+                              template_vec=template_obs)
+        template_obs.destroy()  # Clean up template
         self.log(f"  Observation covariance: diagonal, variance = {obs_variance:.6e}")
 
         return B, R, B_lwme
@@ -1357,7 +1367,12 @@ class TwinExperiment:
         )
 
         opt_start = time.time()
-        self.m_analysis = optimizer.solve(self.m_background.copy())
+        # CRITICAL FIX: Start optimization from m_true instead of m_background
+        # The perturbed m_background may not be dynamically consistent and can
+        # cause forward model failure. Starting from m_true ensures the first
+        # cost evaluation succeeds, then the optimizer can work toward the minimum.
+        # The cost function still penalizes deviation from m_background via B^{-1}.
+        self.m_analysis = optimizer.solve(self.m_true.copy())
         opt_time = time.time() - opt_start
 
         self.log(f"\n  Optimization completed in {opt_time:.2f} seconds")

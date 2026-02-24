@@ -511,13 +511,37 @@ class FourDVarCost(CostFunction):
         observation_term = self._compute_observation_term(trajectory)
         cost = background_term + observation_term
 
+        # Check for non-finite cost
+        if not np.isfinite(cost):
+            import warnings
+            warnings.warn(
+                f"Cost is not finite! background_term={background_term}, "
+                f"observation_term={observation_term}, cost={cost}",
+                RuntimeWarning,
+                stacklevel=2
+            )
+
         # Compute gradient (same as gradient() but reuses trajectory/jacobians)
         delta_m = m.duplicate()
         delta_m.waxpy(-1.0, self.m_b, m)
         grad_background = self.B.apply_inverse(delta_m)
 
         # Adjoint solve (uses cached jacobians)
-        lambda_0 = self._solve_adjoint(trajectory, jacobians)
+        try:
+            lambda_0 = self._solve_adjoint(trajectory, jacobians)
+        except Exception as e:
+            # Adjoint solve failed - return finite cost but background-only gradient
+            import warnings
+            import traceback
+            warnings.warn(
+                f"Adjoint solve failed during value_gradient: {e}\n"
+                f"Traceback: {traceback.format_exc()}\n"
+                "Returning finite cost but background-only gradient.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+            # Return finite cost but only background gradient (observation gradient = 0)
+            return cost, grad_background
 
         # Total gradient: ∇J = B⁻¹(m - m_b) + λ₀
         grad = grad_background.copy()

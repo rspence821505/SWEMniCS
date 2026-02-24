@@ -49,7 +49,7 @@ class CovarianceMatrix(ABC):
         Local size on this MPI rank
     """
 
-    def __init__(self, comm: MPI.Comm, size: int):
+    def __init__(self, comm: MPI.Comm, size: int, template_vec: Optional[PETSc.Vec] = None):
         """Initialize covariance matrix.
 
         Parameters
@@ -58,17 +58,27 @@ class CovarianceMatrix(ABC):
             MPI communicator
         size : int
             Global size of the covariance matrix
+        template_vec : PETSc.Vec, optional
+            Template vector to match partitioning. If provided, the covariance
+            will use the same MPI partitioning as this vector. If None, PETSc
+            will automatically determine partitioning (may not match FEM vectors).
         """
         self.comm = comm
         self.size = size
 
         # Determine local size for this rank
-        ownership_range = PETSc.Vec().create(comm=comm)
-        ownership_range.setSizes((PETSc.DECIDE, size))
-        ownership_range.setUp()
-        self.local_size = ownership_range.getLocalSize()
-        self.ownership_range = ownership_range.getOwnershipRange()
-        ownership_range.destroy()
+        if template_vec is not None:
+            # Use partitioning from template vector
+            self.local_size = template_vec.getLocalSize()
+            self.ownership_range = template_vec.getOwnershipRange()
+        else:
+            # Let PETSc decide partitioning automatically
+            ownership_range = PETSc.Vec().create(comm=comm)
+            ownership_range.setSizes((PETSc.DECIDE, size))
+            ownership_range.setUp()
+            self.local_size = ownership_range.getLocalSize()
+            self.ownership_range = ownership_range.getOwnershipRange()
+            ownership_range.destroy()
 
     @abstractmethod
     def apply(self, v: PETSc.Vec, out: Optional[PETSc.Vec] = None) -> PETSc.Vec:
@@ -211,6 +221,7 @@ class DiagonalCovariance(CovarianceMatrix):
         size: int,
         variance: Optional[float] = None,
         diagonal: Optional[Union[np.ndarray, PETSc.Vec]] = None,
+        template_vec: Optional[PETSc.Vec] = None,
     ):
         """Initialize diagonal covariance matrix.
 
@@ -224,12 +235,15 @@ class DiagonalCovariance(CovarianceMatrix):
             Uniform variance (σ²) for all entries
         diagonal : np.ndarray or PETSc.Vec, optional
             Diagonal entries (variances). If ndarray, must have length = size.
+        template_vec : PETSc.Vec, optional
+            Template vector for MPI partitioning. If provided, covariance will
+            use same partitioning as this vector (important for FEM meshes).
 
         Notes
         -----
         Exactly one of variance or diagonal must be provided.
         """
-        super().__init__(comm, size)
+        super().__init__(comm, size, template_vec=template_vec)
 
         if (variance is None and diagonal is None) or (
             variance is not None and diagonal is not None
@@ -462,7 +476,10 @@ class ScaledCovariance(CovarianceMatrix):
         scale_factor : float
             Scale factor α (L_scaled = α * L_base).
         """
-        super().__init__(base_cov.comm, base_cov.size)
+        # Create a template vector from base covariance to ensure matching partitioning
+        template = base_cov.create_vec()
+        super().__init__(base_cov.comm, base_cov.size, template_vec=template)
+        template.destroy()
         self.base_cov = base_cov
         self.scale_factor = scale_factor
 
