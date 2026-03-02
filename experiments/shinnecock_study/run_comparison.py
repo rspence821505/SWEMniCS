@@ -522,9 +522,9 @@ def run_phase_1(args):
     # Configuration - FULL PHASE 1 (2-3 hour runtime)
     # ================================================================
     dt = 600.0          # 10-min timestep
-    nt_ramp = 288       # 48h ramp (288 × 600s = 172800s) - FULL CONFIG
-    nt_da = 72          # 12h DA window (72 × 600s = 43200s) - FULL CONFIG
-    nt_total = nt_ramp + nt_da  # 360 timesteps = 60h
+    nt_ramp = 144       # 24h ramp (144 × 600s = 86400s) - INTERMEDIATE TEST
+    nt_da = 36          # 6h DA window (36 × 600s = 21600s) - INTERMEDIATE TEST
+    nt_total = nt_ramp + nt_da  # 180 timesteps = 30h
 
     obs_fraction = 0.5      # 50% obs points for Phase 1 (4D-Var only, no DC-WME cost)
     obs_frequency = 2       # Every 2 timesteps (= every 20 min)
@@ -576,13 +576,15 @@ def run_phase_1(args):
         comm=comm, error_if_not_converged=True,
     )
 
-    # Direct LU for DA forward solves (robust for perturbed states where
-    # GMRES+ILU diverges due to white-noise DG cell-to-cell jumps)
+    # GMRES+bjacobi for DA forward solves - iterative solver uses far less RAM
+    # than direct LU (MUMPS). Starting from m_true means the state is physical,
+    # so GMRES converges without the instability seen with perturbed m_background.
+    # max_it=25 and reduction_it=10: if Newton stalls after 10 iters, halve relax param.
     da_solver_params = get_default_solver_params(
-        rtol=1e-5, atol=1e-6, max_it=15,
+        rtol=1e-5, atol=1e-6, max_it=25,
         relaxation_parameter=1.0,
-        ksp_type="preonly", pc_type="lu",
-        comm=comm, error_if_not_converged=True,
+        comm=comm, error_if_not_converged=False,
+        reduction_it=10,
     )
 
     if rank == 0:

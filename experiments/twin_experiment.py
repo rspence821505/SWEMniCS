@@ -311,13 +311,11 @@ class TwinExperiment:
         self.solver_params = solver_params or get_default_solver_params(
             rtol=1e-5,
             atol=1e-6,
-            max_it=10,
+            max_it=25,
             relaxation_parameter=1.0,
             comm=self.comm,
-            error_if_not_converged=True,
-            # Override to use direct solver for stability
-            ksp_type="preonly",
-            pc_type="lu",
+            error_if_not_converged=False,
+            reduction_it=10,
         )
 
         # Extract problem name
@@ -492,10 +490,22 @@ class TwinExperiment:
             monitor_progress=(self.rank == 0 and self.config.verbose),
         )
 
-        # Store truth trajectory
+        # Store truth trajectory using FEM-consistent vector creation
+        # CRITICAL: Must use la.create_petsc_vector with the FEM index map to ensure
+        # vectors have global size = sum of owned DOFs (excluding ghosts).
+        # Using createWithArray(full_array, comm=COMM_WORLD) would include ghost DOFs
+        # in the global size, causing size mismatches with vectors created during
+        # the forward model solve (which use la.create_petsc_vector).
+        from dolfinx import la
+        u_owned_size = self.solver.V.dofmap.index_map.size_local * self.solver.V.dofmap.index_map_bs
         self.truth_trajectory = []
         for state_array in self.solver.storage.saved_states:
-            vec = PETSc.Vec().createWithArray(state_array.copy(), comm=self.comm)
+            vec = la.create_petsc_vector(
+                self.solver.V.dofmap.index_map,
+                self.solver.V.dofmap.index_map_bs,
+            )
+            vec.setArray(state_array[:u_owned_size])
+            vec.assemble()
             self.truth_trajectory.append(vec)
 
         # True initial condition
@@ -972,8 +982,13 @@ class TwinExperiment:
         self.log(f"  Observations generated with mean noise std: {np.mean(noise_stds):.6f}")
         return observations, np.array(noise_stds)
 
-    def _get_component_dof_indices(self):
+    def _get_component_dof_indices(self, owned_only: bool = False):
         """Get DOF indices for each component (h, u, v) using function space structure.
+
+        Args:
+            owned_only: If True, filter to only owned DOFs (excluding ghost DOFs).
+                       Use this when indexing into PETSc vectors created with
+                       la.create_petsc_vector which only contain owned DOFs.
 
         Returns tuple of (h_indices, u_indices, v_indices) as numpy arrays.
         """
@@ -994,10 +1009,19 @@ class TwinExperiment:
             u_indices = uv_indices[0::2]
             v_indices = uv_indices[1::2]
 
+            if owned_only:
+                # Filter to only owned DOFs (exclude ghost DOFs)
+                u_owned_size = V.dofmap.index_map.size_local * V.dofmap.index_map_bs
+                h_indices = h_indices[h_indices < u_owned_size]
+                u_indices = u_indices[u_indices < u_owned_size]
+                v_indices = v_indices[v_indices < u_owned_size]
+
             return h_indices, u_indices, v_indices
         else:
             # Fallback: assume interleaved (h, u, v)
             n_dofs = len(self.solver.u.x.array)
+            if owned_only:
+                n_dofs = V.dofmap.index_map.size_local * V.dofmap.index_map_bs
             h_indices = np.arange(0, n_dofs, 3)
             u_indices = np.arange(1, n_dofs, 3)
             v_indices = np.arange(2, n_dofs, 3)
@@ -1058,7 +1082,8 @@ class TwinExperiment:
         truth_array = self.m_true.getArray()
 
         # Get actual DOF indices for each component using function space
-        h_indices, u_indices, v_indices = self._get_component_dof_indices()
+        # Use owned_only=True since m_true is a PETSc vector with only owned DOFs
+        h_indices, u_indices, v_indices = self._get_component_dof_indices(owned_only=True)
 
         # Extract component values using proper indices
         h_values = truth_array[h_indices]
@@ -1393,8 +1418,8 @@ class TwinExperiment:
         lower_array = lower.getArray()
         upper_array = upper.getArray()
 
-        # Use proper component DOF indices
-        h_indices, u_indices, v_indices = self._get_component_dof_indices()
+        # Use proper component DOF indices (owned only since these are PETSc vectors)
+        h_indices, u_indices, v_indices = self._get_component_dof_indices(owned_only=True)
 
         # h: constrained to be positive (h >= h_min)
         lower_array[h_indices] = self.config.h_min

@@ -93,40 +93,45 @@ class CustomNewtonProblem:
         # Internal counter for tracking solve calls (used as timestep if not externally managed)
         self._solve_counter = 0
 
+        self._solver_parameters = solver_parameters
+        self._mesh = obj1.problem.mesh
         self.A = petsc.create_matrix(self.jacobian)
         self.L = petsc.create_vector(self.residual)
+        self._setup_ksp()
+
+    def _setup_ksp(self):
+        """Create and configure the KSP linear solver.
+
+        Can be called to rebuild the solver after a MUMPS/LU failure
+        that corrupts the internal factorization state.
+        """
+        if hasattr(self, 'solver') and self.solver is not None:
+            self.solver.destroy()
+
         self.solver = PETSc.KSP().create(self.comm)
-
-        # Set a unique options prefix for this solver
         self.solver.setOptionsPrefix("newton_")
-
         self.solver.setTolerances(
-            rtol=solver_parameters.get("ksp_rtol", 1e-8),
-            atol=solver_parameters.get("ksp_atol", 1e-9),
-            max_it=solver_parameters.get("ksp_max_it", 1000),
+            rtol=self._solver_parameters.get("ksp_rtol", 1e-8),
+            atol=self._solver_parameters.get("ksp_atol", 1e-9),
+            max_it=self._solver_parameters.get("ksp_max_it", 1000),
         )
         self.solver.setOperators(self.A)
-        self.solver.setErrorIfNotConverged(
-            solver_parameters.get("ksp_ErrorIfNotConverged", True)
-        )
+        # CRITICAL: Must be False to prevent PETSc from aborting on MUMPS failures.
+        # When True, MUMPS factorization errors (e.g., INFOG=-9) cause PETSc to
+        # throw exceptions that corrupt internal solver state, making all subsequent
+        # solves hang. Instead, we check convergence codes ourselves after each solve.
+        self.solver.setErrorIfNotConverged(False)
 
         if self.pc_type == "element_block":
-            self.pc = ElementBlockPreconditioner(self.A, obj1.problem.mesh)
+            self.pc = ElementBlockPreconditioner(self.A, self._mesh)
         else:
             self.pc = self.solver.getPC()
             self.pc.setType(self.pc_type)
-
-            # For Block Jacobi in parallel, use no preconditioner on each block
-            # This avoids issues with missing diagonal entries from boundary conditions
-            # (LU, ILU, and Jacobi all fail when diagonal entries are zero/missing)
             if self.pc_type == "bjacobi":
-                # Set options for sub-preconditioner using the solver's prefix
                 opts = PETSc.Options()
-                opts["newton_sub_pc_type"] = (
-                    "none"  # No preconditioning (robust to BCs)
-                )
-                opts["newton_sub_ksp_type"] = "gmres"  # Use GMRES on each block
-                opts["newton_sub_ksp_max_it"] = "100"  # Allow more iterations
+                opts["newton_sub_pc_type"] = "none"
+                opts["newton_sub_ksp_type"] = "gmres"
+                opts["newton_sub_ksp_max_it"] = "100"
                 self.solver.setFromOptions()
 
     def log(self, *msg):
@@ -220,8 +225,15 @@ class CustomNewtonProblem:
             linear_convergence = solver.getConvergedReason()
             linear_residual = solver.getResidualNorm()
 
-            if linear_convergence == -9:
-                sys.exit(1)
+            if linear_convergence < 0:
+                if self.comm.rank == 0:
+                    print(f"  Linear solver diverged at timestep {timestep}, "
+                          f"Newton iteration {i+1}: convergence code {linear_convergence}")
+                # Rebuild KSP to recover from corrupted factorization state
+                # (e.g., MUMPS INFOG=-9 leaves the PC in a broken state that
+                # causes all subsequent solves to hang)
+                self._setup_ksp()
+                break
 
             # Update u_{i+1} = u_i + alpha * dx_i
             u.x.array[:] += relaxation_parameter * dx.x.array[:]
@@ -264,6 +276,12 @@ class CustomNewtonProblem:
 
         # End diagnostics tracking for this timestep
         self.diagnostics.end_timestep(converged, i)
+
+        # Warn if Newton solver did not converge
+        if not converged and self.comm.rank == 0:
+            final_norm = correction_norm if i > 0 else float('nan')
+            print(f"  WARNING: Newton solver did not converge at timestep {timestep} "
+                  f"after {i} iterations (correction_norm={final_norm:.4e}, atol={self.atol:.1e})")
 
         # Handle Jacobian return for 4D-Var
         if return_jacobian:
