@@ -1,0 +1,55 @@
+{
+  "phase": 1,
+  "status": "success",
+  "method": "4dvar",
+  "model_error": false,
+  "config": {
+    "dt": 600.0,
+    "nt_ramp": 144,
+    "nt_da": 36,
+    "t_da_start_s": 86400.0,
+    "obs_fraction": 0.05,
+    "obs_frequency": 6,
+    "obs_noise_level": 0.01,
+    "background_error_std": 0.005,
+    "max_iterations": 25,
+    "n_obs_points": 153,
+    "obs_times": [
+      6,
+      12,
+      18,
+      24,
+      30,
+      36
+    ]
+  },
+  "results": {
+    "background_error": 0.08804256519314488,
+    "analysis_error": 0.08804263354585978,
+    "error_reduction": -7.763598749632732e-05,
+    "mean_rmse": 30.849151046390272,
+    "data_misfit": 436819.3807078318,
+    "innovation_mean": -26.546085278306464,
+    "innovation_std": 15.715647205550429,
+    "num_iterations": 2,
+    "converged": true
+  },
+  "convergence": {
+    "cost_history": [
+      74901.92937770985,
+      449.38563578528357,
+      446.70469205645134
+    ],
+    "gradient_norm_history": [
+      8094.723570180026,
+      48.57337927745265,
+      0.0009391704360305462
+    ]
+  },
+  "timing": {
+    "warmup_s": 216.34737515449524,
+    "truth_generation_s": 69.99231791496277,
+    "optimization_s": 408.147665977478,
+    "total_s": 694.487359046936
+  }
+}

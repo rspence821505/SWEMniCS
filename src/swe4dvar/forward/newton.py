@@ -277,11 +277,17 @@ class CustomNewtonProblem:
         # End diagnostics tracking for this timestep
         self.diagnostics.end_timestep(converged, i)
 
-        # Warn if Newton solver did not converge
-        if not converged and self.comm.rank == 0:
-            final_norm = correction_norm if i > 0 else float('nan')
-            print(f"  WARNING: Newton solver did not converge at timestep {timestep} "
-                  f"after {i} iterations (correction_norm={final_norm:.4e}, atol={self.atol:.1e})")
+        # Handle Newton solver failure
+        if not converged:
+            if self.comm.rank == 0:
+                final_norm = correction_norm if i > 0 else float('nan')
+                print(f"  WARNING: Newton solver did not converge at timestep {timestep} "
+                      f"after {i} iterations (correction_norm={final_norm:.4e}, atol={self.atol:.1e})")
+            # During optimization, raise exception so cost function returns infinity
+            if getattr(self, 'raise_on_failure', False):
+                raise RuntimeError(
+                    f"Newton solver failed at timestep {timestep} after {i} iterations"
+                )
 
         # Handle Jacobian return for 4D-Var
         if return_jacobian:

@@ -216,12 +216,56 @@ class CostFunction(ABC):
                 )
             return self._trajectory, self._jacobians
 
+        # Clear solver storage and old trajectory/Jacobians to free memory.
+        # Each eval stores 36 Jacobians at 52K DOFs (~504 MB); without clearing,
+        # Armijo backtracking accumulates multiple sets and causes OOM.
+        if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model.solver, 'storage'):
+            self.forward_model.solver.storage.clear()
+        # Also release previous trajectory/Jacobian references so GC can reclaim.
+        if self._trajectory is not None:
+            for vec in self._trajectory:
+                vec.destroy()
+            self._trajectory = None
+        if self._jacobians is not None:
+            for jac in self._jacobians:
+                if hasattr(jac, 'destroy'):
+                    jac.destroy()
+            self._jacobians = None
+        # Force garbage collection to reclaim PETSc memory
+        import gc
+        gc.collect()
+
+        # Enable Newton failure detection during optimization.
+        # When Newton diverges, raise exception so cost function returns infinity
+        # and TAO's Armijo line search backtracks to a smaller step.
+        # The flag must be set on the actual CGImplicit solver (not the wrapper),
+        # since time_loop() creates the Newton solver and propagates this flag.
+        actual_solver = getattr(self.forward_model, 'solver', self.forward_model)
+        actual_solver._raise_on_newton_failure = True
+
         # Run forward model
-        self._trajectory, self._jacobians = self.forward_model.solve(
-            m, store_jacobians=store_jacobians
-        )
+        try:
+            self._trajectory, self._jacobians = self.forward_model.solve(
+                m, store_jacobians=store_jacobians
+            )
+        finally:
+            actual_solver._raise_on_newton_failure = False
         self._current_control = m.copy()
         self._control_hash = m_hash
+
+        # Check for NaN/inf or unreasonably large values in trajectory.
+        # Newton divergence may produce finite but garbage states (e.g., huge residuals
+        # without NaN if the linear solver diverges and the update is skipped).
+        if self._trajectory:
+            import numpy as np
+            for i, state in enumerate(self._trajectory):
+                arr = state.getArray()
+                if not np.all(np.isfinite(arr)) or np.max(np.abs(arr)) > 1e4:
+                    raise RuntimeError(
+                        f"Forward model produced invalid states at timestep {i}: "
+                        f"max|state|={np.max(np.abs(arr)):.2e}, "
+                        f"has_nan={not np.all(np.isfinite(arr))}"
+                    )
 
         # Warn if Jacobians were requested but not stored
         if store_jacobians and (self._jacobians is None or len(self._jacobians) == 0):
@@ -317,6 +361,7 @@ class FourDVarCost(CostFunction):
         self.m_b = m_background
         self.y_obs = observations
         self.obs_times = obs_times
+        self.gradient_smoother = None  # Optional callable: grad_array -> smoothed_grad_array
 
         # Validate inputs
         if len(observations) != len(obs_times):
@@ -546,6 +591,15 @@ class FourDVarCost(CostFunction):
         # Total gradient: ∇J = B⁻¹(m - m_b) + λ₀
         grad = grad_background.copy()
         grad.axpy(1.0, lambda_0)
+
+        # Apply gradient smoothing if configured.
+        # Smoothing filters high-frequency components from the adjoint gradient,
+        # producing search directions that stay within Newton's convergence basin.
+        # This is equivalent to B-preconditioning when B has spatial correlation.
+        if self.gradient_smoother is not None:
+            arr = grad.getArray().copy()
+            arr = self.gradient_smoother(arr)
+            grad.setArray(arr)
 
         return cost, grad
 

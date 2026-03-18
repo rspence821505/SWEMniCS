@@ -81,6 +81,7 @@ class PETScTAOWrapper(Optimizer):
         # Function evaluation counters
         self.n_func_evals = 0
         self.n_grad_evals = 0
+        self._max_funcs = self.options.get("max_funcs", None)
 
     def solve(self, x0: PETSc.Vec) -> PETSc.Vec:
         """
@@ -127,9 +128,12 @@ class PETScTAOWrapper(Optimizer):
             gttol=gttol,
         )
 
-        # Set maximum iterations
+        # Set maximum iterations and function evaluations
         max_iter = self.options.get("max_iterations", 100)
         self.tao.setMaximumIterations(max_iter)
+        max_funcs = self.options.get("max_funcs", None)
+        if max_funcs is not None:
+            self.tao.setMaximumFunctionEvaluations(max_funcs)
 
         # Configure line search
         # Default More-Thuente requires Wolfe conditions which can fail on
@@ -154,6 +158,8 @@ class PETScTAOWrapper(Optimizer):
         # Re-apply max iterations and tolerances AFTER setFromOptions(),
         # which may override programmatic settings from the options database
         self.tao.setMaximumIterations(max_iter)
+        if max_funcs is not None:
+            self.tao.setMaximumFunctionEvaluations(max_funcs)
         self.tao.setTolerances(gatol=gatol, grtol=grtol, gttol=gttol)
 
         # Set up monitoring
@@ -215,6 +221,14 @@ class PETScTAOWrapper(Optimizer):
             Objective function value
         """
         try:
+            # Enforce max function evaluations (PETSc's setMaximumFunctionEvaluations
+            # is not enforced by all TAO types like BLMVM)
+            if self._max_funcs is not None and self.n_func_evals >= self._max_funcs:
+                if self.verbose and self.comm.rank == 0:
+                    print(f"  [TAO callback] max_funcs={self._max_funcs} reached, signaling convergence")
+                g.set(0.0)  # Zero gradient signals convergence to TAO
+                return self._last_cost if hasattr(self, '_last_cost') else 0.0
+
             # Use efficient combined method if available (avoids double forward solve)
             if hasattr(self.cost_function, 'value_gradient'):
                 f, grad = self.cost_function.value_gradient(x)
@@ -237,6 +251,7 @@ class PETScTAOWrapper(Optimizer):
                         g.set(1e-10)
                     return 1e20
 
+                self._last_cost = f
                 gnorm = grad.norm()
                 if self.verbose and self.comm.rank == 0:
                     print(f"  [TAO callback] eval #{self.n_func_evals}: cost={f:.6f}, ||grad||={gnorm:.4e}")

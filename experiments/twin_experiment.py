@@ -71,6 +71,7 @@ class TwinExperimentConfig:
 
     # Optimization configuration
     max_iterations: int = 50
+    max_funcs: Optional[int] = None  # Max total function evaluations (None = unlimited)
     gradient_tolerance: float = 1e-6
     cost_tolerance: float = 1e-8
     use_bounds: bool = True
@@ -485,7 +486,7 @@ class TwinExperiment:
             stations=np.array([[0.0, 0.0, 0.0]]),
             plot_every=9999,
             save_state=True,
-            store_jacobians=True,
+            store_jacobians=False,  # Truth Jacobians not needed by DA (saves ~2.8GB at 52K DOFs)
             enable_video=False,
             monitor_progress=(self.rank == 0 and self.config.verbose),
         )
@@ -510,6 +511,9 @@ class TwinExperiment:
 
         # True initial condition
         self.m_true = self.truth_trajectory[0].copy()
+
+        # Free solver storage now that we've extracted the trajectory
+        self.solver.storage.clear()
 
         self.log(f"  Truth trajectory: {len(self.truth_trajectory)} states")
 
@@ -874,10 +878,10 @@ class TwinExperiment:
             self.solver.V, obs_points, comm=self.comm
         )
 
-        # Observation times
+        # Observation times (include t=0 if obs_frequency divides evenly)
         obs_times = list(
             range(
-                self.config.obs_frequency,
+                0,
                 self.problem.nt + 1,
                 self.config.obs_frequency,
             )
@@ -1027,21 +1031,22 @@ class TwinExperiment:
             v_indices = np.arange(2, n_dofs, 3)
             return h_indices, u_indices, v_indices
 
-    def _build_smoothing_matrix(self, component_indices: np.ndarray, correlation_length: float) -> np.ndarray:
+    def _build_smoothing_matrix(self, component_indices: np.ndarray, correlation_length: float):
         """Build Gaussian spatial smoothing matrix for DOFs of one component.
 
-        Computes G_ij = exp(-d_ij^2 / (2*L^2)) and normalizes rows so that
-        G @ white_noise has unit variance. This produces spatially correlated
-        perturbations with correlation length L.
+        Uses a sparse KD-tree approach: only computes weights for neighbors
+        within 3*correlation_length (beyond which exp(-d²/2L²) < 1e-4).
+        This avoids building a dense n×n matrix at large DOF counts.
 
         Args:
             component_indices: DOF indices in the parent space for one component
             correlation_length: Gaussian correlation length scale (meters)
 
         Returns:
-            Smoothing matrix of shape (n_dofs, n_dofs)
+            Sparse CSR smoothing matrix of shape (n_dofs, n_dofs)
         """
-        from scipy.spatial.distance import cdist
+        from scipy.spatial import cKDTree
+        from scipy import sparse
 
         # Get DOF coordinates via collapsed sub-space
         V = self.solver.V
@@ -1058,15 +1063,35 @@ class TwinExperiment:
         collapsed_idx = parent_to_collapsed[component_indices]
         coords = all_coords[collapsed_idx]  # (n_component_dofs, 2)
 
-        # Build Gaussian kernel matrix
-        dist_sq = cdist(coords, coords, metric='sqeuclidean')
-        G = np.exp(-dist_sq / (2.0 * correlation_length ** 2))
+        n = len(coords)
+        radius = 3.0 * correlation_length  # exp(-9/2) ≈ 0.011, negligible beyond this
+        two_L_sq = 2.0 * correlation_length ** 2
+
+        # Build sparse Gaussian kernel using KD-tree neighbor queries
+        tree = cKDTree(coords)
+        rows, cols, data = [], [], []
+        for i in range(n):
+            neighbors = tree.query_ball_point(coords[i], radius)
+            if len(neighbors) == 0:
+                neighbors = [i]  # self-connection as fallback
+            dists_sq = np.sum((coords[neighbors] - coords[i]) ** 2, axis=1)
+            weights = np.exp(-dists_sq / two_L_sq)
+            rows.extend([i] * len(neighbors))
+            cols.extend(neighbors)
+            data.extend(weights)
+
+        G = sparse.csr_matrix((data, (rows, cols)), shape=(n, n))
 
         # Normalize rows so G @ white_noise has unit variance
-        # Var(G @ z) = G @ G^T (for z ~ N(0,I)), so normalize by sqrt(row sum of G^2)
-        row_norms = np.sqrt(np.sum(G ** 2, axis=1, keepdims=True))
-        G /= row_norms
+        # Var(G @ z) = sum(G_ij^2) for z ~ N(0,I), so normalize by sqrt(row sum of G^2)
+        G_sq = G.multiply(G)
+        row_norms = np.sqrt(np.array(G_sq.sum(axis=1)).flatten())
+        row_norms[row_norms == 0] = 1.0  # avoid division by zero
+        # Scale rows by 1/row_norm
+        inv_norms = sparse.diags(1.0 / row_norms)
+        G = inv_norms @ G
 
+        self.log(f"  Smoothing matrix: {n}x{n}, nnz={G.nnz} ({100*G.nnz/n**2:.1f}% dense)")
         return G
 
     def _setup_background(self, n_vars: int = 3) -> float:
@@ -1167,9 +1192,11 @@ class TwinExperiment:
             self.log(f"  Background covariance: diagonal, variance = {background_variance:.6e}")
 
         # Add spatial correlation if requested (for L_wme computation only)
+        # Skip dense B_lwme construction for standard 4dvar — it's only needed for DC-WME
+        # and builds a dense n_state × n_state matrix that's infeasible at large DOF counts.
         B_lwme = None
         corr_len = self.config.background_correlation_length
-        if corr_len > 0:
+        if corr_len > 0 and self.config.method in ("dcwme", "dc"):
             B_lwme = self._add_spatial_correlation(B, corr_len)
 
         # Observation covariance
@@ -1254,14 +1281,17 @@ class TwinExperiment:
 
         return B_corr
 
-    def _estimate_component_variances(self, n_vars: int = 3):
-        """Estimate component-specific variances from truth state."""
-        arr = self.m_true.getArray()
-        h_values = arr[0::n_vars]
-        uv_values = np.concatenate([arr[j::n_vars] for j in range(1, n_vars)])
+    def _estimate_component_variances(self):
+        """Estimate component-specific variances from truth state.
 
-        h_mag = np.abs(h_values).mean() + 1e-10
-        uv_mag = np.abs(uv_values).mean() + 1e-10
+        Uses the same component magnitudes as _setup_background() to ensure
+        B covariance matches the actual perturbation statistics.
+        """
+        arr = self.m_true.getArray()
+        h_indices, u_indices, v_indices = self._get_component_dof_indices(owned_only=True)
+
+        h_mag = np.abs(arr[h_indices]).mean() + 1e-10
+        uv_mag = max(np.abs(arr[u_indices]).max(), np.abs(arr[v_indices]).max(), 0.1)
 
         h_variance = (self.config.background_error_std * h_mag) ** 2
         uv_variance = (self.config.background_error_std * uv_mag) ** 2
@@ -1269,17 +1299,18 @@ class TwinExperiment:
         return h_variance, uv_variance
 
     def _create_component_aware_covariance(
-        self, state_size: int, h_variance: float, velocity_variance: float, n_vars: int = 3
+        self, state_size: int, h_variance: float, velocity_variance: float
     ):
-        """Create component-aware diagonal covariance."""
-        variances = np.zeros(state_size)
-        n_nodes = state_size // n_vars
-        for i in range(n_nodes):
-            variances[i * n_vars] = h_variance
-            for j in range(1, n_vars):
-                variances[i * n_vars + j] = velocity_variance
+        """Create component-aware diagonal covariance using correct DOF indices."""
+        h_indices, u_indices, v_indices = self._get_component_dof_indices(owned_only=True)
 
-        return DiagonalCovariance(self.comm, state_size, diagonal=variances)
+        variances = np.zeros(state_size)
+        variances[h_indices] = h_variance
+        variances[u_indices] = velocity_variance
+        variances[v_indices] = velocity_variance
+
+        return DiagonalCovariance(self.comm, state_size, diagonal=variances,
+                                  template_vec=self.m_true)
 
     def _create_forward_model(self, t_start: float = 0.0):
         """Create forward model wrapper."""
@@ -1371,8 +1402,11 @@ class TwinExperiment:
             "gradient_relative_tolerance": 0.0,  # Disable grtol; use gatol only
             "cost_tolerance": self.config.cost_tolerance,
             "verbose": (self.rank == 0),
-            "line_search_initial_step": 1.0,  # Standard for L-BFGS (direction already scaled by approx inverse Hessian)
+            "line_search_initial_step": 1.0,  # Standard for L-BFGS; NaN detection + Armijo backtracking handles overshoots
+            "line_search_max_funcs": 50,  # Extra backtracking attempts for Armijo when forward model fails
         }
+        if self.config.max_funcs is not None:
+            opt_options["max_funcs"] = self.config.max_funcs
 
         if self.config.use_bounds:
             lower, upper = self._create_physical_bounds()
@@ -1392,12 +1426,10 @@ class TwinExperiment:
         )
 
         opt_start = time.time()
-        # CRITICAL FIX: Start optimization from m_true instead of m_background
-        # The perturbed m_background may not be dynamically consistent and can
-        # cause forward model failure. Starting from m_true ensures the first
-        # cost evaluation succeeds, then the optimizer can work toward the minimum.
-        # The cost function still penalizes deviation from m_background via B^{-1}.
-        self.m_analysis = optimizer.solve(self.m_true.copy())
+        # Start optimization from perturbed background state (standard 4D-Var).
+        # With spatially smooth perturbations (background_correlation_length > 0),
+        # m_background is dynamically consistent and the forward model can integrate it.
+        self.m_analysis = optimizer.solve(self.m_background.copy())
         opt_time = time.time() - opt_start
 
         self.log(f"\n  Optimization completed in {opt_time:.2f} seconds")

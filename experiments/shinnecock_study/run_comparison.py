@@ -48,8 +48,17 @@ def parse_args():
         "--phase",
         type=str,
         default="0",
-        choices=["0", "0.5", "1", "2", "3", "4", "5", "all"],
+        choices=["0", "0.5", "1", "2", "3", "4", "5", "6", "all"],
         help="Experiment phase to run",
+    )
+
+    parser.add_argument(
+        "--sweep-dim",
+        type=str,
+        default=None,
+        choices=["noise", "obs_density", "obs_frequency", "bg_error",
+                 "cov_inflation", "window_length", "model_error", "all"],
+        help="Phase 6: which sweep dimension to run (default: all)",
     )
 
     parser.add_argument(
@@ -64,6 +73,14 @@ def parse_args():
         type=str,
         default="data/shinnecock_inlet",
         help="Path to ADCIRC ADIOS files (without extension)",
+    )
+
+    parser.add_argument(
+        "--sub",
+        type=str,
+        default=None,
+        choices=["a", "b", "c"],
+        help="Phase 3 sub-experiment to run (a=4DVar, b=static DC-WME, c=dynamic DC-WME)",
     )
 
     parser.add_argument(
@@ -523,17 +540,15 @@ def run_phase_1(args):
     # ================================================================
     dt = 600.0          # 10-min timestep
     nt_ramp = 144       # 24h ramp (144 × 600s = 86400s) - INTERMEDIATE TEST
-    nt_da = 36          # 6h DA window (36 × 600s = 21600s) - INTERMEDIATE TEST
+    nt_da = 12          # 2h DA window (12 × 600s = 7200s) - reduced for memory
     nt_total = nt_ramp + nt_da  # 180 timesteps = 30h
 
-    obs_fraction = 0.5      # 50% obs points for Phase 1 (4D-Var only, no DC-WME cost)
-    obs_frequency = 2       # Every 2 timesteps (= every 20 min)
+    obs_fraction = 0.1      # 10% obs points (~306 points) - more observation constraint
+    obs_frequency = 6       # Every 6 timesteps (= every hour) per plan
     obs_noise_level = 0.01  # 1% noise
-    background_error_std = 0.01  # 1.0% perturbation (1.5% fails at full scale due to WD regions)
-    cov_inflation_factor = 10.0  # Balance J_b and J_o (2000x caused overfitting to noisy obs)
-    # With inflation=2000, J_b~0.37 << J_o~4600 → severe imbalance, overfits to noise
-    # With inflation=10, J_b~74 ~ 0.1*J_o → better balance, prevents overfitting
-    max_iterations = 25     # Full config for production run
+    background_error_std = 0.02   # 2% perturbation RMS (larger gap for optimizer to find)
+    cov_inflation_factor = 10.0  # Weaken B^{-1} to let optimizer move (larger perturbation needs less inflation)
+    max_iterations = 15     # Need more iters for full convergence with large perturbation
 
     if rank == 0:
         print("=" * 70)
@@ -629,15 +644,17 @@ def run_phase_1(args):
         obs_frequency=obs_frequency,
         obs_noise_level=obs_noise_level,
         background_error_std=background_error_std,
+        background_correlation_length=500.0,  # Smoothed perturbation (Gaussian, L=500m)
         max_iterations=max_iterations,
-        gradient_tolerance=1e-6,
-        cost_tolerance=1e-8,
+        gradient_tolerance=1e-3,
+        cost_tolerance=1e-4,
         n_windows=1,
         perturb_friction=False,
         friction_scale_factor=1.0,
         use_bounds=True,
         h_min=0.01,
         interior_only=True,
+        component_aware_cov=True,  # Match B variances to component-specific perturbation magnitudes
         verbose=(rank == 0),
     )
 
@@ -650,11 +667,14 @@ def run_phase_1(args):
     # Step 4: Generate truth for DA window (72 timesteps from warm state)
     # ================================================================
     if rank == 0:
-        print("\n--- Step 4: Generating truth trajectory for DA window ---")
+        print(f"\n--- Step 4: Generating truth trajectory for DA window ({nt_da} steps) ---")
 
     t_truth_start = time.time()
-    exp._generate_truth()  # Runs 72 steps from warm state at t=48h
+    exp._generate_truth()  # Runs 36 steps from warm state, store_jacobians=False
     t_truth = time.time() - t_truth_start
+
+    # Explicitly clear solver storage to free memory before optimization
+    exp.solver.storage.clear()
 
     if rank == 0:
         print(f"  Truth: {len(exp.truth_trajectory)} states, generated in {t_truth:.1f}s")
@@ -700,6 +720,40 @@ def run_phase_1(args):
     cost_function = exp._setup_cost_function(
         forward_model, obs_operator, B, R, obs_times, B_lwme=B_lwme
     )
+
+    # ================================================================
+    # Step 7b: Attach gradient smoother (filters high-freq adjoint gradient)
+    # ================================================================
+    # The perturbation is spatially smoothed (L=500m) but B is diagonal,
+    # so the adjoint gradient has high-frequency components that B^{-1}
+    # amplifies. Smoothing the gradient is equivalent to B-preconditioning
+    # and keeps L-BFGS search directions within Newton's convergence basin.
+    gradient_smoothing_length = 500.0  # Match perturbation correlation length for consistent preconditioning
+    if config.background_correlation_length > 0:
+        if rank == 0:
+            print("\n--- Step 7b: Building gradient smoother ---")
+
+        h_indices, u_indices, v_indices = exp._get_component_dof_indices(owned_only=True)
+        smoothing_matrix = exp._build_smoothing_matrix(
+            h_indices, gradient_smoothing_length
+        )
+
+        def gradient_smoother(grad_array):
+            """Apply spatial smoothing to each component of the gradient."""
+            smoothed = grad_array.copy()
+            smoothed[h_indices] = smoothing_matrix @ grad_array[h_indices]
+            smoothed[u_indices] = smoothing_matrix @ grad_array[u_indices]
+            smoothed[v_indices] = smoothing_matrix @ grad_array[v_indices]
+            return smoothed
+
+        # Set smoother on the inner FourDVarCost (may be wrapped by ZeroBoundaryGradientCost)
+        inner_cost = cost_function
+        while hasattr(inner_cost, 'base_cost'):
+            inner_cost = inner_cost.base_cost
+        inner_cost.gradient_smoother = gradient_smoother
+
+        if rank == 0:
+            print(f"  Gradient smoother attached (L={gradient_smoothing_length}m)")
 
     # ================================================================
     # Step 8: Run optimization
@@ -812,6 +866,2208 @@ def run_phase_1(args):
     return None
 
 
+def run_phase_2(args):
+    """Phase 2: Single-Window 4D-Var, With Model Error.
+
+    Same as Phase 1 but with friction perturbation (Manning's n × 1.15).
+    Truth is generated with TRUE friction, then friction is scaled by 1.15.
+    DA uses the perturbed friction model, so it cannot perfectly recover truth.
+    Expected: lower error reduction than Phase 1.
+    """
+    import os
+    os.environ.setdefault("CC", "/usr/bin/clang")
+
+    from mpi4py import MPI
+    from swe4dvar.forward.adcirc_problem import ADCIRCProblem
+    from swe4dvar.forward.solvers import get_solver
+    from swe4dvar.utils import get_default_solver_params
+    from experiments.twin_experiment import (
+        TwinExperiment, TwinExperimentConfig, ForwardModelWrapper,
+    )
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    output_dir = Path(args.output_dir)
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "data").mkdir(exist_ok=True)
+    comm.Barrier()
+
+    # ================================================================
+    # Configuration - same as Phase 1 + friction perturbation
+    # ================================================================
+    dt = 600.0
+    nt_ramp = 144       # 24h ramp
+    nt_da = 12          # 2h DA window
+    nt_total = nt_ramp + nt_da
+
+    obs_fraction = 0.1
+    obs_frequency = 6
+    obs_noise_level = 0.01
+    background_error_std = 0.02
+    cov_inflation_factor = 10.0
+    max_iterations = 15
+    friction_scale_factor = 1.15  # 15% Manning's n error
+
+    if rank == 0:
+        print("=" * 70)
+        print("PHASE 2: SINGLE-WINDOW 4D-VAR, WITH MODEL ERROR")
+        print("=" * 70)
+        print(f"  Total simulation: {nt_total} timesteps ({nt_total * dt / 3600:.0f}h)")
+        print(f"  Ramp period: {nt_ramp} timesteps ({nt_ramp * dt / 3600:.0f}h)")
+        print(f"  DA window: {nt_da} timesteps ({nt_da * dt / 3600:.0f}h)")
+        print(f"  Obs fraction: {obs_fraction} (~{int(obs_fraction * 3070)} points)")
+        print(f"  Obs frequency: every {obs_frequency} timesteps ({obs_frequency * dt / 3600:.0f}h)")
+        print(f"  Background error std: {background_error_std}")
+        print(f"  Max iterations: {max_iterations}")
+        print(f"  Model error: Manning's n × {friction_scale_factor}")
+        print("=" * 70)
+
+    # ================================================================
+    # Step 1: Create problem and solver
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 1: Creating problem and solver ---")
+
+    prob = ADCIRCProblem(
+        adios_file=args.adios_file,
+        spherical=True,
+        solution_var="h",
+        friction_law="mannings",
+        wd=True,
+        wd_alpha=1.5,
+        dt=dt,
+        bathy_adjustment=0,
+        nt=nt_total,
+        dramp=2.0,
+    )
+    solver = get_solver("DG")(prob, theta=1.0, p_degree=[1, 1])
+
+    warmup_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=10,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=True,
+    )
+
+    da_solver_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=25,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=False,
+        reduction_it=10,
+    )
+
+    if rank == 0:
+        n_nodes = prob.mesh.topology.index_map(0).size_local
+        n_dofs = len(solver.u.x.array)
+        print(f"  Mesh: {n_nodes} nodes, {n_dofs} DOFs")
+
+    # ================================================================
+    # Step 2: Warm-up (ramp period with TRUE friction)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 2: Running {nt_ramp}-step warm-up ({nt_ramp * dt / 3600:.0f}h ramp) ---")
+
+    t_warmup_start = time.time()
+    prob.nt = nt_ramp
+    solver.time_loop(
+        solver_parameters=warmup_params,
+        stations=[],
+        plot_every=9999,
+        save_state=False,
+        store_jacobians=False,
+        enable_video=False,
+        monitor_progress=(rank == 0),
+    )
+    t_warmup = time.time() - t_warmup_start
+    t_da_start = prob.t
+
+    if rank == 0:
+        print(f"  Warm-up completed in {t_warmup:.1f}s (t = {t_da_start:.0f}s = {t_da_start/3600:.1f}h)")
+
+    # ================================================================
+    # Step 3: Set up TwinExperiment for DA window (with friction perturbation)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 3: Setting up DA window ({nt_da} timesteps from t={t_da_start/3600:.0f}h) ---")
+
+    prob.nt = nt_da
+
+    config = TwinExperimentConfig(
+        method="4dvar",
+        obs_fraction=obs_fraction,
+        obs_frequency=obs_frequency,
+        obs_noise_level=obs_noise_level,
+        background_error_std=background_error_std,
+        background_correlation_length=500.0,
+        max_iterations=max_iterations,
+        gradient_tolerance=1e-3,
+        cost_tolerance=1e-4,
+        n_windows=1,
+        perturb_friction=True,  # KEY DIFFERENCE: enable friction perturbation
+        friction_scale_factor=friction_scale_factor,  # 15% Manning's n error
+        use_bounds=True,
+        h_min=0.01,
+        interior_only=True,
+        component_aware_cov=True,
+        verbose=(rank == 0),
+    )
+
+    exp = TwinExperiment(
+        problem=prob, solver=solver, config=config,
+        solver_params=da_solver_params, comm=comm,
+    )
+
+    # ================================================================
+    # Step 4: Generate truth for DA window (with TRUE friction)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 4: Generating truth trajectory ({nt_da} steps, TRUE friction) ---")
+
+    t_truth_start = time.time()
+    exp._generate_truth()
+    t_truth = time.time() - t_truth_start
+
+    exp.solver.storage.clear()
+
+    if rank == 0:
+        print(f"  Truth: {len(exp.truth_trajectory)} states, generated in {t_truth:.1f}s")
+
+    # ================================================================
+    # Step 4b: Apply friction perturbation (scale Manning's n by 1.15)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 4b: Applying friction perturbation (×{friction_scale_factor}) ---")
+
+    exp._apply_physics_perturbations()
+
+    # ================================================================
+    # Step 5: Setup observations, background, covariances
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 5: Setting up observations and background ---")
+
+    obs_points, obs_operator, obs_times = exp._setup_observations()
+    exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, obs_times)
+    background_error = exp._setup_background()
+    B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
+
+    if cov_inflation_factor != 1.0:
+        B.diagonal.scale(cov_inflation_factor)
+        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
+        if rank == 0:
+            print(f"  B covariance inflated by {cov_inflation_factor}x")
+
+    n_obs = obs_operator.get_num_observations()
+    if rank == 0:
+        print(f"  Observation points: {n_obs}")
+        print(f"  Observation times: {obs_times}")
+        print(f"  Background RMS error: {background_error:.6f}")
+
+    # ================================================================
+    # Step 6: Create forward model (with PERTURBED friction)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 6: Creating forward model (t_start={t_da_start:.0f}s, perturbed friction) ---")
+
+    forward_model = exp._create_forward_model(t_start=t_da_start)
+
+    # ================================================================
+    # Step 7: Setup cost function
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 7: Setting up 4D-Var cost function ---")
+
+    cost_function = exp._setup_cost_function(
+        forward_model, obs_operator, B, R, obs_times, B_lwme=B_lwme
+    )
+
+    # ================================================================
+    # Step 7b: Attach gradient smoother (same as Phase 1)
+    # ================================================================
+    gradient_smoothing_length = 500.0
+    if config.background_correlation_length > 0:
+        if rank == 0:
+            print("\n--- Step 7b: Building gradient smoother ---")
+
+        h_indices, u_indices, v_indices = exp._get_component_dof_indices(owned_only=True)
+        smoothing_matrix = exp._build_smoothing_matrix(
+            h_indices, gradient_smoothing_length
+        )
+
+        def gradient_smoother(grad_array):
+            """Apply spatial smoothing to each component of the gradient."""
+            smoothed = grad_array.copy()
+            smoothed[h_indices] = smoothing_matrix @ grad_array[h_indices]
+            smoothed[u_indices] = smoothing_matrix @ grad_array[u_indices]
+            smoothed[v_indices] = smoothing_matrix @ grad_array[v_indices]
+            return smoothed
+
+        inner_cost = cost_function
+        while hasattr(inner_cost, 'base_cost'):
+            inner_cost = inner_cost.base_cost
+        inner_cost.gradient_smoother = gradient_smoother
+
+        if rank == 0:
+            print(f"  Gradient smoother attached (L={gradient_smoothing_length}m)")
+
+    # ================================================================
+    # Step 8: Run optimization
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 8: Running L-BFGS optimization ---")
+
+    optimizer, opt_time = exp._run_optimization(cost_function)
+
+    cost_history = [h["cost"] for h in optimizer.convergence_history]
+    gradient_history = [h["grad_norm"] for h in optimizer.convergence_history]
+
+    if rank == 0:
+        print(f"  Iterations: {optimizer.iteration}")
+        print(f"  Converged: {optimizer.converged}")
+        print(f"  Optimization time: {opt_time:.1f}s")
+        if cost_history:
+            print(f"  Cost: {cost_history[0]:.6f} → {cost_history[-1]:.6f}")
+        if gradient_history:
+            print(f"  ||grad||: {gradient_history[0]:.6e} → {gradient_history[-1]:.6e}")
+
+    # ================================================================
+    # Step 9: Evaluate results
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 9: Evaluating results ---")
+
+    if cost_history and cost_history[-1] >= 1e19:
+        if rank == 0:
+            print("  WARNING: Optimization failed (cost diverged)")
+        analysis_error = background_error
+        error_reduction = 0.0
+        innov_mean = innov_std = mean_rmse = data_misfit = 0.0
+    else:
+        analysis_error, error_reduction, innov_mean, innov_std, mean_rmse, data_misfit = (
+            exp._evaluate_results(obs_operator, obs_times, background_error)
+        )
+
+    total_time = t_warmup + t_truth + opt_time
+
+    if rank == 0:
+        print(f"\n  Background error:  {background_error:.6f}")
+        print(f"  Analysis error:    {analysis_error:.6f}")
+        print(f"  Error reduction:   {error_reduction:.1f}%")
+        print(f"  Mean RMSE:         {mean_rmse:.6f}")
+        print(f"  Data misfit:       {data_misfit:.6f}")
+
+    # ================================================================
+    # Step 10: Save results
+    # ================================================================
+    if rank == 0:
+        results = {
+            "phase": 2,
+            "status": "success",
+            "method": "4dvar",
+            "model_error": True,
+            "model_error_type": "friction",
+            "friction_scale_factor": friction_scale_factor,
+            "config": {
+                "dt": dt,
+                "nt_ramp": nt_ramp,
+                "nt_da": nt_da,
+                "t_da_start_s": t_da_start,
+                "obs_fraction": obs_fraction,
+                "obs_frequency": obs_frequency,
+                "obs_noise_level": obs_noise_level,
+                "background_error_std": background_error_std,
+                "max_iterations": max_iterations,
+                "n_obs_points": n_obs,
+                "obs_times": obs_times,
+            },
+            "results": {
+                "background_error": float(background_error),
+                "analysis_error": float(analysis_error),
+                "error_reduction": float(error_reduction),
+                "mean_rmse": float(mean_rmse),
+                "data_misfit": float(data_misfit),
+                "innovation_mean": float(innov_mean),
+                "innovation_std": float(innov_std),
+                "num_iterations": int(optimizer.iteration),
+                "converged": bool(optimizer.converged),
+            },
+            "convergence": {
+                "cost_history": [float(c) for c in cost_history],
+                "gradient_norm_history": [float(g) for g in gradient_history],
+            },
+            "timing": {
+                "warmup_s": float(t_warmup),
+                "truth_generation_s": float(t_truth),
+                "optimization_s": float(opt_time),
+                "total_s": float(total_time),
+            },
+        }
+
+        results_file = output_dir / "data" / "phase2_results.json"
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=2)
+
+        print(f"\n{'=' * 70}")
+        # Phase 2 expects lower error reduction than Phase 1 (8.5%)
+        # but still some positive reduction
+        phase_pass = error_reduction > 0.0
+        print(f"PHASE 2: {'PASS' if phase_pass else 'NEEDS REVIEW'}")
+        print(f"{'=' * 70}")
+        print(f"  Error reduction: {error_reduction:.1f}% (expected >0%, lower than Phase 1's 8.5%)")
+        print(f"  Iterations: {optimizer.iteration}")
+        print(f"  Converged: {optimizer.converged}")
+        print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
+        print(f"  Results saved to: {results_file}")
+        print(f"{'=' * 70}")
+
+        return results
+
+    return None
+
+
+def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
+                           m_template, predictability_gamma=0.1,
+                           adaptive_gamma=True, max_inflate_factor=5.0,
+                           comm=None, rank=0):
+    """Compute static L_wme = (N / σ²_obs) · H B_inflated Hᵀ (no adjoint solves).
+
+    This matches the near-linear limit of the dynamic L_wme. When M_{k:0} ≈ I,
+    J_wme → (√N/σ_obs)·H, so L_wme → (N/σ²_obs)·H B Hᵀ.
+
+    Parameters
+    ----------
+    obs_operator : ObservationOperator
+        Point observation operator (H).
+    B : DiagonalCovariance
+        Background covariance.
+    n_obs_times : int
+        Number of observation times (N).
+    obs_variance : float
+        Observation variance (σ²_obs).
+    m_template : PETSc.Vec
+        Template state vector for creating unit vectors.
+    predictability_gamma : float
+        Relaxation parameter for eigenvalue flooring.
+    adaptive_gamma : bool
+        If True, floor = gamma * lambda_max.
+    max_inflate_factor : float
+        Maximum B inflation factor.
+    comm : MPI.Comm
+        MPI communicator.
+    rank : int
+        MPI rank.
+
+    Returns
+    -------
+    DenseCovariance
+        Regularized static L_wme covariance.
+    dict
+        Diagnostics dictionary.
+    """
+    from petsc4py import PETSc
+    from swe4dvar.data_assimilation.covariance import DenseCovariance
+
+    d_obs = obs_operator.get_num_observations()
+    n_state = m_template.getSize()
+
+    # Extract H matrix via adjoint: H^T e_i gives row i of H
+    # This is O(d_obs) applications instead of O(n_state) — much faster
+    # (306 vs 52020 for Shinnecock)
+    if rank == 0:
+        print(f"  Extracting H matrix ({d_obs} × {n_state}) via {d_obs} adjoint applications...")
+
+    H = np.zeros((d_obs, n_state))
+
+    # Create observation-space unit vector
+    obs_vec = obs_operator.forward(m_template)  # get correctly sized obs vector
+    obs_vec.zeroEntries()
+
+    for i in range(d_obs):
+        obs_vec.zeroEntries()
+        obs_vec.setValue(i, 1.0)
+        obs_vec.assemblyBegin()
+        obs_vec.assemblyEnd()
+        HT_ei = obs_operator.adjoint(obs_vec)  # H^T e_i = state-space vector
+        H[i, :] = HT_ei.getArray()
+        HT_ei.destroy()
+    obs_vec.destroy()
+
+    if rank == 0:
+        print(f"  H extracted: {np.count_nonzero(H)} nonzeros out of {d_obs * n_state}")
+
+    # Step 1: Static B inflation from H Hᵀ eigenvalues
+    G_static = H @ H.T  # (d_obs × d_obs)
+    gram_eigvals = np.linalg.eigvalsh(G_static)
+    lambda_min_G = max(gram_eigvals.min(), 1e-30)
+
+    # Get B diagonal
+    B_diag = B.diagonal.getArray().copy()
+    # Gather full diagonal (for MPI)
+    if comm is not None and comm.Get_size() > 1:
+        B_diag_full = np.zeros(n_state)
+        start, end = B.diagonal.getOwnershipRange()
+        B_diag_full[start:end] = B_diag
+        comm.Allreduce(B_diag_full.copy(), B_diag_full)
+        B_diag = B_diag_full
+
+    current_min_var = B_diag.min()
+
+    # Inflation factor from predictability bound
+    required_var = (predictability_gamma * obs_variance) / (n_obs_times * lambda_min_G)
+    alpha_uncapped = max(1.0, required_var / current_min_var) if current_min_var > 0 else 1.0
+    alpha = min(alpha_uncapped, max_inflate_factor)
+
+    diagnostics = {
+        'gram_eigvals': gram_eigvals.tolist(),
+        'lambda_min_G': float(lambda_min_G),
+        'required_var': float(required_var),
+        'inflation_factor': float(alpha),
+        'inflation_capped': alpha < alpha_uncapped,
+    }
+
+    if rank == 0:
+        if alpha > 1.0:
+            print(f"  Static B inflation: α = {alpha:.4f} "
+                  f"(required σ²_b = {required_var:.4e}, current = {current_min_var:.4e})")
+        else:
+            print(f"  Static: no B inflation needed")
+
+    B_diag_inflated = B_diag * alpha if alpha > 1.0 else B_diag
+
+    # Step 2: Form L_static = (N/σ²_obs) · H B Hᵀ
+    HB = H * B_diag_inflated[np.newaxis, :]
+    L_dense = (n_obs_times / obs_variance) * (HB @ H.T)
+
+    # Free large intermediate arrays
+    del H, HB, B_diag_inflated
+    import gc; gc.collect()
+
+    # Step 3: Eigenvalue regularization (same as dynamic Layer 2)
+    eigvals, eigvecs = np.linalg.eigh(L_dense)
+
+    if adaptive_gamma:
+        gamma_floor = predictability_gamma * eigvals.max()
+        if rank == 0:
+            print(f"  Static adaptive γ: {predictability_gamma} × λ_max={eigvals.max():.4e} "
+                  f"→ γ_eff={gamma_floor:.4e}")
+    else:
+        gamma_floor = predictability_gamma
+
+    n_floored = int(np.sum(eigvals < gamma_floor))
+    n_natural = len(eigvals) - n_floored
+    eigvals_reg = np.maximum(eigvals, gamma_floor)
+    L_dense = eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
+
+    if rank == 0:
+        print(f"  Static L_wme: {n_natural}/{d_obs} natural, {n_floored}/{d_obs} floored")
+
+    diagnostics['eigvals_raw'] = eigvals.tolist()
+    diagnostics['eigvals_regularized'] = eigvals_reg.tolist()
+    diagnostics['gamma_floor'] = float(gamma_floor)
+    diagnostics['n_natural'] = int(n_natural)
+    diagnostics['n_floored'] = int(n_floored)
+
+    # Create PETSc Mat from numpy array
+    mat = PETSc.Mat().create(comm=comm)
+    mat.setSizes((d_obs, d_obs))
+    mat.setType(PETSc.Mat.Type.DENSE)
+    mat.setUp()
+
+    if rank == 0:
+        for i in range(d_obs):
+            mat.setValues(i, list(range(d_obs)), L_dense[i, :])
+
+    mat.assemblyBegin()
+    mat.assemblyEnd()
+
+    L_wme_cov = DenseCovariance(comm, mat, inverse_method="cholesky")
+
+    return L_wme_cov, diagnostics
+
+
+def _run_sub_experiment(args, sub_label, method, config_overrides=None,
+                        static_L_wme=None, output_dir=None,
+                        nt_da=12, nt_ramp=144, phase_prefix="3",
+                        sweep_params=None):
+    """Run a single sub-experiment.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments.
+    sub_label : str
+        Sub-experiment label (e.g., "a", "b", "c").
+    method : str
+        DA method ("4dvar" or "dcwme").
+    config_overrides : dict, optional
+        Override config parameters.
+    static_L_wme : DenseCovariance, optional
+        Precomputed static L_wme for DC-WME static.
+    output_dir : Path
+        Output directory.
+    nt_da : int
+        Number of DA timesteps (default: 12 for 2h window).
+    nt_ramp : int
+        Number of ramp-up timesteps (default: 144 for 24h).
+    sweep_params : dict, optional
+        Parameter overrides for Phase 6 sweep. Keys override local
+        configuration variables (obs_fraction, obs_frequency, etc.).
+
+    Returns
+    -------
+    dict
+        Results dictionary.
+    """
+    import os
+    os.environ.setdefault("CC", "/usr/bin/clang")
+
+    from mpi4py import MPI
+    from swe4dvar.forward.adcirc_problem import ADCIRCProblem
+    from swe4dvar.forward.solvers import get_solver
+    from swe4dvar.utils import get_default_solver_params
+    from experiments.twin_experiment import (
+        TwinExperiment, TwinExperimentConfig, ForwardModelWrapper,
+    )
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    # ================================================================
+    # Configuration
+    # ================================================================
+    dt = 600.0
+    nt_total = nt_ramp + nt_da
+
+    obs_fraction = 0.1
+    obs_frequency = 6
+    obs_noise_level = 0.01
+    background_error_std = 0.02
+    cov_inflation_factor = 10.0
+    max_iterations = 15
+    friction_scale_factor = 1.15
+
+    # Override with sweep parameters (Phase 6)
+    if sweep_params:
+        obs_fraction = sweep_params.get("obs_fraction", obs_fraction)
+        obs_frequency = sweep_params.get("obs_frequency", obs_frequency)
+        obs_noise_level = sweep_params.get("obs_noise_level", obs_noise_level)
+        background_error_std = sweep_params.get("background_error_std", background_error_std)
+        cov_inflation_factor = sweep_params.get("cov_inflation_factor", cov_inflation_factor)
+        friction_scale_factor = sweep_params.get("friction_scale_factor", friction_scale_factor)
+
+    # DC-WME parameters
+    predictability_gamma = 0.1
+    max_inflate_factor = 5.0
+    auto_inflate_B = True
+    adaptive_gamma = True
+
+    if rank == 0:
+        print(f"\n{'=' * 70}")
+        print(f"PHASE {phase_prefix}{sub_label.upper()}: {method.upper()}"
+              f"{' (static L_wme)' if sub_label == 'b' else ''}"
+              f"{' (dynamic L_wme)' if sub_label == 'c' else ''}")
+        print(f"{'=' * 70}")
+
+    # ================================================================
+    # Step 1: Create problem and solver
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 1: Creating problem and solver ---")
+
+    prob = ADCIRCProblem(
+        adios_file=args.adios_file,
+        spherical=True,
+        solution_var="h",
+        friction_law="mannings",
+        wd=True,
+        wd_alpha=1.5,
+        dt=dt,
+        bathy_adjustment=0,
+        nt=nt_total,
+        dramp=2.0,
+    )
+    solver = get_solver("DG")(prob, theta=1.0, p_degree=[1, 1])
+
+    warmup_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=10,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=True,
+    )
+
+    da_solver_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=25,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=False,
+        reduction_it=10,
+    )
+
+    if rank == 0:
+        n_nodes = prob.mesh.topology.index_map(0).size_local
+        n_dofs = len(solver.u.x.array)
+        print(f"  Mesh: {n_nodes} nodes, {n_dofs} DOFs")
+
+    # ================================================================
+    # Step 2: Warm-up
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 2: Running {nt_ramp}-step warm-up ---")
+
+    t_warmup_start = time.time()
+    prob.nt = nt_ramp
+    solver.time_loop(
+        solver_parameters=warmup_params,
+        stations=[],
+        plot_every=9999,
+        save_state=False,
+        store_jacobians=False,
+        enable_video=False,
+        monitor_progress=(rank == 0),
+    )
+    t_warmup = time.time() - t_warmup_start
+    t_da_start = prob.t
+
+    if rank == 0:
+        print(f"  Warm-up completed in {t_warmup:.1f}s")
+
+    # ================================================================
+    # Step 3: Set up TwinExperiment
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 3: Setting up DA window ({nt_da} timesteps) ---")
+
+    prob.nt = nt_da
+
+    config_kwargs = dict(
+        method=method,
+        obs_fraction=obs_fraction,
+        obs_frequency=obs_frequency,
+        obs_noise_level=obs_noise_level,
+        background_error_std=background_error_std,
+        background_correlation_length=500.0,
+        max_iterations=max_iterations,
+        max_funcs=30,  # Cap total function evals to prevent optimizer stalling
+        gradient_tolerance=1e-3,
+        cost_tolerance=1e-4,
+        n_windows=1,
+        perturb_friction=True,
+        friction_scale_factor=friction_scale_factor,
+        use_bounds=True,
+        h_min=0.01,
+        interior_only=True,
+        component_aware_cov=True,
+        verbose=(rank == 0),
+    )
+
+    # DC-WME specific parameters
+    if method == "dcwme":
+        config_kwargs.update(
+            predictability_gamma=predictability_gamma,
+            max_inflate_factor=max_inflate_factor,
+            auto_inflate_B=auto_inflate_B,
+            adaptive_gamma=adaptive_gamma,
+        )
+        if static_L_wme is not None:
+            # Phase 3b: skip analytical L_wme computation
+            config_kwargs['l_wme_samples'] = 0
+
+    # Handle friction_scale_factor=1.0 (no model error / inverse crime reference)
+    if sweep_params and friction_scale_factor == 1.0:
+        config_kwargs["perturb_friction"] = False
+        config_kwargs["friction_scale_factor"] = 1.0
+
+    if config_overrides:
+        config_kwargs.update(config_overrides)
+
+    config = TwinExperimentConfig(**config_kwargs)
+
+    exp = TwinExperiment(
+        problem=prob, solver=solver, config=config,
+        solver_params=da_solver_params, comm=comm,
+    )
+
+    # ================================================================
+    # Step 4: Generate truth + apply friction perturbation
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 4: Generating truth trajectory ---", flush=True)
+
+    t_truth_start = time.time()
+    exp._generate_truth()
+    t_truth = time.time() - t_truth_start
+    exp.solver.storage.clear()
+
+    if rank == 0:
+        print(f"  Truth: {len(exp.truth_trajectory)} states, generated in {t_truth:.1f}s")
+        print(f"\n--- Step 4b: Applying friction perturbation (×{friction_scale_factor}) ---", flush=True)
+
+    exp._apply_physics_perturbations()
+
+    # ================================================================
+    # Step 5: Setup observations, background, covariances
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 5: Setting up observations and background ---", flush=True)
+
+    # Temporarily set method to "4dvar" to prevent _setup_covariances from building
+    # the dense B_lwme correlation matrix (52020×52020 = 21 GB, causes OOM).
+    # We use diagonal B for all Phase 3 experiments (per plan: "diagonal B for Phases 0-3").
+    # Static L_wme is computed directly from H·B·Hᵀ, dynamic L_wme uses diagonal B.
+    original_method = exp.config.method
+    exp.config.method = "4dvar"  # Skip dense B_lwme construction
+
+    obs_points, obs_operator, obs_times = exp._setup_observations()
+    exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, obs_times)
+    background_error = exp._setup_background()
+    B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
+
+    exp.config.method = original_method  # Restore original method
+
+    if cov_inflation_factor != 1.0:
+        B.diagonal.scale(cov_inflation_factor)
+        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
+        if rank == 0:
+            print(f"  B covariance inflated by {cov_inflation_factor}x")
+
+    n_obs = obs_operator.get_num_observations()
+    if rank == 0:
+        print(f"  Observation points: {n_obs}")
+        print(f"  Observation times: {obs_times}")
+        print(f"  Background RMS error: {background_error:.6f}", flush=True)
+
+    # ================================================================
+    # Step 5b: Compute static L_wme if needed
+    # ================================================================
+    static_diagnostics = None
+    if method == "dcwme" and static_L_wme is None:
+        if rank == 0:
+            print("\n--- Step 5b: Computing static L_wme ---", flush=True)
+        static_L_wme, static_diagnostics = _compute_static_L_wme(
+            obs_operator, B, len(obs_times), obs_noise_level ** 2,
+            exp.m_true, predictability_gamma=predictability_gamma,
+            adaptive_gamma=adaptive_gamma, max_inflate_factor=max_inflate_factor,
+            comm=comm, rank=rank,
+        )
+        if rank == 0:
+            print("  Static L_wme computed successfully", flush=True)
+    elif static_L_wme is not None and rank == 0:
+        print("\n  Using precomputed static L_wme")
+
+    # Memory cleanup before cost function init
+    import gc
+    exp.solver.storage.clear()
+    gc.collect()
+
+    # ================================================================
+    # Step 6: Create forward model
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 6: Creating forward model (t_start={t_da_start:.0f}s) ---", flush=True)
+
+    forward_model = exp._create_forward_model(t_start=t_da_start)
+
+    # ================================================================
+    # Step 7: Setup cost function
+    # ================================================================
+    if rank == 0:
+        method_label = method.upper()
+        if static_L_wme is not None:
+            method_label += " (static L_wme)"
+        print(f"\n--- Step 7: Setting up {method_label} cost function ---", flush=True)
+
+    if static_L_wme is not None:
+        # Phase 3b: pass precomputed static L_wme
+        from swe4dvar.data_assimilation.cost_functions import DCWMEFourDVarCost
+
+        cost_function = DCWMEFourDVarCost(
+            forward_model=forward_model,
+            observation_operator=obs_operator,
+            background_cov=B,
+            observation_cov=R,
+            m_background=exp.m_background,
+            observations=exp.observations,
+            obs_times=obs_times,
+            predicted_cov_wme=static_L_wme,
+            n_l_wme_samples=0,  # Skip analytical computation
+            auto_inflate_B=False,  # Already inflated in static computation
+            max_inflate_factor=max_inflate_factor,
+            predictability_gamma=predictability_gamma,
+            adaptive_gamma=adaptive_gamma,
+            comm=comm,
+        )
+
+        # Wrap with boundary gradient zeroing if needed
+        if config.interior_only:
+            from experiments.twin_experiment import ZeroBoundaryGradientCost
+            boundary_dofs = exp._get_boundary_dofs()
+            cost_function = ZeroBoundaryGradientCost(cost_function, boundary_dofs)
+            if rank == 0:
+                print(f"  Zeroing {len(boundary_dofs)} boundary DOF gradients")
+
+        # Disable M^{-1} preconditioning (same as Phase 1/2)
+        if rank == 0:
+            print(f"  M^{{-1}} preconditioning DISABLED (causes ill-conditioning)")
+    else:
+        cost_function = exp._setup_cost_function(
+            forward_model, obs_operator, B, R, obs_times, B_lwme=B_lwme
+        )
+
+    # ================================================================
+    # Step 7b: Attach gradient smoother
+    # ================================================================
+    gradient_smoothing_length = 500.0
+    if config.background_correlation_length > 0:
+        if rank == 0:
+            print("\n--- Step 7b: Building gradient smoother ---")
+
+        h_indices, u_indices, v_indices = exp._get_component_dof_indices(owned_only=True)
+        smoothing_matrix = exp._build_smoothing_matrix(
+            h_indices, gradient_smoothing_length
+        )
+
+        def gradient_smoother(grad_array):
+            smoothed = grad_array.copy()
+            smoothed[h_indices] = smoothing_matrix @ grad_array[h_indices]
+            smoothed[u_indices] = smoothing_matrix @ grad_array[u_indices]
+            smoothed[v_indices] = smoothing_matrix @ grad_array[v_indices]
+            return smoothed
+
+        inner_cost = cost_function
+        while hasattr(inner_cost, 'base_cost'):
+            inner_cost = inner_cost.base_cost
+        inner_cost.gradient_smoother = gradient_smoother
+
+        if rank == 0:
+            print(f"  Gradient smoother attached (L={gradient_smoothing_length}m)")
+
+    # ================================================================
+    # Step 8: Run optimization
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 8: Running L-BFGS optimization ---")
+
+    optimizer, opt_time = exp._run_optimization(cost_function)
+
+    cost_history = [h["cost"] for h in optimizer.convergence_history]
+    gradient_history = [h["grad_norm"] for h in optimizer.convergence_history]
+
+    if rank == 0:
+        print(f"  Iterations: {optimizer.iteration}")
+        print(f"  Converged: {optimizer.converged}")
+        print(f"  Optimization time: {opt_time:.1f}s")
+        if cost_history:
+            print(f"  Cost: {cost_history[0]:.6f} → {cost_history[-1]:.6f}")
+        if gradient_history:
+            print(f"  ||grad||: {gradient_history[0]:.6e} → {gradient_history[-1]:.6e}")
+
+    # ================================================================
+    # Step 9: Evaluate results
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 9: Evaluating results ---")
+
+    if cost_history and cost_history[-1] >= 1e19:
+        if rank == 0:
+            print("  WARNING: Optimization failed (cost diverged)")
+        analysis_error = background_error
+        error_reduction = 0.0
+        innov_mean = innov_std = mean_rmse = data_misfit = 0.0
+    else:
+        analysis_error, error_reduction, innov_mean, innov_std, mean_rmse, data_misfit = (
+            exp._evaluate_results(obs_operator, obs_times, background_error)
+        )
+
+    total_time = t_warmup + t_truth + opt_time
+
+    if rank == 0:
+        print(f"\n  Background error:  {background_error:.6f}")
+        print(f"  Analysis error:    {analysis_error:.6f}")
+        print(f"  Error reduction:   {error_reduction:.1f}%")
+        print(f"  Mean RMSE:         {mean_rmse:.6f}")
+        print(f"  Data misfit:       {data_misfit:.6f}")
+
+    # ================================================================
+    # Step 10: Extract DC-WME diagnostics
+    # ================================================================
+    dcwme_diagnostics = {}
+    if method == "dcwme":
+        # Get the inner cost function (unwrap boundary gradient zeroing)
+        inner = cost_function
+        while hasattr(inner, 'base_cost'):
+            inner = inner.base_cost
+
+        if hasattr(inner, '_b_inflation_factor'):
+            dcwme_diagnostics['b_inflation_factor'] = float(inner._b_inflation_factor)
+        if hasattr(inner, '_gram_eigenvalues') and inner._gram_eigenvalues is not None:
+            dcwme_diagnostics['gram_eigenvalues'] = [float(v) for v in inner._gram_eigenvalues]
+        if hasattr(inner, '_L_wme') and inner._L_wme is not None:
+            # Extract L_wme eigenvalues for diagnostics
+            try:
+                L_wme_mat = inner._L_wme
+                if hasattr(L_wme_mat, 'mat'):
+                    n = L_wme_mat.mat.getSize()[0]
+                    L_dense_np = np.zeros((n, n))
+                    rstart, rend = L_wme_mat.mat.getOwnershipRange()
+                    for i in range(rstart, rend):
+                        cols, vals = L_wme_mat.mat.getRow(i)
+                        for c, v in zip(cols, vals):
+                            L_dense_np[i, c] = v
+                    l_eigvals = np.linalg.eigvalsh(L_dense_np)
+                    dcwme_diagnostics['l_wme_eigenvalues'] = [float(v) for v in l_eigvals]
+                    dcwme_diagnostics['l_wme_n_natural'] = int(np.sum(l_eigvals > predictability_gamma * l_eigvals.max()))
+            except Exception as e:
+                if rank == 0:
+                    print(f"  Warning: Could not extract L_wme eigenvalues: {e}")
+
+        if static_diagnostics is not None:
+            dcwme_diagnostics['static_lwme'] = static_diagnostics
+
+    # ================================================================
+    # Step 11: Save results
+    # ================================================================
+    results = None
+    if rank == 0:
+        results = {
+            "phase": f"{phase_prefix}{sub_label}",
+            "status": "success",
+            "method": method,
+            "model_error": True,
+            "model_error_type": "friction",
+            "friction_scale_factor": friction_scale_factor,
+            "l_wme_type": "static" if sub_label == "b" else ("dynamic" if sub_label == "c" else "N/A"),
+            "config": {
+                "dt": dt,
+                "nt_ramp": nt_ramp,
+                "nt_da": nt_da,
+                "t_da_start_s": t_da_start,
+                "obs_fraction": obs_fraction,
+                "obs_frequency": obs_frequency,
+                "obs_noise_level": obs_noise_level,
+                "background_error_std": background_error_std,
+                "max_iterations": max_iterations,
+                "n_obs_points": n_obs,
+                "obs_times": obs_times,
+                "predictability_gamma": predictability_gamma,
+                "max_inflate_factor": max_inflate_factor,
+            },
+            "results": {
+                "background_error": float(background_error),
+                "analysis_error": float(analysis_error),
+                "error_reduction": float(error_reduction),
+                "mean_rmse": float(mean_rmse),
+                "data_misfit": float(data_misfit),
+                "innovation_mean": float(innov_mean),
+                "innovation_std": float(innov_std),
+                "num_iterations": int(optimizer.iteration),
+                "converged": bool(optimizer.converged),
+            },
+            "convergence": {
+                "cost_history": [float(c) for c in cost_history],
+                "gradient_norm_history": [float(g) for g in gradient_history],
+            },
+            "dcwme_diagnostics": dcwme_diagnostics,
+            "timing": {
+                "warmup_s": float(t_warmup),
+                "truth_generation_s": float(t_truth),
+                "optimization_s": float(opt_time),
+                "total_s": float(total_time),
+            },
+        }
+
+        results_file = output_dir / "data" / f"phase{phase_prefix}{sub_label}_results.json"
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=2)
+
+        print(f"\n{'=' * 70}")
+        print(f"PHASE {phase_prefix}{sub_label.upper()}: {method.upper()}"
+              f"{' (static L_wme)' if sub_label == 'b' else ''}"
+              f"{' (dynamic L_wme)' if sub_label == 'c' else ''}")
+        print(f"  Error reduction: {error_reduction:.1f}%")
+        print(f"  Iterations: {optimizer.iteration}")
+        print(f"  Converged: {optimizer.converged}")
+        print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
+        print(f"  Results saved to: {results_file}")
+        print(f"{'=' * 70}")
+
+    return results
+
+
+def run_phase_3(args):
+    """Phase 3: Single-Window DC-WME vs 4D-Var Comparison.
+
+    Runs three sub-experiments on the same configuration as Phase 2:
+    - 3a: Standard 4D-Var baseline (for seed-consistent comparison)
+    - 3b: DC-WME with static L_wme = (N/σ²_obs) · H B Hᵀ
+    - 3c: DC-WME with dynamic L_wme = J_wme B J_wmeᵀ (adjoint-computed)
+    """
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    output_dir = Path(args.output_dir)
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "data").mkdir(exist_ok=True)
+    comm.Barrier()
+
+    if rank == 0:
+        print("=" * 70)
+        print("PHASE 3: SINGLE-WINDOW DC-WME vs 4D-VAR COMPARISON")
+        print("=" * 70)
+        print("  Sub-experiments:")
+        print("    3a: Standard 4D-Var (baseline)")
+        print("    3b: DC-WME with static L_wme")
+        print("    3c: DC-WME with dynamic L_wme")
+        print("=" * 70)
+
+    # Determine which sub-experiments to run
+    sub = getattr(args, 'sub', None)
+    if sub:
+        subs_to_run = [sub]
+    else:
+        subs_to_run = ["a", "b", "c"]
+
+    all_results = {}
+
+    for sub_label in subs_to_run:
+        if sub_label == "a":
+            result = _run_sub_experiment(
+                args, sub_label="a", method="4dvar",
+                output_dir=output_dir,
+            )
+        elif sub_label == "b":
+            result = _run_sub_experiment(
+                args, sub_label="b", method="dcwme",
+                output_dir=output_dir,
+            )
+        elif sub_label == "c":
+            result = _run_sub_experiment(
+                args, sub_label="c", method="dcwme",
+                output_dir=output_dir,
+            )
+        else:
+            if rank == 0:
+                print(f"Unknown sub-experiment: 3{sub_label}")
+            continue
+
+        all_results[f"3{sub_label}"] = result
+
+    # Print comparison summary
+    if rank == 0 and len(all_results) > 1:
+        print(f"\n{'=' * 70}")
+        print("PHASE 3 COMPARISON SUMMARY")
+        print(f"{'=' * 70}")
+        print(f"{'Sub-exp':<10} {'Method':<20} {'Error Red.':<12} {'Iters':<8} {'Conv.':<8} {'Time (min)':<10}")
+        print(f"{'-' * 68}")
+        for key, res in all_results.items():
+            if res is not None:
+                r = res['results']
+                t = res['timing']
+                lwme = res.get('l_wme_type', 'N/A')
+                method_label = f"{res['method']}"
+                if lwme != 'N/A':
+                    method_label += f" ({lwme})"
+                print(f"{key:<10} {method_label:<20} {r['error_reduction']:.1f}%{'':<7} "
+                      f"{r['num_iterations']:<8} {'Yes' if r['converged'] else 'No':<8} "
+                      f"{t['total_s']/60:.1f}")
+        print(f"{'=' * 70}")
+
+    return all_results
+
+
+# ====================================================================
+# Phase 4: Cycling Comparison
+# ====================================================================
+
+def _run_cycling_experiment(args, sub_label, method, output_dir=None):
+    """Run a single Phase 4 cycling experiment (one method).
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command line arguments.
+    sub_label : str
+        Sub-experiment label ("a", "b", "c").
+    method : str
+        DA method ("4dvar" or "dcwme").
+    output_dir : Path
+        Output directory.
+
+    Returns
+    -------
+    dict
+        Results dictionary with per-window metrics.
+    """
+    import os
+    import gc
+    os.environ.setdefault("CC", "/usr/bin/clang")
+
+    from mpi4py import MPI
+    from petsc4py import PETSc
+    from swe4dvar.forward.adcirc_problem import ADCIRCProblem
+    from swe4dvar.forward.solvers import get_solver
+    from swe4dvar.utils import get_default_solver_params
+    from experiments.twin_experiment import (
+        TwinExperiment, TwinExperimentConfig, ForwardModelWrapper,
+        ZeroBoundaryGradientCost,
+    )
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    # ================================================================
+    # Configuration
+    # ================================================================
+    dt = 600.0
+    nt_ramp = 288          # 48h ramp
+    n_windows = 6
+    window_nt = 71         # ~11.8h per window
+    nt_da_total = n_windows * window_nt  # 426 timesteps total DA
+
+    obs_fraction = 0.1
+    obs_frequency = 6      # every hour
+    obs_noise_level = 0.01
+    background_error_std = 0.02
+    cov_inflation_factor = 10.0
+    max_iterations = 15
+    friction_scale_factor = 1.15
+
+    # DC-WME parameters
+    predictability_gamma = 0.1
+    max_inflate_factor = 5.0
+    auto_inflate_B = True
+    adaptive_gamma = True
+
+    l_wme_type = "N/A"
+    if sub_label == "b":
+        l_wme_type = "static"
+    elif sub_label == "c":
+        l_wme_type = "dynamic"
+
+    if rank == 0:
+        print(f"\n{'=' * 70}")
+        print(f"PHASE 4{sub_label.upper()}: CYCLING {method.upper()}"
+              f"{' (static L_wme)' if sub_label == 'b' else ''}"
+              f"{' (dynamic L_wme)' if sub_label == 'c' else ''}")
+        print(f"  {n_windows} windows × {window_nt} timesteps "
+              f"({window_nt * dt / 3600:.1f}h each)")
+        print(f"{'=' * 70}", flush=True)
+
+    t_total_start = time.time()
+
+    # ================================================================
+    # Step 1: Create problem and solver
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 1: Creating problem and solver ---", flush=True)
+
+    prob = ADCIRCProblem(
+        adios_file=args.adios_file,
+        spherical=True,
+        solution_var="h",
+        friction_law="mannings",
+        wd=True,
+        wd_alpha=1.5,
+        dt=dt,
+        bathy_adjustment=0,
+        nt=nt_ramp + nt_da_total,
+        dramp=2.0,
+    )
+    solver = get_solver("DG")(prob, theta=1.0, p_degree=[1, 1])
+
+    warmup_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=10,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=True,
+    )
+
+    da_solver_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=25,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=False,
+        reduction_it=10,
+    )
+
+    if rank == 0:
+        n_nodes = prob.mesh.topology.index_map(0).size_local
+        n_dofs = len(solver.u.x.array)
+        print(f"  Mesh: {n_nodes} nodes, {n_dofs} DOFs")
+
+    # ================================================================
+    # Step 2: Warm-up (48h ramp)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 2: Running {nt_ramp}-step warm-up ({nt_ramp * dt / 3600:.0f}h) ---",
+              flush=True)
+
+    t_warmup_start = time.time()
+    prob.nt = nt_ramp
+    solver.time_loop(
+        solver_parameters=warmup_params,
+        stations=[],
+        plot_every=9999,
+        save_state=False,
+        store_jacobians=False,
+        enable_video=False,
+        monitor_progress=(rank == 0),
+    )
+    t_warmup = time.time() - t_warmup_start
+    t_da_start = prob.t  # Time after ramp
+
+    if rank == 0:
+        print(f"  Warm-up completed in {t_warmup:.1f}s ({t_warmup/60:.1f} min)")
+
+    # ================================================================
+    # Step 3: Set up TwinExperiment for full DA period
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 3: Setting up DA ({nt_da_total} timesteps, "
+              f"{nt_da_total * dt / 3600:.1f}h) ---", flush=True)
+
+    prob.nt = nt_da_total
+
+    config_kwargs = dict(
+        method=method,
+        obs_fraction=obs_fraction,
+        obs_frequency=obs_frequency,
+        obs_noise_level=obs_noise_level,
+        background_error_std=background_error_std,
+        background_correlation_length=500.0,
+        max_iterations=max_iterations,
+        max_funcs=30,  # Cap total function evals per window to prevent line search stalling
+        gradient_tolerance=1e-3,
+        cost_tolerance=1e-4,
+        n_windows=1,  # We manage cycling ourselves
+        perturb_friction=True,
+        friction_scale_factor=friction_scale_factor,
+        use_bounds=True,
+        h_min=0.01,
+        interior_only=True,
+        component_aware_cov=True,
+        verbose=(rank == 0),
+    )
+
+    if method == "dcwme":
+        config_kwargs.update(
+            predictability_gamma=predictability_gamma,
+            max_inflate_factor=max_inflate_factor,
+            auto_inflate_B=auto_inflate_B,
+            adaptive_gamma=adaptive_gamma,
+        )
+
+    config = TwinExperimentConfig(**config_kwargs)
+
+    exp = TwinExperiment(
+        problem=prob, solver=solver, config=config,
+        solver_params=da_solver_params, comm=comm,
+    )
+
+    # ================================================================
+    # Step 4: Generate truth for full DA period
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 4: Generating truth trajectory ---", flush=True)
+
+    t_truth_start = time.time()
+    exp._generate_truth()
+    t_truth = time.time() - t_truth_start
+    exp.solver.storage.clear()
+
+    if rank == 0:
+        print(f"  Truth: {len(exp.truth_trajectory)} states in {t_truth:.1f}s")
+        print(f"\n--- Step 4b: Applying friction perturbation (×{friction_scale_factor}) ---",
+              flush=True)
+
+    exp._apply_physics_perturbations()
+
+    # ================================================================
+    # Step 5: Setup observations, background, covariances for full period
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 5: Setting up observations and background ---", flush=True)
+
+    # Use "4dvar" trick to avoid dense B_lwme construction (OOM)
+    original_method = exp.config.method
+    exp.config.method = "4dvar"
+
+    obs_points, obs_operator, global_obs_times = exp._setup_observations()
+    exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, global_obs_times)
+    background_error = exp._setup_background()
+    B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
+
+    exp.config.method = original_method
+
+    if cov_inflation_factor != 1.0:
+        B.diagonal.scale(cov_inflation_factor)
+        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
+        if rank == 0:
+            print(f"  B covariance inflated by {cov_inflation_factor}x")
+
+    n_obs = obs_operator.get_num_observations()
+    if rank == 0:
+        print(f"  Observation points: {n_obs}")
+        print(f"  Global observation times: {global_obs_times}")
+        print(f"  Background RMS error: {background_error:.6f}", flush=True)
+
+    # Pre-compute gradient smoother (same for all windows)
+    gradient_smoothing_length = 500.0
+    gradient_smoother = None
+    if config.background_correlation_length > 0:
+        h_indices, u_indices, v_indices = exp._get_component_dof_indices(owned_only=True)
+        smoothing_matrix = exp._build_smoothing_matrix(h_indices, gradient_smoothing_length)
+
+        def gradient_smoother(grad_array):
+            smoothed = grad_array.copy()
+            smoothed[h_indices] = smoothing_matrix @ grad_array[h_indices]
+            smoothed[u_indices] = smoothing_matrix @ grad_array[u_indices]
+            smoothed[v_indices] = smoothing_matrix @ grad_array[v_indices]
+            return smoothed
+
+        if rank == 0:
+            print(f"  Gradient smoother built (L={gradient_smoothing_length}m)")
+
+    # Pre-compute boundary DOFs (same for all windows)
+    boundary_dofs = exp._get_boundary_dofs() if config.interior_only else None
+
+    # Memory cleanup before cycling
+    exp.solver.storage.clear()
+    gc.collect()
+
+    # ================================================================
+    # Step 6: Cycling loop
+    # ================================================================
+    per_window_results = []
+    all_cost_history = []
+    all_gradient_history = []
+    total_iterations = 0
+
+    # Store original B diagonal for per-window scaling
+    B_diag_original = B.diagonal.copy()
+    B_inv_diag_original = B.inv_diagonal.copy()
+
+    for w in range(n_windows):
+        t_window_start = time.time()
+        t_start_window = t_da_start + w * window_nt * dt
+        t_end_window = t_da_start + (w + 1) * window_nt * dt
+
+        if rank == 0:
+            print(f"\n{'=' * 60}")
+            print(f"  Window {w + 1}/{n_windows}: t = {t_start_window / 3600:.1f}h - "
+                  f"{t_end_window / 3600:.1f}h")
+            print(f"{'=' * 60}", flush=True)
+
+        # a) Compute per-window background error for B scaling
+        truth_idx = w * window_nt
+        if w == 0:
+            window_bg_error = background_error
+        else:
+            diff_bg = exp.m_background.copy()
+            diff_bg.axpy(-1.0, exp.truth_trajectory[truth_idx])
+            window_bg_error = np.sqrt(diff_bg.dot(diff_bg) / diff_bg.getSize())
+            diff_bg.destroy()
+
+        # Scale B proportionally to actual background error vs initial
+        # This prevents overfitting when propagated background is already close to truth
+        b_scale = min(window_bg_error / background_error, 1.0) if background_error > 0 else 1.0
+        b_scale = max(b_scale, 0.01)  # Floor: at least 1% of original B
+
+        # Restore original B and apply per-window scaling
+        B.diagonal.copy(result=B.diagonal)  # no-op, overwrite below
+        B_diag_original.copy(result=B.diagonal)
+        B_inv_diag_original.copy(result=B.inv_diagonal)
+        if b_scale < 1.0:
+            B.diagonal.scale(b_scale)
+            B.inv_diagonal.scale(1.0 / b_scale)
+
+        if rank == 0:
+            print(f"  Background error:  {window_bg_error:.6f} "
+                  f"(B scale: {b_scale:.3f}x of original)", flush=True)
+
+        # b) Subset observations for this window
+        window_obs_indices = []
+        window_local_times = []
+        for i, gt in enumerate(global_obs_times):
+            if w * window_nt <= gt <= (w + 1) * window_nt:
+                # Remap to window-local time
+                local_t = gt - w * window_nt
+                # Include t=0 for first obs, but skip duplicates at boundaries
+                if local_t == 0 and w > 0:
+                    continue  # Skip boundary overlap (was end of previous window)
+                window_obs_indices.append(i)
+                window_local_times.append(local_t)
+
+        window_observations = [exp.observations[i] for i in window_obs_indices]
+
+        if rank == 0:
+            print(f"  Window obs: {len(window_local_times)} at local times {window_local_times}",
+                  flush=True)
+
+        if len(window_observations) == 0:
+            if rank == 0:
+                print(f"  WARNING: No observations in window {w + 1}, skipping")
+            # Propagate background forward
+            if w < n_windows - 1:
+                new_bg = _propagate_state_safe(
+                    exp, window_nt, t_start_window, da_solver_params, rank
+                )
+                if new_bg is not None:
+                    exp.m_background = new_bg
+                else:
+                    if rank == 0:
+                        print(f"  WARNING: Propagation failed, stopping cycling")
+                    break
+            per_window_results.append({
+                "window": w,
+                "t_start_h": float(t_start_window / 3600),
+                "t_end_h": float(t_end_window / 3600),
+                "n_obs_times": 0,
+                "skipped": True,
+            })
+            continue
+
+        # c) Set problem.nt to window length for forward model
+        prob.nt = window_nt
+
+        # d) Create forward model for this window
+        if rank == 0:
+            print(f"  Creating forward model (t_start={t_start_window:.0f}s)", flush=True)
+        forward_model = exp._create_forward_model(t_start=t_start_window)
+
+        # e) Compute static L_wme for this window (Phase 4b only)
+        static_L_wme = None
+        static_diagnostics = None
+        if method == "dcwme" and sub_label == "b":
+            if rank == 0:
+                print(f"  Computing static L_wme for window {w + 1}...", flush=True)
+            t_lwme_start = time.time()
+            static_L_wme, static_diagnostics = _compute_static_L_wme(
+                obs_operator, B, len(window_local_times), obs_noise_level ** 2,
+                exp.m_background, predictability_gamma=predictability_gamma,
+                adaptive_gamma=adaptive_gamma, max_inflate_factor=max_inflate_factor,
+                comm=comm, rank=rank,
+            )
+            t_lwme = time.time() - t_lwme_start
+            if rank == 0:
+                print(f"  Static L_wme computed in {t_lwme:.1f}s", flush=True)
+
+        # f) Create cost function
+        if rank == 0:
+            method_label = method.upper()
+            if sub_label == "b":
+                method_label += " (static L_wme)"
+            elif sub_label == "c":
+                method_label += " (dynamic L_wme)"
+            print(f"  Setting up {method_label} cost function", flush=True)
+
+        if method == "dcwme" and static_L_wme is not None:
+            # Phase 4b: precomputed static L_wme
+            from swe4dvar.data_assimilation.cost_functions import DCWMEFourDVarCost
+
+            cost_function = DCWMEFourDVarCost(
+                forward_model=forward_model,
+                observation_operator=obs_operator,
+                background_cov=B,
+                observation_cov=R,
+                m_background=exp.m_background,
+                observations=window_observations,
+                obs_times=window_local_times,
+                predicted_cov_wme=static_L_wme,
+                n_l_wme_samples=0,
+                auto_inflate_B=False,
+                max_inflate_factor=max_inflate_factor,
+                predictability_gamma=predictability_gamma,
+                adaptive_gamma=adaptive_gamma,
+                comm=comm,
+            )
+
+            if boundary_dofs is not None:
+                cost_function = ZeroBoundaryGradientCost(cost_function, boundary_dofs)
+        else:
+            # Phase 4a (4D-Var) or 4c (dynamic DC-WME)
+            orig_observations = exp.observations
+            exp.observations = window_observations
+            cost_function = exp._setup_cost_function(
+                forward_model, obs_operator, B, R, window_local_times, B_lwme=B_lwme
+            )
+            exp.observations = orig_observations
+
+        # g) Attach gradient smoother
+        if gradient_smoother is not None:
+            inner_cost = cost_function
+            while hasattr(inner_cost, 'base_cost'):
+                inner_cost = inner_cost.base_cost
+            inner_cost.gradient_smoother = gradient_smoother
+
+        # h) Run optimization
+        if rank == 0:
+            print(f"  Running L-BFGS optimization (max {max_iterations} iters)...", flush=True)
+
+        optimizer, opt_time = exp._run_optimization(cost_function)
+
+        window_cost = [h["cost"] for h in optimizer.convergence_history]
+        window_grad = [h["grad_norm"] for h in optimizer.convergence_history]
+        all_cost_history.extend(window_cost)
+        all_gradient_history.extend(window_grad)
+        total_iterations += optimizer.iteration
+
+        # Check if optimization failed (inf cost on first eval)
+        opt_failed = window_cost and window_cost[0] >= 1e19
+
+        if rank == 0:
+            print(f"  Window {w + 1}: {optimizer.iteration} iters, "
+                  f"converged={optimizer.converged}", flush=True)
+            if window_cost:
+                print(f"  Cost: {window_cost[0]:.1f} → {window_cost[-1]:.1f}")
+            if opt_failed:
+                print(f"  WARNING: Forward model failed — using background as analysis")
+
+        # If optimization failed, use background as analysis
+        if opt_failed:
+            exp.m_analysis = exp.m_background.copy()
+
+        # i) Compute per-window analysis error
+        if w == 0:
+            diff = exp.m_analysis.copy()
+            diff.axpy(-1.0, exp.m_true)
+            analysis_error = np.sqrt(diff.dot(diff) / diff.getSize())
+            diff.destroy()
+        else:
+            diff = exp.m_analysis.copy()
+            diff.axpy(-1.0, exp.truth_trajectory[truth_idx])
+            analysis_error = np.sqrt(diff.dot(diff) / diff.getSize())
+            diff.destroy()
+
+        window_err_reduction = (window_bg_error - analysis_error) / window_bg_error * 100 if window_bg_error > 0 else 0.0
+
+        if rank == 0:
+            print(f"  Analysis error:    {analysis_error:.6f}")
+            print(f"  Error reduction:   {window_err_reduction:.1f}%", flush=True)
+
+        # i) Extract DC-WME diagnostics
+        window_dcwme_diag = {}
+        if method == "dcwme":
+            inner = cost_function
+            while hasattr(inner, 'base_cost'):
+                inner = inner.base_cost
+
+            if hasattr(inner, '_b_inflation_factor'):
+                window_dcwme_diag['b_inflation_factor'] = float(inner._b_inflation_factor)
+            if hasattr(inner, '_gram_eigenvalues') and inner._gram_eigenvalues is not None:
+                window_dcwme_diag['gram_eigenvalues'] = [float(v) for v in inner._gram_eigenvalues]
+            if hasattr(inner, '_L_wme') and inner._L_wme is not None:
+                try:
+                    L_wme_mat = inner._L_wme
+                    if hasattr(L_wme_mat, 'mat'):
+                        n = L_wme_mat.mat.getSize()[0]
+                        L_dense_np = np.zeros((n, n))
+                        rstart, rend = L_wme_mat.mat.getOwnershipRange()
+                        for i in range(rstart, rend):
+                            cols, vals = L_wme_mat.mat.getRow(i)
+                            for c, v in zip(cols, vals):
+                                L_dense_np[i, c] = v
+                        l_eigvals = np.linalg.eigvalsh(L_dense_np)
+                        window_dcwme_diag['l_wme_eigenvalues'] = [float(v) for v in l_eigvals]
+                        window_dcwme_diag['l_wme_n_natural'] = int(
+                            np.sum(l_eigvals > predictability_gamma * l_eigvals.max())
+                        )
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  Warning: Could not extract L_wme eigenvalues: {e}")
+
+            if static_diagnostics is not None:
+                window_dcwme_diag['static_lwme'] = static_diagnostics
+
+        t_window = time.time() - t_window_start
+        per_window_results.append({
+            "window": w,
+            "t_start_h": float(t_start_window / 3600),
+            "t_end_h": float(t_end_window / 3600),
+            "n_obs_times": len(window_local_times),
+            "iterations": int(optimizer.iteration),
+            "converged": bool(optimizer.converged),
+            "background_error": float(window_bg_error),
+            "analysis_error": float(analysis_error),
+            "error_reduction_pct": float(window_err_reduction),
+            "cost_initial": float(window_cost[0]) if window_cost else None,
+            "cost_final": float(window_cost[-1]) if window_cost else None,
+            "cost_history": [float(c) for c in window_cost],
+            "gradient_norm_history": [float(g) for g in window_grad],
+            "optimization_time_s": float(opt_time),
+            "window_time_s": float(t_window),
+            "dcwme_diagnostics": window_dcwme_diag,
+        })
+
+        if rank == 0:
+            print(f"  Window {w + 1} time: {t_window:.1f}s ({t_window / 60:.1f} min)")
+
+        # j) Propagate analysis forward to next window
+        if w < n_windows - 1:
+            if rank == 0:
+                print(f"  Propagating analysis to next window...", flush=True)
+            new_bg = _propagate_state_safe(
+                exp, window_nt, t_start_window, da_solver_params, rank
+            )
+            if new_bg is not None:
+                exp.m_background = new_bg
+            else:
+                if rank == 0:
+                    print(f"  WARNING: Propagation failed at window {w + 1}, stopping cycling")
+                # Record remaining windows as skipped
+                for w_skip in range(w + 1, n_windows):
+                    t_s = t_da_start + w_skip * window_nt * dt
+                    t_e = t_da_start + (w_skip + 1) * window_nt * dt
+                    per_window_results.append({
+                        "window": w_skip,
+                        "t_start_h": float(t_s / 3600),
+                        "t_end_h": float(t_e / 3600),
+                        "n_obs_times": 0,
+                        "skipped": True,
+                        "skip_reason": "propagation_failure",
+                    })
+                break
+
+        # k) Memory cleanup
+        exp.solver.storage.clear()
+        gc.collect()
+
+    # Restore problem.nt
+    prob.nt = nt_ramp + nt_da_total
+
+    # ================================================================
+    # Aggregate results
+    # ================================================================
+    total_time = time.time() - t_total_start
+
+    # Final analysis error (from last window)
+    final_analysis_error = per_window_results[-1]["analysis_error"] if per_window_results else background_error
+    cumulative_reduction = (background_error - final_analysis_error) / background_error * 100
+
+    if rank == 0:
+        print(f"\n{'=' * 60}")
+        print(f"  CYCLING COMPLETE: {total_iterations} total iterations across {n_windows} windows")
+        print(f"  Initial background error: {background_error:.6f}")
+        print(f"  Final analysis error:     {final_analysis_error:.6f}")
+        print(f"  Cumulative reduction:     {cumulative_reduction:.1f}%")
+        print(f"  Total time: {total_time:.1f}s ({total_time / 60:.1f} min)")
+        print(f"{'=' * 60}", flush=True)
+
+    # Save results
+    results = None
+    if rank == 0:
+        results = {
+            "phase": f"4{sub_label}",
+            "status": "success",
+            "method": method,
+            "l_wme_type": l_wme_type,
+            "model_error": True,
+            "model_error_type": "friction",
+            "friction_scale_factor": friction_scale_factor,
+            "config": {
+                "dt": dt,
+                "nt_ramp": nt_ramp,
+                "n_windows": n_windows,
+                "window_nt": window_nt,
+                "nt_da_total": nt_da_total,
+                "t_da_start_s": t_da_start,
+                "obs_fraction": obs_fraction,
+                "obs_frequency": obs_frequency,
+                "obs_noise_level": obs_noise_level,
+                "background_error_std": background_error_std,
+                "cov_inflation_factor": cov_inflation_factor,
+                "max_iterations": max_iterations,
+                "n_obs_points": n_obs,
+                "predictability_gamma": predictability_gamma,
+                "max_inflate_factor": max_inflate_factor,
+            },
+            "per_window": per_window_results,
+            "aggregate": {
+                "total_iterations": total_iterations,
+                "initial_background_error": float(background_error),
+                "final_analysis_error": float(final_analysis_error),
+                "cumulative_error_reduction_pct": float(cumulative_reduction),
+                "total_time_s": float(total_time),
+                "warmup_time_s": float(t_warmup),
+                "truth_time_s": float(t_truth),
+            },
+            "convergence": {
+                "cost_history": [float(c) for c in all_cost_history],
+                "gradient_norm_history": [float(g) for g in all_gradient_history],
+            },
+        }
+
+        results_file = output_dir / "data" / f"phase4{sub_label}_results.json"
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=2)
+
+        print(f"\n  Results saved to: {results_file}")
+
+    return results
+
+
+def _propagate_state_safe(exp, window_nt, t_start, solver_params, rank=0):
+    """Propagate analysis state forward by window_nt timesteps.
+
+    Uses the same pattern as TwinExperiment._propagate_forward().
+    Returns a PETSc Vec with the final state, or None if propagation fails.
+    """
+    exp.solver.storage.clear()
+
+    # Set initial condition from analysis
+    m_array = exp.m_analysis.getArray()
+    u_owned_size = exp.solver.V.dofmap.index_map.size_local
+    if len(m_array) == len(exp.solver.u_n.x.array):
+        exp.solver.u_n.x.array[:] = m_array
+        exp.solver.u_n_old.x.array[:] = m_array
+        exp.solver.u.x.array[:] = m_array
+    else:
+        exp.solver.u_n.x.array[:u_owned_size] = m_array
+        exp.solver.u_n_old.x.array[:u_owned_size] = m_array
+        exp.solver.u.x.array[:u_owned_size] = m_array
+        exp.solver.u_n.x.scatter_forward()
+        exp.solver.u_n_old.x.scatter_forward()
+        exp.solver.u.x.scatter_forward()
+
+    # Set time and nt for propagation
+    orig_nt = exp.problem.nt
+    exp.problem.nt = window_nt
+    exp.problem.t = t_start
+
+    try:
+        exp.solver.time_loop(
+            solver_parameters=solver_params,
+            stations=np.array([[0.0, 0.0, 0.0]]),
+            plot_every=9999,
+            save_state=True,
+            enable_video=False,
+        )
+
+        if not exp.solver.storage.saved_states:
+            if rank == 0:
+                print("  WARNING: No states saved during propagation")
+            exp.problem.nt = orig_nt
+            exp.solver.storage.clear()
+            return None
+
+        # Get final state
+        final_state = exp.solver.storage.saved_states[-1]
+        from dolfinx import la
+        vec = la.create_petsc_vector(
+            exp.solver.V.dofmap.index_map,
+            exp.solver.V.dofmap.index_map_bs,
+        )
+        vec.setArray(final_state[:u_owned_size])
+        vec.assemble()
+
+        # Sanity check: reject states with NaN or extremely large values
+        arr = vec.getArray()
+        if np.any(np.isnan(arr)) or np.any(np.abs(arr) > 1e10):
+            if rank == 0:
+                print(f"  WARNING: Propagated state has NaN or extreme values "
+                      f"(max={np.nanmax(np.abs(arr)):.2e})")
+            vec.destroy()
+            exp.problem.nt = orig_nt
+            exp.solver.storage.clear()
+            return None
+
+        exp.problem.nt = orig_nt
+        exp.solver.storage.clear()
+        return vec
+
+    except Exception as e:
+        if rank == 0:
+            print(f"  WARNING: Propagation failed with error: {e}")
+        exp.problem.nt = orig_nt
+        exp.solver.storage.clear()
+        return None
+
+
+def run_phase_4(args):
+    """Phase 4: Cycling DC-WME vs 4D-Var Comparison.
+
+    Runs three cycling experiments:
+    - 4a: Standard 4D-Var cycling
+    - 4b: DC-WME cycling with static L_wme
+    - 4c: DC-WME cycling with dynamic L_wme
+    """
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    output_dir = Path(args.output_dir)
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "data").mkdir(exist_ok=True)
+    comm.Barrier()
+
+    if rank == 0:
+        print("=" * 70)
+        print("PHASE 4: CYCLING DC-WME vs 4D-VAR COMPARISON")
+        print("=" * 70)
+        print("  Sub-experiments:")
+        print("    4a: Standard 4D-Var cycling (6 windows)")
+        print("    4b: DC-WME cycling with static L_wme")
+        print("    4c: DC-WME cycling with dynamic L_wme")
+        print("=" * 70)
+
+    sub = getattr(args, 'sub', None)
+    if sub:
+        subs_to_run = [sub]
+    else:
+        subs_to_run = ["a", "b", "c"]
+
+    all_results = {}
+
+    for sub_label in subs_to_run:
+        if sub_label == "a":
+            result = _run_cycling_experiment(
+                args, sub_label="a", method="4dvar", output_dir=output_dir,
+            )
+        elif sub_label == "b":
+            result = _run_cycling_experiment(
+                args, sub_label="b", method="dcwme", output_dir=output_dir,
+            )
+        elif sub_label == "c":
+            result = _run_cycling_experiment(
+                args, sub_label="c", method="dcwme", output_dir=output_dir,
+            )
+        else:
+            if rank == 0:
+                print(f"Unknown sub-experiment: 4{sub_label}")
+            continue
+
+        all_results[f"4{sub_label}"] = result
+
+    # Print comparison summary
+    if rank == 0 and len(all_results) > 1:
+        print(f"\n{'=' * 70}")
+        print("PHASE 4 CYCLING COMPARISON SUMMARY")
+        print(f"{'=' * 70}")
+        print(f"{'Sub':<6} {'Method':<22} {'Cum. Err Red.':<14} {'Tot Iters':<10} "
+              f"{'Time (min)':<10}")
+        print(f"{'-' * 62}")
+        for key, res in all_results.items():
+            if res is not None:
+                agg = res['aggregate']
+                method_label = res['method']
+                if res.get('l_wme_type', 'N/A') != 'N/A':
+                    method_label += f" ({res['l_wme_type']})"
+                print(f"{key:<6} {method_label:<22} "
+                      f"{agg['cumulative_error_reduction_pct']:.1f}%{'':<9} "
+                      f"{agg['total_iterations']:<10} "
+                      f"{agg['total_time_s'] / 60:.1f}")
+
+        # Per-window comparison
+        print(f"\n{'=' * 70}")
+        print("PER-WINDOW ERROR REDUCTION (%)")
+        print(f"{'=' * 70}")
+        header = f"{'Window':<8}"
+        for key in all_results:
+            header += f" {key:<12}"
+        print(header)
+        print(f"{'-' * (8 + 12 * len(all_results))}")
+
+        first_res = next(iter(all_results.values()))
+        if first_res is not None:
+            n_win = len(first_res['per_window'])
+            for w in range(n_win):
+                row = f"W{w + 1:<7}"
+                for key, res in all_results.items():
+                    if res is not None and w < len(res['per_window']):
+                        pw = res['per_window'][w]
+                        if pw.get('skipped'):
+                            row += f" {'skip':<12}"
+                        else:
+                            row += f" {pw['error_reduction_pct']:.1f}%{'':<8}"
+                    else:
+                        row += f" {'N/A':<12}"
+                print(row)
+        print(f"{'=' * 70}")
+
+    return all_results
+
+
+def run_phase_5(args):
+    """Phase 5: Single Long-Window DC-WME vs 4D-Var Comparison.
+
+    Same as Phase 3 but with a 71-step (~11.8h) DA window instead of 12-step (2h).
+    Tests whether longer windows create meaningful eigenvalue spread in L_wme,
+    which would enable DC-WME's directional predictability reweighting.
+
+    - 5a: Standard 4D-Var baseline
+    - 5b: DC-WME with static L_wme
+    - 5c: DC-WME with dynamic L_wme
+    """
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    output_dir = Path(args.output_dir)
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "data").mkdir(exist_ok=True)
+    comm.Barrier()
+
+    if rank == 0:
+        print("=" * 70)
+        print("PHASE 5: LONG-WINDOW DC-WME vs 4D-VAR COMPARISON")
+        print("  71 timesteps (~11.8h), 48h ramp, single window")
+        print("=" * 70)
+        print("  Sub-experiments:")
+        print("    5a: Standard 4D-Var (baseline)")
+        print("    5b: DC-WME with static L_wme")
+        print("    5c: DC-WME with dynamic L_wme")
+        print("=" * 70)
+
+    sub = getattr(args, 'sub', None)
+    if sub:
+        subs_to_run = [sub]
+    else:
+        subs_to_run = ["a", "b", "c"]
+
+    all_results = {}
+
+    for sub_label in subs_to_run:
+        if sub_label == "a":
+            result = _run_sub_experiment(
+                args, sub_label="a", method="4dvar",
+                output_dir=output_dir,
+                nt_da=71, nt_ramp=288, phase_prefix="5",
+            )
+        elif sub_label == "b":
+            result = _run_sub_experiment(
+                args, sub_label="b", method="dcwme",
+                output_dir=output_dir,
+                nt_da=71, nt_ramp=288, phase_prefix="5",
+            )
+        elif sub_label == "c":
+            result = _run_sub_experiment(
+                args, sub_label="c", method="dcwme",
+                output_dir=output_dir,
+                nt_da=71, nt_ramp=288, phase_prefix="5",
+            )
+        else:
+            if rank == 0:
+                print(f"Unknown sub-experiment: 5{sub_label}")
+            continue
+
+        all_results[f"5{sub_label}"] = result
+
+    # Print comparison summary
+    if rank == 0 and len(all_results) > 1:
+        print(f"\n{'=' * 70}")
+        print("PHASE 5 COMPARISON SUMMARY")
+        print(f"{'=' * 70}")
+        print(f"{'Sub-exp':<10} {'Method':<20} {'Error Red.':<12} {'Iters':<8} {'Conv.':<8} {'Time (min)':<10}")
+        print(f"{'-' * 68}")
+        for key, res in all_results.items():
+            if res is not None:
+                r = res['results']
+                t = res['timing']
+                lwme = res.get('l_wme_type', 'N/A')
+                method_label = f"{res['method']}"
+                if lwme != 'N/A':
+                    method_label += f" ({lwme})"
+                print(f"{key:<10} {method_label:<20} {r['error_reduction']:.1f}%{'':<7} "
+                      f"{r['num_iterations']:<8} {'Yes' if r['converged'] else 'No':<8} "
+                      f"{t['total_s']/60:.1f}")
+        print(f"{'=' * 70}")
+
+    return all_results
+
+
+# ========================================================================
+# Phase 6: Parameter Sweep — 4D-Var vs Static DC-WME
+# ========================================================================
+
+SWEEP_BASELINE = {
+    "obs_noise_level": 0.01,
+    "obs_fraction": 0.1,
+    "obs_frequency": 6,
+    "background_error_std": 0.02,
+    "cov_inflation_factor": 10.0,
+    "nt_da": 12,
+    "nt_ramp": 144,
+    "friction_scale_factor": 1.15,
+}
+
+SWEEP_DIMS = {
+    "noise": {
+        "param": "obs_noise_level",
+        "values": [0.001, 0.005, 0.01, 0.05, 0.1],
+    },
+    "obs_density": {
+        "param": "obs_fraction",
+        "values": [0.05, 0.1, 0.25, 0.5],
+    },
+    "obs_frequency": {
+        "param": "obs_frequency",
+        "values": [2, 4, 6, 12],
+    },
+    "bg_error": {
+        "param": "background_error_std",
+        "values": [0.01, 0.02, 0.05, 0.1],
+    },
+    "cov_inflation": {
+        "param": "cov_inflation_factor",
+        "values": [1.0, 5.0, 10.0, 20.0],
+    },
+    "window_length": {
+        "param": "nt_da",
+        "values": [6, 12, 36, 71],
+        "nt_ramp_map": {6: 144, 12: 144, 36: 144, 71: 288},
+    },
+    "model_error": {
+        "param": "friction_scale_factor",
+        "values": [1.0, 1.15, 1.3, 1.5],
+    },
+}
+
+
+def _print_sweep_summary(all_results):
+    """Print formatted summary table of sweep results."""
+    for dim_name, dim_results in all_results.items():
+        print(f"\n{'=' * 70}")
+        print(f"SWEEP: {dim_name}")
+        print(f"{'Value':<15} {'4DVar Err%':<12} {'DCWME Err%':<12} {'Winner':<10}")
+        print(f"{'-' * 49}")
+        for point in dim_results:
+            val = point["value"]
+            fdvar = point.get("4dvar", {})
+            dcwme = point.get("dcwme", {})
+
+            fdvar_err = fdvar.get("results", {}).get("error_reduction", None)
+            if fdvar.get("status") == "failed":
+                fdvar_err = None
+            dcwme_err = dcwme.get("results", {}).get("error_reduction", None)
+            if dcwme.get("status") == "failed":
+                dcwme_err = None
+
+            fdvar_str = f"{fdvar_err:.1f}" if fdvar_err is not None else "FAIL"
+            dcwme_str = f"{dcwme_err:.1f}" if dcwme_err is not None else "FAIL"
+
+            if fdvar_err is not None and dcwme_err is not None:
+                winner = "4DVar" if fdvar_err > dcwme_err else "DCWME"
+            else:
+                winner = "N/A"
+
+            print(f"{str(val):<15} {fdvar_str:<12} {dcwme_str:<12} {winner:<10}")
+        print(f"{'=' * 70}")
+
+
+def run_phase_6(args):
+    """Phase 6: Parameter Sweep — 4D-Var vs Static DC-WME.
+
+    One-at-a-time sweep across 7 parameter dimensions.
+    Each point runs both 4D-Var and static DC-WME.
+    """
+    from mpi4py import MPI
+    import gc
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    output_dir = Path(args.output_dir)
+    data_dir = output_dir / "data"
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(exist_ok=True)
+    comm.Barrier()
+
+    sweep_dim_filter = getattr(args, 'sweep_dim', None) or "all"
+    dims_to_run = list(SWEEP_DIMS.keys()) if sweep_dim_filter == "all" else [sweep_dim_filter]
+
+    all_sweep_results = {}
+
+    for dim_name in dims_to_run:
+        dim_config = SWEEP_DIMS[dim_name]
+        param_name = dim_config["param"]
+        values = dim_config["values"]
+
+        if rank == 0:
+            print(f"\n{'#' * 70}")
+            print(f"# SWEEP DIMENSION: {dim_name} ({param_name})")
+            print(f"#   Values: {values}")
+            print(f"{'#' * 70}")
+
+        dim_results = []
+
+        for val in values:
+            # Build sweep_params from baseline, overriding the swept parameter
+            sweep_params = dict(SWEEP_BASELINE)
+            sweep_params[param_name] = val
+
+            # Extract nt_da and nt_ramp (handled separately as function args)
+            nt_da = sweep_params.pop("nt_da")
+            nt_ramp = sweep_params.pop("nt_ramp")
+            if dim_name == "window_length":
+                nt_ramp = dim_config["nt_ramp_map"][val]
+                nt_da = val
+
+            val_str = str(val).replace(".", "p").replace(",", "_")
+            point_results = {"dimension": dim_name, "param": param_name, "value": val}
+
+            for method, sub_label in [("4dvar", "a"), ("dcwme", "b")]:
+                phase_prefix = f"6_{dim_name}_{val_str}_"
+                result_file = data_dir / f"phase{phase_prefix}{sub_label}_results.json"
+
+                # Skip/resume: check if output file exists
+                if result_file.exists():
+                    if rank == 0:
+                        print(f"\n  Skipping {result_file.name} (already exists)")
+                    with open(result_file) as f:
+                        result = json.load(f)
+                    point_results[method] = result
+                    continue
+
+                if rank == 0:
+                    print(f"\n  Running: {dim_name}={val}, method={method}")
+
+                try:
+                    result = _run_sub_experiment(
+                        args, sub_label=sub_label, method=method,
+                        output_dir=output_dir,
+                        nt_da=nt_da, nt_ramp=nt_ramp,
+                        phase_prefix=phase_prefix,
+                        sweep_params=sweep_params,
+                    )
+                    point_results[method] = result
+                except Exception as e:
+                    if rank == 0:
+                        print(f"  FAILED: {dim_name}={val}, {method}: {e}")
+                    result = {
+                        "phase": f"{phase_prefix}{sub_label}",
+                        "status": "failed",
+                        "error": str(e),
+                        "method": method,
+                        "sweep_dimension": dim_name,
+                        "sweep_param": param_name,
+                        "sweep_value": val,
+                    }
+                    # Save failed result to JSON for skip/resume
+                    if rank == 0:
+                        with open(result_file, "w") as f:
+                            json.dump(result, f, indent=2, default=str)
+                    point_results[method] = result
+
+                # Memory cleanup between runs
+                gc.collect()
+
+            dim_results.append(point_results)
+
+        all_sweep_results[dim_name] = dim_results
+
+    # Save summary
+    if rank == 0:
+        summary_file = data_dir / "phase6_summary.json"
+        with open(summary_file, "w") as f:
+            json.dump(all_sweep_results, f, indent=2, default=str)
+        print(f"\nSummary saved to {summary_file}")
+
+        _print_sweep_summary(all_sweep_results)
+
+    return all_sweep_results
+
+
 def main():
     """Main entry point."""
     import os
@@ -823,6 +3079,16 @@ def main():
         run_phase_0(args)
     elif args.phase == "1":
         run_phase_1(args)
+    elif args.phase == "2":
+        run_phase_2(args)
+    elif args.phase == "3":
+        run_phase_3(args)
+    elif args.phase == "4":
+        run_phase_4(args)
+    elif args.phase == "5":
+        run_phase_5(args)
+    elif args.phase == "6":
+        run_phase_6(args)
     else:
         print(f"Phase {args.phase} not yet implemented.")
         return 1

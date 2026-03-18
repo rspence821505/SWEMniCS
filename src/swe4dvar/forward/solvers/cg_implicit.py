@@ -557,6 +557,12 @@ class CGImplicit(BaseSolver):
             newton_diagnostics_config=newton_diagnostics_config,
         )
 
+        # Propagate raise_on_failure flag to Newton solver.
+        # During optimization, the cost function sets this attribute so Newton failures
+        # trigger exceptions that the line search can handle via backtracking.
+        if getattr(self, '_raise_on_newton_failure', False):
+            solver.raise_on_failure = True
+
         if enable_video:
             self.initialize_video(plot_name)
             self.plot_frame()
