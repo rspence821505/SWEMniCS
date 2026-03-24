@@ -84,6 +84,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--mem-limit-gb",
+        type=float,
+        default=12.0,
+        help="Phase 6: memory limit in GB; sweep aborts gracefully if exceeded (default: 12)",
+    )
+
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -596,7 +603,7 @@ def run_phase_1(args):
     # so GMRES converges without the instability seen with perturbed m_background.
     # max_it=25 and reduction_it=10: if Newton stalls after 10 iters, halve relax param.
     da_solver_params = get_default_solver_params(
-        rtol=1e-5, atol=1e-6, max_it=25,
+        rtol=1e-5, atol=1e-6, max_it=35,
         relaxation_parameter=1.0,
         comm=comm, error_if_not_converged=False,
         reduction_it=10,
@@ -951,7 +958,7 @@ def run_phase_2(args):
     )
 
     da_solver_params = get_default_solver_params(
-        rtol=1e-5, atol=1e-6, max_it=25,
+        rtol=1e-5, atol=1e-6, max_it=35,
         relaxation_parameter=1.0,
         comm=comm, error_if_not_converged=False,
         reduction_it=10,
@@ -1289,7 +1296,16 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
         obs_vec.assemblyBegin()
         obs_vec.assemblyEnd()
         HT_ei = obs_operator.adjoint(obs_vec)  # H^T e_i = state-space vector
-        H[i, :] = HT_ei.getArray()
+        # Gather full vector across MPI ranks
+        local_arr = HT_ei.getArray()
+        if comm is not None and comm.Get_size() > 1:
+            full_arr = np.zeros(n_state)
+            start, end = HT_ei.getOwnershipRange()
+            full_arr[start:end] = local_arr
+            comm.Allreduce(full_arr.copy(), full_arr)
+            H[i, :] = full_arr
+        else:
+            H[i, :] = local_arr
         HT_ei.destroy()
     obs_vec.destroy()
 
@@ -1496,7 +1512,7 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
     )
 
     da_solver_params = get_default_solver_params(
-        rtol=1e-5, atol=1e-6, max_it=25,
+        rtol=1e-5, atol=1e-6, max_it=35,
         relaxation_parameter=1.0,
         comm=comm, error_if_not_converged=False,
         reduction_it=10,
@@ -1889,6 +1905,11 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
         print(f"  Results saved to: {results_file}")
         print(f"{'=' * 70}")
 
+    # Explicitly delete heavy objects to help GC reclaim memory
+    del optimizer, cost_function, forward_model, exp, solver, prob
+    del B, R, B_lwme, obs_operator
+    _cleanup_petsc_objects()
+
     return results
 
 
@@ -2082,7 +2103,7 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
     )
 
     da_solver_params = get_default_solver_params(
-        rtol=1e-5, atol=1e-6, max_it=25,
+        rtol=1e-5, atol=1e-6, max_it=35,
         relaxation_parameter=1.0,
         comm=comm, error_if_not_converged=False,
         reduction_it=10,
@@ -2893,7 +2914,7 @@ SWEEP_BASELINE = {
 SWEEP_DIMS = {
     "noise": {
         "param": "obs_noise_level",
-        "values": [0.001, 0.005, 0.01, 0.05, 0.1],
+        "values": [0.01, 0.005, 0.05, 0.1, 0.001],
     },
     "obs_density": {
         "param": "obs_fraction",
@@ -2954,14 +2975,244 @@ def _print_sweep_summary(all_results):
         print(f"{'=' * 70}")
 
 
+def _cleanup_petsc_objects():
+    """Aggressively destroy PETSc objects to reclaim memory.
+
+    PETSc/FEniCSx can leak memory across solver instantiations.
+    This forces cleanup of the PETSc garbage and Python GC.
+    """
+    import gc
+    gc.collect()
+
+    try:
+        from petsc4py import PETSc
+        PETSc.garbage_cleanup()
+    except Exception:
+        pass
+
+    # Second GC pass to collect anything PETSc released
+    gc.collect()
+
+
+def _get_process_memory_mb():
+    """Return current process RSS in MB, or None if unavailable."""
+    try:
+        import resource
+        # maxrss on macOS is in bytes, on Linux in KB
+        import platform
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if platform.system() == "Darwin":
+            return rss / (1024 * 1024)
+        else:
+            return rss / 1024
+    except Exception:
+        return None
+
+
+def _get_pid_rss_mb(pid):
+    """Return RSS in MB for a given PID, or None if unavailable.
+
+    Uses psutil if available, otherwise falls back to ``ps``.
+    """
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        return proc.memory_info().rss / (1024 * 1024)
+    except Exception:
+        pass
+
+    # Fallback: parse ``ps`` output (works on macOS and Linux)
+    try:
+        import subprocess as _sp
+        out = _sp.check_output(["ps", "-o", "rss=", "-p", str(pid)],
+                               text=True, timeout=5).strip()
+        if out:
+            return int(out) / 1024  # ps reports KB
+    except Exception:
+        pass
+
+    return None
+
+
+MEM_WATCHDOG_INTERVAL_S = 5  # How often the watchdog checks child RSS
+
+
+def _run_in_subprocess(run_config, mem_limit_mb, script_path):
+    """Run a single sweep config as a child process with a memory watchdog.
+
+    Parameters
+    ----------
+    run_config : dict
+        Serializable dict with all parameters needed by ``_sweep_worker``.
+    mem_limit_mb : float
+        RSS limit in MB. The watchdog SIGKILLs the child if exceeded.
+    script_path : str
+        Absolute path to this script (used to launch the worker).
+
+    Returns
+    -------
+    dict
+        Result dict loaded from the child's output JSON, or a failure dict.
+    """
+    import subprocess as sp
+    import signal
+    import threading
+
+    config_json = json.dumps(run_config)
+
+    # Launch child: python <this_script> --_sweep_worker <json>
+    cmd = [sys.executable, script_path, "--_sweep-worker", config_json]
+    child = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+
+    killed_by_watchdog = threading.Event()
+
+    # --- Memory watchdog thread ---
+    def watchdog():
+        while child.poll() is None:
+            rss = _get_pid_rss_mb(child.pid)
+            if rss is not None and rss > mem_limit_mb:
+                print(f"\n  WATCHDOG: Child PID {child.pid} using {rss:.0f} MB "
+                      f"(limit {mem_limit_mb:.0f} MB) — sending SIGKILL",
+                      flush=True)
+                killed_by_watchdog.set()
+                try:
+                    import os
+                    os.kill(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                return
+            # Sleep in small increments so we can exit quickly when child dies
+            for _ in range(MEM_WATCHDOG_INTERVAL_S * 2):
+                if child.poll() is not None:
+                    return
+                import time as _time
+                _time.sleep(0.5)
+
+    watcher = threading.Thread(target=watchdog, daemon=True)
+    watcher.start()
+
+    # Stream child stdout to parent stdout in real time
+    output_lines = []
+    for line in child.stdout:
+        print(f"    [child] {line}", end="", flush=True)
+        output_lines.append(line)
+
+    child.wait()
+    watcher.join(timeout=2)
+
+    result_file = Path(run_config["result_file"])
+
+    if killed_by_watchdog.is_set():
+        result = {
+            "phase": run_config["phase_prefix"] + run_config["sub_label"],
+            "status": "failed",
+            "error": f"Killed by memory watchdog (>{mem_limit_mb:.0f} MB)",
+            "method": run_config["method"],
+            "sweep_dimension": run_config.get("dim_name", ""),
+            "sweep_param": run_config.get("param_name", ""),
+            "sweep_value": run_config.get("val"),
+        }
+        with open(result_file, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        return result
+
+    if child.returncode != 0:
+        stderr_tail = "".join(output_lines[-20:])
+        result = {
+            "phase": run_config["phase_prefix"] + run_config["sub_label"],
+            "status": "failed",
+            "error": f"Child exited with code {child.returncode}: {stderr_tail[-500:]}",
+            "method": run_config["method"],
+            "sweep_dimension": run_config.get("dim_name", ""),
+            "sweep_param": run_config.get("param_name", ""),
+            "sweep_value": run_config.get("val"),
+        }
+        with open(result_file, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        return result
+
+    # Read result JSON written by the child
+    if result_file.exists():
+        with open(result_file) as f:
+            return json.load(f)
+
+    return {
+        "phase": run_config["phase_prefix"] + run_config["sub_label"],
+        "status": "failed",
+        "error": "Child completed but result file not found",
+        "method": run_config["method"],
+    }
+
+
+def _sweep_worker_main(config_json):
+    """Entry point for a subprocess that runs a single sweep config.
+
+    Called via: ``python run_comparison.py --_sweep-worker '<json>'``
+
+    The child process runs ``_run_sub_experiment``, writes the result JSON,
+    then exits. All PETSc/FEniCSx memory is reclaimed by the OS on exit.
+    """
+    import os
+    os.environ.setdefault("CC", "/usr/bin/clang")
+
+    config = json.loads(config_json)
+
+    args = argparse.Namespace(
+        phase="6",
+        sweep_dim=None,
+        output_dir=config["output_dir"],
+        adios_file=config["adios_file"],
+        sub=None,
+        verbose=True,
+        mem_limit_gb=config.get("mem_limit_gb", 12.0),
+    )
+
+    sweep_params = config["sweep_params"]
+
+    try:
+        result = _run_sub_experiment(
+            args,
+            sub_label=config["sub_label"],
+            method=config["method"],
+            output_dir=Path(config["output_dir"]),
+            nt_da=config["nt_da"],
+            nt_ramp=config["nt_ramp"],
+            phase_prefix=config["phase_prefix"],
+            sweep_params=sweep_params,
+        )
+    except Exception as e:
+        result_file = Path(config["result_file"])
+        result = {
+            "phase": config["phase_prefix"] + config["sub_label"],
+            "status": "failed",
+            "error": str(e),
+            "method": config["method"],
+            "sweep_dimension": config.get("dim_name", ""),
+            "sweep_param": config.get("param_name", ""),
+            "sweep_value": config.get("val"),
+        }
+        with open(result_file, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        sys.exit(1)
+
+    sys.exit(0)
+
+
+SWEEP_BATCH_SIZE = 10  # Max configs per batch before forced cleanup
+
+
 def run_phase_6(args):
     """Phase 6: Parameter Sweep — 4D-Var vs Static DC-WME.
 
     One-at-a-time sweep across 7 parameter dimensions.
     Each point runs both 4D-Var and static DC-WME.
+
+    Memory safety: each config runs in its own subprocess.
+    A watchdog thread in the parent monitors the child's RSS and SIGKILLs
+    it if it exceeds --mem-limit-gb (default 12 GB). The parent process
+    stays small and safe regardless of how much memory the child uses.
     """
     from mpi4py import MPI
-    import gc
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -2972,6 +3223,9 @@ def run_phase_6(args):
         output_dir.mkdir(parents=True, exist_ok=True)
         data_dir.mkdir(exist_ok=True)
     comm.Barrier()
+
+    mem_limit_mb = float(getattr(args, 'mem_limit_gb', 12.0)) * 1024
+    script_path = str(Path(__file__).resolve())
 
     sweep_dim_filter = getattr(args, 'sweep_dim', None) or "all"
     dims_to_run = list(SWEEP_DIMS.keys()) if sweep_dim_filter == "all" else [sweep_dim_filter]
@@ -2984,19 +3238,18 @@ def run_phase_6(args):
         values = dim_config["values"]
 
         if rank == 0:
-            print(f"\n{'#' * 70}")
-            print(f"# SWEEP DIMENSION: {dim_name} ({param_name})")
-            print(f"#   Values: {values}")
-            print(f"{'#' * 70}")
+            print(f"\n{'#' * 70}", flush=True)
+            print(f"# SWEEP DIMENSION: {dim_name} ({param_name})", flush=True)
+            print(f"#   Values: {values}", flush=True)
+            print(f"# Memory limit: {mem_limit_mb:.0f} MB per child", flush=True)
+            print(f"{'#' * 70}", flush=True)
 
         dim_results = []
 
         for val in values:
-            # Build sweep_params from baseline, overriding the swept parameter
             sweep_params = dict(SWEEP_BASELINE)
             sweep_params[param_name] = val
 
-            # Extract nt_da and nt_ramp (handled separately as function args)
             nt_da = sweep_params.pop("nt_da")
             nt_ramp = sweep_params.pop("nt_ramp")
             if dim_name == "window_length":
@@ -3010,47 +3263,47 @@ def run_phase_6(args):
                 phase_prefix = f"6_{dim_name}_{val_str}_"
                 result_file = data_dir / f"phase{phase_prefix}{sub_label}_results.json"
 
-                # Skip/resume: check if output file exists
+                # Skip/resume
                 if result_file.exists():
                     if rank == 0:
-                        print(f"\n  Skipping {result_file.name} (already exists)")
+                        print(f"\n  Skipping {result_file.name} (already exists)", flush=True)
                     with open(result_file) as f:
                         result = json.load(f)
                     point_results[method] = result
                     continue
 
                 if rank == 0:
-                    print(f"\n  Running: {dim_name}={val}, method={method}")
+                    print(f"\n  Running: {dim_name}={val}, method={method} "
+                          f"[subprocess, limit={mem_limit_mb:.0f} MB]", flush=True)
 
-                try:
-                    result = _run_sub_experiment(
-                        args, sub_label=sub_label, method=method,
-                        output_dir=output_dir,
-                        nt_da=nt_da, nt_ramp=nt_ramp,
-                        phase_prefix=phase_prefix,
-                        sweep_params=sweep_params,
-                    )
-                    point_results[method] = result
-                except Exception as e:
-                    if rank == 0:
-                        print(f"  FAILED: {dim_name}={val}, {method}: {e}")
-                    result = {
-                        "phase": f"{phase_prefix}{sub_label}",
-                        "status": "failed",
-                        "error": str(e),
-                        "method": method,
-                        "sweep_dimension": dim_name,
-                        "sweep_param": param_name,
-                        "sweep_value": val,
-                    }
-                    # Save failed result to JSON for skip/resume
-                    if rank == 0:
-                        with open(result_file, "w") as f:
-                            json.dump(result, f, indent=2, default=str)
-                    point_results[method] = result
+                run_config = {
+                    "output_dir": str(output_dir),
+                    "adios_file": args.adios_file,
+                    "sub_label": sub_label,
+                    "method": method,
+                    "nt_da": nt_da,
+                    "nt_ramp": nt_ramp,
+                    "phase_prefix": phase_prefix,
+                    "sweep_params": sweep_params,
+                    "result_file": str(result_file),
+                    "dim_name": dim_name,
+                    "param_name": param_name,
+                    "val": val,
+                    "mem_limit_gb": getattr(args, 'mem_limit_gb', 12.0),
+                }
 
-                # Memory cleanup between runs
-                gc.collect()
+                result = _run_in_subprocess(run_config, mem_limit_mb, script_path)
+                point_results[method] = result
+
+                status = result.get("status", "unknown")
+                if status == "failed":
+                    if rank == 0:
+                        err = result.get("error", "unknown error")
+                        print(f"  FAILED: {err[:200]}", flush=True)
+                else:
+                    if rank == 0:
+                        err_red = result.get("results", {}).get("error_reduction", "?")
+                        print(f"  Done: error_reduction={err_red}", flush=True)
 
             dim_results.append(point_results)
 
@@ -3061,9 +3314,10 @@ def run_phase_6(args):
         summary_file = data_dir / "phase6_summary.json"
         with open(summary_file, "w") as f:
             json.dump(all_sweep_results, f, indent=2, default=str)
-        print(f"\nSummary saved to {summary_file}")
+        print(f"\nSummary saved to {summary_file}", flush=True)
 
         _print_sweep_summary(all_sweep_results)
+        sys.stdout.flush()
 
     return all_sweep_results
 
@@ -3097,4 +3351,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Hidden entry point for subprocess sweep workers
+    if len(sys.argv) >= 3 and sys.argv[1] == "--_sweep-worker":
+        _sweep_worker_main(sys.argv[2])
+    else:
+        sys.exit(main())

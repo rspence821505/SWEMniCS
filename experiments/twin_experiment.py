@@ -919,12 +919,18 @@ class TwinExperiment:
         all_coords = self.comm.gather(local_coords, root=0)
 
         if self.comm.rank == 0:
-            # Concatenate all coordinates from all ranks
-            coords = np.vstack(all_coords)
+            # Concatenate all coordinates from all ranks, deduplicate, and sort
+            # to ensure deterministic obs selection regardless of MPI partition count.
+            # (DG meshes duplicate geometry points at partition boundaries)
+            coords_all = np.vstack(all_coords)
+            _, unique_idx = np.unique(
+                np.round(coords_all[:, :2], decimals=10), axis=0, return_index=True
+            )
+            coords = coords_all[unique_idx]  # sorted by np.unique
 
             rng = np.random.default_rng(self.config.obs_seed)
 
-            # Domain bounds (now using GLOBAL coordinates)
+            # Domain bounds (now using GLOBAL unique coordinates)
             x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
             y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
 
