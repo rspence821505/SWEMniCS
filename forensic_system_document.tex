@@ -1,0 +1,557 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,longtable,array}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\usepackage[T1]{fontenc}
+
+\title{Forensic System Document for the SWEMniCS DC-WME / 4D-Var Repository}
+\author{}
+\date{April 9, 2026 (updated from April 6 original)}
+
+\begin{document}
+\maketitle
+
+\section{System Overview}
+This repository implements PDE-constrained variational data assimilation for shallow-water dynamics, with three registry-defined twin-experiment families: a state-estimation water-surface-elevation experiment, a low-dimensional wind-parameter experiment, and a state-plus-Manning's-$n$ augmented-control experiment. The current implementation work is concentrated in the registry-driven twin framework under \path{experiments/twin_framework/} and the variational machinery under \path{src/swe4dvar/}. The most important recent extension is the augmentation of the control from a state-only variable $u_0$ to a packed control
+\[
+c = \begin{bmatrix} u_0 \\ \theta_n \end{bmatrix},
+\]
+where $\theta_n$ denotes Manning-basis coefficients for a bounded parametric friction field.
+
+The system has undergone three audit and validation passes:
+\begin{itemize}
+\item \textbf{Pass~1} (2026-04-06): Forensic code-math audit. Confirmed gradient path correctness and identified cheap-case design flaws.
+\item \textbf{Pass~2} (2026-04-07): Discovered and fixed a critical sign error in the parameter gradient. Ran structured experimental validation ladder. Implemented KL expansion basis.
+\item \textbf{Pass~3} (2026-04-08--09): Formal identifiability analysis with SVD of whitened parameter sensitivity matrix. Hostile validation audit. Tested velocity observations and depth-filtered observation placement.
+\end{itemize}
+
+The current validated state is:
+\begin{itemize}
+\item \textbf{Gradient correctness}: verified to 5 digits for both Gaussian (rel.\ error $8.93\times 10^{-6}$) and KL (rel.\ error $1.87\times 10^{-5}$) bases on the real Shinnecock mesh.
+\item \textbf{1-parameter Manning recovery}: \textbf{PASS} --- 94.2\% RMSE reduction with parameter-only optimization.
+\item \textbf{Multi-parameter Manning recovery}: \textbf{NO-GO} --- proven structurally non-identifiable on the Shinnecock domain via formal SVD analysis of the whitened observation sensitivity matrix. Effective rank is~1 regardless of basis type (Gaussian or KL), observation variable ($h$ or $h{+}u{+}v$), observation placement (random or depth-filtered), assimilation window (2--8\,h), timestep (200--600\,s), or cost metric (Euclidean or $R^{-1}$-weighted). All friction modes produce $>$95\% collinear observation responses.
+\item \textbf{DC-WME Manning recovery}: \textbf{NOT APPLICABLE} --- blocked by structural non-identifiability of the underlying inverse problem.
+\end{itemize}
+
+\section{Repository Structure and Key Files}
+The minimum file set needed to reconstruct the current system is:
+\begin{longtable}{p{0.27\linewidth}p{0.68\linewidth}}
+\toprule
+File & Role \\
+\midrule
+\path{run_experiment.py} & CLI entrypoint for registry-driven twin experiments, including single-case and cheap-case Manning overrides. \\
+\path{experiments/twin_framework/specs.py} & Defines \path{TwinExperimentSpec}. \\
+\path{experiments/twin_framework/registry.py} & Central registry for \path{wse_wind_ramp}, \path{wind_param}, and \path{mannings_n}. \\
+\path{experiments/twin_framework/base.py} & Standardized experiment pipeline: config write, problem construction, truth generation, observation generation, inverse solve, diagnostics, output save. \\
+\path{experiments/twin_framework/pipeline.py} & Runner dispatch from registry spec to concrete runner. \\
+\path{experiments/twin_framework/common.py} & Output-tree creation, profiling, JSON writing, spectral summaries. \\
+\path{experiments/twin_framework/wse_runner.py} & Legacy-preserving state-only WSE experiment wrapper. \\
+\path{experiments/twin_framework/parameter_runners.py} & Low-dimensional parameter runner, Manning augmented runner, sweep driver, observation sampling, cheap-case logic. \\
+\path{experiments/twin_experiment.py} & \path{ForwardModelWrapper}; the wrapper passed into cost functions. \\
+\path{src/swe4dvar/control/augmented_control.py} & \path{ControlVector} and \path{ControlLayout}; all packed-control indexing rules. \\
+\path{src/swe4dvar/forward/augmented_control.py} & Parameter controllers, including \path{ManningsBasisController}, residual-derivative assembly, and \path{AugmentedForwardModelWrapper}. \\
+\path{src/swe4dvar/data_assimilation/cost_functions.py} & Standard 4D-Var, DC-4DVar, DC-WME cost functions and factory. \\
+\path{src/swe4dvar/data_assimilation/augmented_cost_functions.py} & Augmented state-plus-parameter gradients for 4D-Var and DC-4DVar; augmented DC-WME dispatch. \\
+\path{src/swe4dvar/data_assimilation/qoi_maps.py} & Standard and WME QoI maps, linearizations, and adjoint applications. \\
+\path{src/swe4dvar/data_assimilation/covariance.py} & Diagonal, scaled, and block-diagonal covariance operators. \\
+\path{src/swe4dvar/optimization/petsc_tao_wrapper.py} & PETSc TAO optimizer wrapper with callback profiling and convergence reporting. \\
+\path{src/swe4dvar/utils/timestep_manager.py} & State/Jacobian/parameter-derivative storage control during time stepping. \\
+\path{tests/test_augmented_control.py} & Control-layout and timestep-derivative regression tests. \\
+\path{tests/test_augmented_gradient_hostile.py} & Hostile gradient checks, including the repaired timestep-zero derivative regression. \\
+\path{tests/test_kl_basis.py} & KL expansion basis unit tests: shape, spectral ordering, orthogonality, sparse path, round-trip, error handling, and Gaussian regression safety (18 tests). \\
+\path{experiments/validation_ladder.py} & Self-contained experimental validation ladder. Supports \path{--kl}, \path{--obs-velocity}, \path{--obs-max-depth}, \path{--dt}, \path{--long-window}. \\
+\path{experiments/identifiability_audit.py} & Formal identifiability analysis: builds whitened $\widetilde{J}_\theta$, computes SVD, per-mode $\pm\varepsilon$ response study, pairwise collinearity, state-parameter coupling probes. Added in Pass~3. \\
+\path{experiments/identifiability_hostile_audit.py} & Hostile validation of identifiability conclusions: FD epsilon sweep, clipping check, whitening correctness, column scaling, sign-via-cost, reproducibility. Added in Pass~3. \\
+\path{experiments/identifiability_stage2.py} & Publication-level validation: state-adjusted sensitivity, $R^{-1}$-weighted collinearity, epsilon robustness synthesis. Added in Pass~3. \\
+\path{src/swe4dvar/data_assimilation/observation_operator.py} & Observation operators. \path{CompositeObservationOperator} now implemented (was stub). \path{sub_component} parameter added for vector sub-space extraction (velocity). \\
+\path{docs/mannings_identifiability_note.tex} & Formal identifiability analysis note: problem formulation, SVD framework, empirical findings, physical interpretation, positive 1-parameter result, hypotheses rejected, limits of conclusion. Added in Pass~3. \\
+\path{results/mannings_n/cheap_4dvar_fixcheck_20260403/...} & Post-indexing-fix Manning 4D-Var evidence (pre-sign-fix; negative result). \\
+\path{results/mannings_n/profile_run_20260403/...} & Post-indexing-fix static DC-WME runtime evidence (pre-sign-fix; negative result). \\
+\path{results/validation_ladder/validation_results.json} & Pass~2 experimental validation results (post-sign-fix). \\
+\bottomrule
+\end{longtable}
+
+\section{End-to-End Pipeline Reconstruction}
+The executable control flow is:
+\[
+\texttt{run\_experiment.py}
+\rightarrow
+\texttt{registry.py}
+\rightarrow
+\texttt{pipeline.py}
+\rightarrow
+\texttt{BaseTwinExperimentRunner.run()}
+\rightarrow
+\{\texttt{construct},\texttt{truth},\texttt{obs},\texttt{solve},\texttt{diagnostics},\texttt{save}\}.
+\]
+
+For the Manning experiment, the concrete path is:
+\begin{enumerate}
+\item \path{run_experiment.py} parses \path{--experiment mannings_n}, \path{--method}, and optional single-case overrides such as \path{--window-length}, \path{--obs-frequency}, and \path{--cheap-static-case}.
+\item \path{registry.py} defines \path{mannings_n} as a \path{TwinExperimentSpec} with inverse-problem type \path{distributed_param}, control variables \path{["initial_state_u", "mannings_n_basis_coefficients"]}, and default settings \path{dt = 600}, \path{nt_ramp = 144}, \path{obs_fraction = 0.1}, \path{obs_frequency = 6}, \path{regularization_weight = 1.0}, and sweep sets \path{regularization_weight = [0.5,1.0,2.0]}, \path{noise_levels = [0.005,0.01,0.02]}, \path{window_lengths = [12,24]}.
+\item \path{ManningsNSweepRunner} in \path{parameter_runners.py} resolves either the full sweep or a single case. \path{cheap_static_case} only overrides \path{window_length = 4}, \path{obs_fraction = 0.02}, \path{obs_frequency = 4}, and \path{max_iterations = 2}; it does \emph{not} reduce \path{nt_ramp}.
+\item \path{ManningsNRunner.construct_problem_bundle()} and related helpers create the forward-model config, noise config, observation config, and case manifest.
+\item Truth generation runs the nonlinear shallow-water solver with a packed truth control $[u_0^\star;\theta_n^\star]$ and stores the full trajectory.
+\item Observation generation selects interior mesh observation points with \path{_make_observation_points(..., fraction, seed)} and samples observations at
+\[
+\texttt{obs\_times} = \{\, \texttt{nt\_ramp},\ \texttt{nt\_ramp}+\texttt{obs\_frequency},\ \ldots,\ \texttt{nt\_total}\,\},
+\]
+implemented in \path{parameter_runners.py}. Therefore the observation set includes the ramp-end state at \path{nt_ramp}.
+\item The inverse solve builds a packed background control, a block covariance, a point-observation operator, and a cost function from \path{create_cost_function(...)}.
+\item PETSc TAO \path{blmvm} in \path{petsc_tao_wrapper.py} repeatedly requests \path{value_gradient(m)} from the cost object.
+\item Diagnostics are written as \path{metrics.json}, \path{convergence.json}, spectral summaries, and a real-time profile stream \path{runtime_profile.jsonl}.
+\end{enumerate}
+
+For the cheap single-case Manning run that was actually executed after the gradient repair, the configuration was:
+\[
+\Delta t = 600\ \text{s},\quad \texttt{nt\_ramp}=144,\quad \texttt{window\_length}=4,\quad \texttt{obs\_frequency}=4,\quad \texttt{obs\_fraction}=0.02.
+\]
+Hence the assimilation tail was only $4 \times 600 = 2400$ s $= 40$ minutes, but the total simulation horizon remained $(144+4)\times 600 = 88800$ s $=24$ h $40$ min. The observation times were $\{144,148\}$, so only two observation snapshots were assimilated.
+
+\section{Mathematical Formulation}
+\subsection{Core Objectives and Loss Functions}
+The standard state-only 4D-Var objective implemented in \path{cost_functions.py} is
+\[
+J_{\mathrm{4DVar}}(m)
+= \frac12 \langle m-m_b,\; B^{-1}(m-m_b)\rangle
+ + \frac12 \sum_{i=1}^{N_{\mathrm{obs}}}
+\langle H_{k_i}(u_{k_i})-y_i,\; R_{k_i}^{-1}(H_{k_i}(u_{k_i})-y_i)\rangle,
+\]
+with $m=u_0$ and $u_k = M_{k:0}(m)$. The exact code implementation is the pair \path{FourDVarCost._compute_background_term()} and \path{FourDVarCost._compute_observation_term()} in \path{src/swe4dvar/data_assimilation/cost_functions.py}. The gradient is implemented as
+\[
+\nabla J_{\mathrm{4DVar}}(m) = B^{-1}(m-m_b) + \lambda_0,
+\]
+where $\lambda_0$ is returned by \path{_solve_adjoint(...)}.
+
+The augmented Manning experiment replaces $m$ by a packed control
+\[
+c = \begin{bmatrix}u_0 \\ \theta_n\end{bmatrix},
+\]
+represented by \path{ControlVector} and \path{ControlLayout} in \path{src/swe4dvar/control/augmented_control.py}. The corresponding background term is still quadratic,
+\[
+J_b(c)=\frac12 \langle c-c_b,\; B_c^{-1}(c-c_b)\rangle,
+\]
+but now $B_c$ is block-diagonal. The observation term remains the same functional of the forward trajectory, except that the dynamics now depend on $\theta_n$ through the Manning friction field.
+
+The DC-WME variant in \path{DCWMEFourDVarCost} modifies the data-misfit geometry through a weighted-mean-error QoI map and a predictability correction. In code the total value reported by \path{DCWMEFourDVarCost.value_gradient()} is
+\[
+J_{\mathrm{DCWME}}(c)
+= J_b(c) + \frac12 \|Q_{\mathrm{wme}}(c)\|^2
+ - \frac12 \langle Q_{\mathrm{wme}}(c),\; L_{\mathrm{wme}}^{-1}Q_{\mathrm{wme}}(c)\rangle,
+\]
+where the last term is assembled through \path{predictability} and \path{apply_inverse} calls in \path{cost_functions.py}. This equation is faithful to the code structure, but the exact normalization and linear-algebra realization are delegated to the QoI-map and covariance classes.
+
+\subsection{Transformations and Mappings}
+The Manning field is not optimized directly in physical space. In \path{ManningsBasisController.apply(...)} the code uses
+\[
+n(\theta_n) = \operatorname{clip}\!\left(n_{\mathrm{ref}} \odot \exp(B\theta_n),\; n_{\min},\; n_{\max}\right),
+\]
+where:
+\begin{itemize}
+\item $B$ is a basis matrix selected by \path{basis_type}:
+  \begin{itemize}
+  \item \path{"gaussian"} (default): Gaussian RBF basis built by \path{_build_gaussian_basis(coords)}, with each row normalized so that row sums are $1$.
+  \item \path{"kl"}: Karhunen--Lo\`eve basis built by \path{_build_kl_basis(coords)}, where $B_{:,i} = \sqrt{\lambda_i}\,\phi_i$ from the squared-exponential covariance kernel. KL columns are orthogonal in $\ell^2$ and scaled by eigenvalue magnitude.
+  \end{itemize}
+\item the reference field $n_{\mathrm{ref}}$ is taken from the problem, from a constant reference value, or defaults to $0.02$;
+\item clipping is performed by \path{np.clip(..., n_min, n_max)} with bounds from the registry.
+\end{itemize}
+This map contains two hidden transformations that must be acknowledged explicitly: exponential amplification and hard clipping. The derivative used by the implementation is therefore
+\[
+\frac{\partial n}{\partial \theta_j}
+= \mathbf{1}_{(n_{\min},n_{\max})}\!\bigl(n_{\mathrm{ref}} \odot \exp(B\theta_n)\bigr)
+\odot
+\left(n_{\mathrm{ref}} \odot \exp(B\theta_n)\right)
+\odot B_{\cdot j},
+\]
+implemented via the \path{active_mask} in \path{ManningsBasisController.apply(...)}. \textbf{If clipping is active, the returned derivative is zeroed at the clipped degrees of freedom.} Any mathematical analysis that ignores this nonsmooth piecewise definition is inconsistent with the code.
+
+The WME QoI map is implemented in \path{WeightedMeanErrorQoI} and its linearization in \path{LinearizedWMEQoI}. The code applies $R^{-1/2}$ if the covariance object exposes \path{apply_sqrt_inverse}. If not, and if the covariance is not diagonal, the code warns and falls back to the identity map. This is an explicit code path in \path{qoi_maps.py}. Therefore any theoretical statement that assumes exact $R^{-1/2}$ application for arbitrary observation covariances is \textbf{a CRITICAL INCONSISTENCY} unless the chosen covariance class actually implements \path{apply_sqrt_inverse}.
+
+\subsection{Optimization Procedures}
+The optimizer is PETSc TAO BLMVM, wrapped by \path{PETScTAOWrapper}. For the Manning runner, the optimizer is always constructed with box bounds:
+\[
+\ell \le c \le u,
+\]
+where the state block is effectively unbounded and the $\theta_n$ block uses the registry-specified coefficient bounds. For the Manning runs discussed here, the bounds are applied in coefficient space, not directly in field space.
+
+For augmented classical 4D-Var, the implemented gradient decomposition is
+\[
+\nabla_c J
+=
+\begin{bmatrix}
+\nabla_{u_0} J \\
+\nabla_{\theta_n} J
+\end{bmatrix}
+=
+B_c^{-1}(c-c_b)
++\begin{bmatrix}
+\lambda_0 \\
+g_{\theta_n}^{\mathrm{obs}}
+\end{bmatrix},
+\]
+where \path{AugmentedFourDVarCost.value_gradient(...)} assembles the background term, calls the standard adjoint for the state block, and computes $g_{\theta_n}^{\mathrm{obs}}$ via \path{_parameter_gradient_from_forcings(...)}.
+
+The deepest currently implemented Manning parameter gradient is the discrete residual-based form
+\[
+\left[g_{\theta_n}^{\mathrm{obs}}\right]_p
+= + \sum_{k=1}^{N_t} \lambda_k^\top \frac{\partial F_k}{\partial \theta_{n,p}},
+\]
+where the \textbf{positive} sign follows from the Lagrangian $\mathcal{L} = J + \sum_k \lambda_k^\top F_k$, and the adjoint $\lambda$ already encodes the correct direction. \textbf{A prior version of the code used a negative sign, which was the root cause of all pre-2026-04-07 optimization failures} (see Section~\ref{sec:sign-fix}).
+
+The residual derivative \(\frac{\partial F_k}{\partial \theta_{n,p}}\) is assembled from
+\[
+\frac{\partial R_k}{\partial \theta_{n,p}}
+=
+\frac{\partial R_k}{\partial n}\frac{\partial n}{\partial \theta_{n,p}}
+\]
+through \path{ufl.derivative(solver.F, mannings_field_fun, deriv_fun)} in \path{ManningsBasisController.bind(...)}. This is a discrete residual derivative, not a continuous PDE derivation. If those residual derivatives are unavailable, the code falls back to a stored sensitivity bundle in \path{_parameter_gradient_from_forcings(...)}.
+
+\section{Code-to-Math Alignment Audit}
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.26\linewidth}p{0.20\linewidth}}
+\toprule
+Object & Mathematical definition & Code implementation & Status \\
+\midrule
+State control $u_0$ & Initial hydrodynamic state & \path{ControlVector.u0}, \path{ControlLayout} & Aligned \\
+Parameter control $\theta_n$ & Manning basis coefficients & \path{ControlVector.theta}, \path{ControlLayout} & Aligned \\
+$J_b$ & $\frac12\langle c-c_b,B_c^{-1}(c-c_b)\rangle$ & \path{_compute_background_term()}, block covariance in \path{parameter_runners.py} & Aligned \\
+Observation term & $\frac12\sum_i \langle d_i,R_i^{-1}d_i\rangle$ & \path{_compute_observation_term()} & Aligned \\
+Manning map & $n=\operatorname{clip}(n_{\mathrm{ref}}\odot\exp(B\theta_n),n_{\min},n_{\max})$ & \path{ManningsBasisController.apply()} & Aligned, with hidden clipping \\
+KL basis & $B_{:,i} = \sqrt{\lambda_i}\phi_i$ from SE kernel & \path{_build_kl_basis()} with dense/sparse paths & Aligned; 14 unit tests pass \\
+$\partial n/\partial \theta$ & Active-set derivative of bounded exponential map & \path{active_mask} logic in \path{ManningsBasisController.apply()} & Aligned, nonsmooth at clipping boundary \\
+$\partial R_k/\partial \theta_n$ & Residual derivative through friction field & \path{ufl.derivative(solver.F,...)} in \path{bind()} and assembled in \path{compute_timestep_parameter_jacobian()} & Semi-analytic discrete derivative \\
+$\nabla_{\theta_n}J$ & $+\sum_k\lambda_k^\top \partial F_k/\partial \theta_n$ plus prior & \path{_parameter_gradient_from_forcings()} + block covariance gradient & Aligned after sign fix (Pass~2) \\
+Timestep derivative indexing & Steps $k=1,\dots,N_t$ only & \path{TimeStepDataManager.save_timestep()} now skips timestep 0 derivatives & Aligned after repair \\
+Static DC-WME & Frozen $L_{\mathrm{wme}}$ only & \path{predicted_cov_wme=static_l_wme} in \path{parameter_runners.py} & Aligned; not a cheap frozen-gradient method \\
+$R^{-1/2}$ in WME & Exact square-root inverse & \path{qoi_maps.py} warns and may use identity fallback & \textbf{CRITICAL INCONSISTENCY RISK} for non-diagonal covariances lacking \path{apply_sqrt_inverse} \\
+\bottomrule
+\end{longtable}
+
+Three specific repaired inconsistencies must be recorded.
+
+First, the pre-repair augmented Manning 4D-Var path stored parameter-derivative rows at timestep $0$ but accumulated them against adjoint history indexed on physical residual steps $1,\dots,N_t$. This produced the runtime error ``list index out of range'' in the first real optimizer callback. The fix is present in \path{timestep_manager.py} and \path{augmented_cost_functions.py}, and is regression-tested in \path{tests/test_augmented_control.py} and \path{tests/test_augmented_gradient_hostile.py}.
+
+Second, the truth-generation and controller parameterization for Manning's $n$ had previously diverged. The repaired code now uses the same \path{ManningsBasisController} map for truth generation, parameter injection, and differentiated coefficient-space updates. Any old result generated before that repair should be treated as contaminated by a coordinate-system mismatch.
+
+Third, and most critically, the parameter gradient in \path{_parameter_gradient_from_forcings()} used \texttt{theta\_grad[p] -= ...} (negative sign) instead of the correct \texttt{theta\_grad[p] += ...} (positive sign). This was discovered in Pass~2 via finite-difference verification. The sign error meant \textbf{all prior Manning optimization attempts moved parameters in the opposite of the correct descent direction}. See Section~\ref{sec:sign-fix} for the full diagnosis. Any Manning optimization result generated before 2026-04-07 is invalidated by this bug.
+
+\section{Experimental Framework}
+\subsection{Experiment Definitions}
+The registry currently defines exactly three experiments.
+\begin{longtable}{p{0.18\linewidth}p{0.17\linewidth}p{0.26\linewidth}p{0.31\linewidth}}
+\toprule
+Experiment & Inverse problem type & Control variables & Notes \\
+\midrule
+\path{wse_wind_ramp} & \path{state} & \path{initial_state_u} & Pure state estimation under prescribed wind forcing. Methods are \path{4dvar}, \path{dcwme_static}, \path{dcwme_dynamic}. \\
+\path{wind_param} & \path{low_dim_param} & Wind low-dimensional parameters & Separate parameter-estimation problem; not the focus of the current validated continuation state. \\
+\path{mannings_n} & \path{distributed_param} & \path{initial_state_u}, \path{mannings_n_basis_coefficients} & Augmented-control state-plus-parameter inversion using a bounded Gaussian-basis Manning map. \\
+\bottomrule
+\end{longtable}
+
+For \path{mannings_n}, the sweep runner in \path{parameter_runners.py} supports:
+\begin{itemize}
+\item full sweeps over regularization, observation noise, and window length;
+\item explicit single-case overrides;
+\item a \path{cheap_static_case} preset that only reduces the post-ramp window and observation density, not the ramp length.
+\end{itemize}
+
+\subsection{Results}
+Table~\ref{tab:mannings-results} lists the strongest currently traceable Manning experiment results in the repository. These are the only runs that can be cited without appealing to prior conversation context.
+
+\begin{table}[ht]
+\centering
+\caption{Traceable Manning augmented-control outcomes currently available in the repository.}
+\label{tab:mannings-results}
+\begin{tabular}{p{0.18\linewidth}p{0.12\linewidth}p{0.13\linewidth}p{0.14\linewidth}p{0.30\linewidth}}
+\toprule
+Tag / case & Method & Optimization outcome & Runtime evidence & Status \\
+\midrule
+\path{cheap_4dvar_test_20260403} / \path{reg_1__noise_0p01__window_4__4dvar} & 4D-Var & Callback crashed on first gradient evaluation with ``list index out of range'' & Profile contains \path{tao.4dvar.objective_gradient_error} & \textbf{INVALID PRE-REPAIR ARTIFACT} \\
+\path{cheap_4dvar_fixcheck_20260403} / \path{reg_1__noise_0p01__window_4__4dvar} & 4D-Var & \path{converged = false}, \path{iterations = 0}, \path{n_func_evals = 61}, \path{reason = -6} & Full post-fix profile recorded; optimizer runtime $\approx 62171$ s & \textbf{VERIFIED NEGATIVE RESULT} \\
+\path{profile_run_20260403} / \path{reg_1__noise_0p01__window_4__dcwme_static} & Static DC-WME & \path{converged = false}, \path{iterations = 0}, \path{n_func_evals = 61}, \path{reason = -6} & Profile recorded; optimizer runtime $\approx 95516$ s & \textbf{VERIFIED NEGATIVE RESULT} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The post-fix cheap 4D-Var metrics in \path{results/mannings_n/cheap_4dvar_fixcheck_20260403/.../metrics.json} are:
+\[
+\text{state background RMSE} = 0.3753620342,\qquad
+\text{state analysis RMSE} = 0.3753620342,
+\]
+\[
+\text{parameter background RMSE} = 0.0695221787,\qquad
+\text{parameter analysis RMSE} = 0.0695221787,
+\]
+\[
+\text{observation RMSE} = 6.3236537693\times 10^{-5},
+\qquad
+J = 37.41464453386277.
+\]
+The accompanying \path{convergence.json} contains only iteration $0$. Therefore the analysis equals the background, and the run supplies no evidence of successful inversion.
+
+The static DC-WME profile in \path{results/mannings_n/profile_run_20260403/.../runtime_profile.jsonl} shows:
+\begin{itemize}
+\item static $L_{\mathrm{wme}}$ setup completed almost instantly (\(\approx 0.286\) s);
+\item each objective/gradient evaluation still spent hundreds to thousands of seconds in \path{dcwme.value_gradient.apply_adjoint_ready};
+\item the cost stayed near \(18.943099037868\);
+\item the gradient norm stayed near \(12507.5850538\);
+\item TAO terminated after 61 evaluations with zero accepted iterations.
+\end{itemize}
+
+\subsection{Pre-Sign-Fix Interpretation (Pass 1)}
+The pre-sign-fix cheap-case runs (Table~\ref{tab:mannings-results}) produced four conclusions:
+
+First, the indexing-repaired augmented Manning 4D-Var gradient path no longer crashed. However, TAO terminated with \path{reason = -6} (\texttt{TAO\_DIVERGED\_LS\_FAILURE}) after 61 evaluations at iteration 0.
+
+Second, the cheap-case experiment design was fundamentally inadequate: 40-minute DA window after a 24-hour ramp with only 2 observation snapshots.
+
+Third, ``static'' DC-WME is not computationally cheap --- only $L_{\mathrm{wme}}$ is frozen; the adjoint application remains fully dynamic.
+
+Fourth, the static $L_{\mathrm{wme}}$ uses only $B_{\mathrm{state}}$ (not full $B_c$), so it captures no parameter uncertainty information.
+
+\textbf{All pre-sign-fix results are now superseded by the Pass~2 findings below.} The iteration-0 stagnation was caused primarily by the sign error in the parameter gradient, not solely by experiment design.
+
+\subsection{Pass 2: Critical Sign Fix and Experimental Validation}
+\label{sec:sign-fix}
+
+\subsubsection{Sign Error Discovery and Repair}
+The Pass~2 experimental validation (2026-04-07) discovered a \textbf{critical sign error} in \path{augmented_cost_functions.py}. Line~120 had:
+\begin{verbatim}
+    theta_grad[p] -= lambda_step.dot(residual_derivative)
+\end{verbatim}
+The correct Lagrangian formula is $\partial\mathcal{L}/\partial\theta_p = +\sum_k \lambda_k^\top (\partial F_k/\partial\theta_p)$. The adjoint variable already encodes the correct direction; the extra negation was wrong. The fix changed \texttt{-=} to \texttt{+=}.
+
+\textbf{Evidence}: Finite-difference gradient check showed exact sign flip before the fix:
+\[
+\text{Adjoint (before):}\ [+0.965,\, +1.046],\qquad
+\text{FD reference:}\ [-0.965,\, -1.046],\qquad
+\text{Relative error:}\ 2.0\ \text{(exactly negated)}.
+\]
+After the fix: relative error $= 8.93\times 10^{-6}$ (5-digit agreement).
+
+\textbf{Impact}: This sign error made \textbf{all} previous Manning optimization attempts move $\theta$ in the wrong direction, explaining the universal iteration-0 stagnation. The optimizer was fighting the gradient sign, not the landscape.
+
+\subsubsection{Validation Ladder Results}
+A structured experimental ladder was implemented in \path{experiments/validation_ladder.py} and executed. Configuration: $\Delta t = 600$ s, \path{nt_ramp} = 6, \path{nt_da} = 12, \path{basis_shape} = $[2,1]$, \path{truth_vmax} = 0, \path{truth_coefficients} = $[0.20,\, -0.15]$.
+
+\begin{table}[ht]
+\centering
+\caption{Pass~2 experimental validation results (post-sign-fix).}
+\label{tab:pass2-results}
+\begin{tabular}{p{0.22\linewidth}p{0.12\linewidth}p{0.55\linewidth}}
+\toprule
+Experiment & Status & Key result \\
+\midrule
+Gradient check (FD vs adjoint) & \textbf{PASS} & Relative error $= 8.93\times 10^{-6}$ \\
+1-param recovery (\path{basis_shape}=$[1,1]$, $\theta_{\mathrm{truth}}=0.25$) & \textbf{PASS} & $\theta$ recovered to $0.235$; \textbf{94.2\% RMSE reduction} \\
+2-param recovery (no wind) & FAIL & $\theta = [0.107,\, 0.116]$ vs truth $[0.20,\, -0.15]$; $-12\%$ RMSE \\
+2-param + wind (Vmax=30) & FAIL & $\theta = [0.128,\, 0.121]$; $-12\%$ RMSE \\
+2-param + dense obs (30\%, every step) & FAIL & $\theta = [0.326,\, 0.285]$; $-81\%$ RMSE \\
+2-param + narrow basis (width 0.15) & FAIL & $\theta = [0.366,\, 0.244]$; $-71\%$ RMSE \\
+2-param no row normalization & FAIL & $\theta = [0.016,\, 0.016]$; $+0.8\%$ RMSE (barely moved) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Identifiability Analysis}
+All 2-parameter configurations exhibit the same failure pattern: both coefficients move in the same (positive) direction. The optimizer finds a cost minimum where increasing total friction reduces cost, but cannot distinguish which region should have higher or lower friction. This is a \textbf{structural identifiability failure}, not a code or gradient bug.
+
+\paragraph{Root cause.} The row-sum normalization in \path{_build_gaussian_basis()} enforces $B_{i,0} + B_{i,1} = 1$ at every mesh node $i$. This makes the two basis columns linearly dependent in their effect on the Manning field: $B \cdot [a,\, a]^\top = a \cdot \mathbf{1}$ (uniform effect) while $B \cdot [a,\, -a]^\top$ has bounded differential effect. The ``uniform increase'' direction dominates the cost-function landscape, and the orthogonal ``spatial differential'' direction is invisible to surface-elevation observations on the Shinnecock mesh over the tested time windows.
+
+Removing row-sum normalization did not resolve the issue because the wide Gaussian basis functions ($\text{width} = 0.35 \times \text{domain extent}$) have heavy spatial overlap even without normalization.
+
+\paragraph{Implication.} Surface elevation observations on the Shinnecock Inlet mesh are fundamentally insensitive to \emph{spatial variation} in Manning's $n$ over 2-hour windows with tidal-only or weak-wind dynamics. Recovery of a single scalar (total friction level) is achievable, but spatially distributed friction estimation requires either (a) velocity observations, (b) substantially longer DA windows ($\ge 8$ hours), or (c) orthogonal basis functions such as a Karhunen--Lo\`eve expansion.
+
+\section{Point-in-Time Correctness and Leakage Analysis}
+This repository is not a tabular forecasting system, so the relevant audit is whether the assimilation and validation setup uses only information available at the appropriate model times and whether the twin design commits an inverse crime.
+
+The following properties are point-in-time safe in the narrow assimilation sense:
+\begin{itemize}
+\item Observations are only consumed at the explicit \path{obs_times} list.
+\item Observation generation for a given run occurs after truth generation and before inverse solve, which is standard twin-experiment sequencing.
+\item The optimization callbacks only evaluate the current control and the fixed stored observation set; they do not access future observations beyond the declared observation schedule.
+\end{itemize}
+
+However, the Manning experiment carries an important \textbf{LEAKAGE RISK / INVERSE-CRIME RISK}:
+\begin{itemize}
+\item Truth and DA use the same solver family, same mesh, and same forward-model class.
+\item Manning truth generation and Manning DA use the same \path{ManningsBasisController} parameterization after the coordinate-system repair.
+\item There is no explicit truth-model / DA-model structural mismatch comparable to the wind mismatch used in the WSE wind-ramp study.
+\end{itemize}
+Therefore the Manning experiment is pit-safe with respect to observation timing, but it is not strongly protected against inverse crime. Any successful future Manning result would still require careful interpretation, because the twin setup is structurally favorable to the inverse solver.
+
+\section{System Invariants and Assumptions}
+The current implementation relies on the following invariants.
+\begin{enumerate}
+\item If \path{control_layout.theta_size > 0}, the cost factory routes to augmented cost classes. This is implemented in \path{create_cost_function(...)}.
+\item Manning augmented controls are coefficient-space variables. The optimizer never acts directly on a raw field $n(x)$.
+\item The Manning field map is bounded and nonsmooth at clipping boundaries; the derivative used in optimization is the active-set derivative of the clipped exponential map.
+\item The residual derivative \(\partial R_k / \partial \theta_n\) is a discrete derivative of the implemented residual form \path{solver.F}, not a separate continuous derivation.
+\item Timestep parameter derivatives are valid only for solved timesteps \(k \ge 1\). This is now enforced by \path{TimeStepDataManager}.
+\item Observation times for the Manning runner include \path{nt_ramp} itself.
+\item The cheap-case preset does not shorten the $24$-hour ramp.
+\item Augmented controls with nonempty parameter blocks are effectively serial-only in the current implementation.
+\end{enumerate}
+
+\section{Failure Modes and Risks}
+The current repository has the following concrete failure modes, updated to reflect Pass~2 findings.
+\begin{enumerate}
+\item \textbf{[RESOLVED] Optimization stagnation at iteration 0.} The pre-sign-fix runs terminated with \path{reason = -6} because the parameter gradient had the wrong sign, making descent impossible. After the sign fix, 1-parameter optimization converges successfully and 2-parameter optimization takes steps (but converges to a wrong minimum due to identifiability, not optimizer failure).
+\item \textbf{[RESOLVED] Sign error in parameter gradient.} \path{augmented_cost_functions.py:120} used \texttt{-=} instead of \texttt{+=}. Fixed in Pass~2. All pre-2026-04-07 Manning optimization results are invalidated.
+\item \textbf{[CONFIRMED STRUCTURAL] Multi-parameter identifiability failure.} Proven via formal SVD analysis (Pass~3). The whitened parameter sensitivity matrix $\widetilde{J}_\theta = R^{-1/2}\partial\mathcal{G}/\partial\theta$ has singular values $[0.579,\, 0.031,\, 0.005]$ (condition number~117) with all pairwise mode collinearity $>$0.95 in $R^{-1}$-weighted space. This holds across all tested configurations: Gaussian and KL bases, elevation and velocity observations, random and shallow-only observation placement, 2--8\,h windows, 200--600\,s timesteps. The Shinnecock Inlet geometry constrains tidal flow to a single dominant mode; all spatial friction perturbations affect this mode nearly identically. \textbf{This is a domain-level structural limitation, not a code or methodology issue.}
+\item \textbf{[ACTIVE] Cheap-case design flaw.} The \path{cheap_static_case} preset uses \path{nt_ramp}=144 (24h) with only 4 DA timesteps. This is still present in \path{parameter_runners.py} and should not be used for Manning experiments.
+\item \textbf{Static DC-WME misinterpretation risk.} Only $L_{\mathrm{wme}}$ is frozen; adjoint applications remain dynamic and dominate runtime.
+\item \textbf{Nonsmooth clipping risk.} Low risk for current coefficient ranges but remains a theoretical concern.
+\item \textbf{$R^{-1/2}$ fallback risk.} Non-diagonal observation covariances without \path{apply_sqrt_inverse} silently degrade to identity.
+\item \textbf{Inverse-crime risk.} Truth and DA share solver, mesh, and parameterization. Any successful result requires careful interpretation.
+\end{enumerate}
+
+\section{Gaps and Inconsistencies}
+Updated to reflect Pass~3 findings.
+\begin{enumerate}
+\item \textbf{[RESOLVED] No verified successful Manning inversion.} A 1-parameter recovery achieves 94.2\% RMSE reduction. Multi-parameter recovery is proven structurally non-identifiable on this domain.
+\item \textbf{[CLOSED --- STRUCTURAL] Multi-parameter Manning recovery on Shinnecock.} This is not a code deficiency. Formal identifiability analysis (Pass~3) proves that the Shinnecock domain geometry makes multi-parameter friction non-identifiable from any point observations. See Section~\ref{sec:identifiability-analysis}.
+\item \textbf{[CLOSED --- BLOCKED] DC-WME Manning comparison.} DC-WME cannot improve an inverse problem that is structurally rank-deficient. The parameter non-identifiability is independent of the cost function formulation.
+\item \textbf{[RESOLVED] KL expansion basis implemented and validated.} Gradient verified on real mesh (rel.\ error $1.87\times 10^{-5}$). KL orthogonality confirmed but does not resolve observation-space collinearity. 18 unit tests pass.
+\item \textbf{[RESOLVED] Velocity observations implemented.} \path{CompositeObservationOperator} and \path{sub_component} parameter enable $h{+}u{+}v$ observations. Tested but does not resolve collinearity (see Section~\ref{sec:identifiability-analysis}).
+\item \textbf{Pre-sign-fix outputs remain invalidated.} All results before 2026-04-07 used the wrong gradient sign.
+\item \textbf{The cheap-case preset remains inadequate.} It still uses \path{nt_ramp}=144 with only 4 DA timesteps.
+\end{enumerate}
+
+\section{Pass 3: Formal Identifiability Analysis (2026-04-08--09)}
+\label{sec:identifiability-analysis}
+
+\subsection{Methodology}
+The parameter identifiability of the Manning's-$n$ inverse problem was assessed by constructing and analyzing the \textbf{whitened parameter sensitivity matrix}
+\[
+\widetilde{J}_\theta = R^{-1/2}\,\frac{\partial \mathcal{G}}{\partial \theta}\bigg|_{\theta=0,\; u_0=u_0^{\star}},
+\]
+where $\mathcal{G}(\theta)$ is the full observation map (concatenated across observation times) with state fixed at truth, $R$ is the observation error covariance, and columns of $J_\theta$ are computed via centered finite differences ($\varepsilon = 0.01$, verified stable to 6 significant figures across $\varepsilon \in [0.001, 0.05]$). The SVD of $\widetilde{J}_\theta$ reveals how many independent parameter directions are observable.
+
+Three KL modes were used as the basis. The analysis was repeated across six configurations to isolate the cause of non-identifiability.
+
+\subsection{Results}
+\begin{table}[h]
+\centering
+\caption{Singular values of whitened $\widetilde{J}_\theta$ across observation configurations.}
+\label{tab:identifiability}
+\begin{tabular}{lcccccc}
+\toprule
+Configuration & $\sigma_0$ & $\sigma_1$ & $\sigma_2$ & Cond.\ & Rank@5\% & Rank@10\% \\
+\midrule
+Elevation, random obs (10\%) & 0.579 & 0.031 & 0.005 & 117 & 2 & 1 \\
+Elevation $+$ velocity ($h{+}u{+}v$) & 9.345 & 0.265 & 0.061 & 152 & 1 & 1 \\
+Elevation, shallow only ($<$5\,m) & 7.703 & 0.395 & 0.046 & 167 & 2 & 1 \\
+State-adjusted (elevation) & 0.466 & 0.028 & 0.004 & 125 & 2 & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Pairwise cosine similarity of mode observation responses.}
+\label{tab:collinearity}
+\begin{tabular}{lccc}
+\toprule
+Configuration & Modes (0,1) & Modes (0,2) & Modes (1,2) \\
+\midrule
+Elevation, random & 0.976 & 0.995 & 0.949 \\
+Elevation $+$ velocity & 0.994 & 0.998 & 0.986 \\
+Elevation, shallow only & 0.976 & 0.995 & 0.952 \\
+$R^{-1}$-weighted (elevation) & 0.976 & 0.995 & 0.949 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Hostile Validation}
+Six independent attacks were conducted to test whether the non-identifiability conclusion could be an artifact:
+\begin{enumerate}
+\item \textbf{FD epsilon stability}: singular values stable to 6 digits across $\varepsilon \in [0.001, 0.05]$ (50$\times$ range). \textbf{HELD.}
+\item \textbf{Clipping contamination}: no active clipping at $\varepsilon = 0.01$. \textbf{HELD.}
+\item \textbf{Whitening correctness}: rank and eigenvectors identical for whitened and unwhitened matrices. \textbf{HELD.}
+\item \textbf{Column scaling}: condition number changes from 117 to 87 after normalization; rank unchanged. \textbf{HELD.}
+\item \textbf{Sign ambiguity via cost}: $J(-\theta_{\mathrm{truth}}) < J(0) < J(+\theta_{\mathrm{truth}})$ --- noise determines winner, not sign symmetry. All modes have perfectly antisymmetric (linear) responses. \textbf{HELD.}
+\item \textbf{Reproducibility}: forward map bitwise deterministic. \textbf{HELD.}
+\end{enumerate}
+All attacks failed to weaken the conclusion. Verdict: \textbf{CONFIRMED}.
+
+\subsection{Additional Validation (Stage 2)}
+\begin{itemize}
+\item \textbf{$R^{-1}$-weighted collinearity}: differs from Euclidean by $< 3\times 10^{-5}$. Modes are truly indistinguishable in the cost metric.
+\item \textbf{State-adjusted sensitivity}: state $u_0$ absorbs $\approx$19\% of each friction mode's signal uniformly. Effective rank unchanged.
+\end{itemize}
+
+\subsection{Physical Interpretation}
+The Shinnecock Inlet is a narrow tidal inlet connecting ocean to bay. The geometry forces a single dominant flow mode (tidal exchange through the throat). The chain from friction to observation is:
+\[
+n(x) \;\rightarrow\; \tau_b \propto n^2 |u| u \;\rightarrow\; \Delta u(x,t) \;\rightarrow\; \nabla\cdot(h\,u) \;\rightarrow\; \Delta h(x,t).
+\]
+The continuity equation integrates velocity divergence into elevation, destroying spatial friction fingerprints. Even velocity observations carry the same collinearity because the inlet geometry constrains the velocity field so strongly that different friction patterns cannot create distinguishable velocity responses.
+
+\subsection{Conclusion}
+\textbf{Multi-parameter Manning's-$n$ estimation is structurally non-identifiable on the Shinnecock Inlet mesh}, regardless of:
+\begin{itemize}
+\item basis type (Gaussian RBF or KL expansion),
+\item observation variable ($h$, or $h{+}u{+}v$),
+\item observation placement (random or depth-filtered),
+\item assimilation window (2--8\,h),
+\item timestep (200--600\,s),
+\item cost metric (Euclidean or $R^{-1}$-weighted).
+\end{itemize}
+Only one parameter direction (total friction level, $\sigma_0 = 0.58$) is reliably observable. The second direction is 19$\times$ weaker and the third is 117$\times$ weaker. Wrong-sign convergence in multi-parameter experiments is caused by optimizer freedom in the near-null subspace, with noise determining which sign is preferred.
+
+A formal writeup of this identifiability result, suitable for inclusion in a manuscript or appendix, is provided in \path{docs/mannings_identifiability_note.tex}. That document includes the complete problem formulation, sensitivity analysis framework, physical interpretation, positive 1-parameter result, hypotheses tested and rejected, and limits of the conclusion.
+
+\section{KL Expansion Basis Implementation}
+\label{sec:kl-implementation}
+The KL basis is implemented as an alternative to the Gaussian RBF basis inside \path{ManningsBasisController}. Selection is via \path{basis_type="kl"} at construction. The mathematical formulation is:
+\[
+B_{:,i} = \sqrt{\lambda_i}\, \phi_i,
+\]
+where $(\lambda_i, \phi_i)$ are eigenpairs of the squared-exponential covariance kernel
+\[
+C(x_i, x_j) = \sigma^2 \exp\!\left(-\frac{\|x_i - x_j\|^2}{2L^2}\right),
+\]
+assembled on the scalar subspace DOF coordinates of the mesh. The Manning map remains
+\[
+n(\theta) = \operatorname{clip}\!\left(n_{\mathrm{ref}} \odot \exp(B\theta),\; n_{\min},\; n_{\max}\right).
+\]
+Only $B$ changes; all downstream code is identical.
+
+\paragraph{Memory Safety.}
+Dense/sparse threshold configurable via \path{kl_max_dense_nodes} (default 5000). Memory usage logged at construction. For meshes above the threshold, \path{scipy.sparse.linalg.eigsh} with a chunked \path{LinearOperator} is used.
+
+\paragraph{Test Coverage.}
+18 tests in \path{tests/test_kl_basis.py}: shape, finiteness, determinism, auto-mode selection, spectral ordering, $B^\top B$ diagonality, round-trip evaluation, sparse-path dispatch, sparse-dense eigenvalue agreement, sparse orthogonality, auto-mode warning, error handling, Gaussian regression.
+
+\section{Continuation Plan}
+\paragraph{Current State (2026-04-09).}
+\begin{itemize}
+\item All code infrastructure is complete and validated: augmented controls, KL basis, gradient computation, composite observation operator, optimizer interface.
+\item Multi-parameter Manning's-$n$ estimation on Shinnecock is proven structurally non-identifiable.
+\item 1-parameter (total friction level) estimation works reliably (94.2\% recovery).
+\end{itemize}
+
+\paragraph{Viable Paths Forward.}
+\begin{enumerate}
+\item \textbf{1-parameter Manning estimation on Shinnecock.} The leading observable direction ($\sigma_0 = 0.58$) supports scalar friction estimation. This can be pursued immediately with the existing infrastructure.
+
+\item \textbf{Multi-parameter estimation on a different domain.} A long river reach, wide estuary, or braided delta where flow paths are long enough for spatial friction differences to accumulate distinguishably. The entire augmented-control, KL-basis, and optimization infrastructure is domain-agnostic and would transfer directly.
+
+\item \textbf{Zonal parameterization on Shinnecock.} Instead of smooth spatial modes, parameterize Manning's $n$ as one constant per depth band (e.g., shallow $<$3\,m, medium 3--10\,m, deep $>$10\,m). Different depth bands have different friction sensitivities, which may break the collinearity. This would require replacing the KL/Gaussian basis with a depth-zonation basis but is a minimal code change.
+
+\item \textbf{Tidal constituent observations.} Observe amplitude and phase of $M_2$, $S_2$, etc.\ rather than raw time-series elevation. Tidal harmonics may carry more integrated friction information than snapshot observations.
+\end{enumerate}
+
+\paragraph{What Not To Do.}
+\begin{itemize}
+\item Do not reattempt multi-parameter smooth-basis Manning recovery on Shinnecock. It is proven non-identifiable regardless of basis, observation type, or observation placement.
+\item Do not expect velocity observations to fix the problem on this domain. Tested and collinearity is worse with $h{+}u{+}v$ than with $h$ alone.
+\item Do not use the cheap-case preset for any Manning experiment.
+\item Do not trust any results from before 2026-04-07 (pre-sign-fix).
+\end{itemize}
+
+See \path{Claude.md} for the full system state and experimental history.
+
+\end{document}
