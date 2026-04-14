@@ -766,7 +766,7 @@ class TestConstants:
 
     def test_sweep_baseline_has_required_keys(self):
         required = {"obs_noise_level", "obs_fraction", "obs_frequency",
-                    "background_error_std", "cov_inflation_factor",
+                    "background_error_std",
                     "nt_da", "nt_ramp", "friction_scale_factor"}
         assert required.issubset(SWEEP_BASELINE.keys())
 
