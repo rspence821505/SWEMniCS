@@ -41,6 +41,7 @@ from mpi4py import MPI
 from petsc4py import PETSc
 
 from swe4dvar.forward.solvers import get_solver
+from swe4dvar.forward.augmented_control import AugmentedForwardModelWrapper
 from swe4dvar.data_assimilation import (
     FourDVarCost,
     DCWMEFourDVarCost,
@@ -97,8 +98,7 @@ class TwinExperimentConfig:
     # DC-WME L_wme estimation
     l_wme_samples: int = 100  # >0 = analytical L_wme via adjoint, 0 = 2R fallback
     auto_inflate_B: bool = True  # Auto-inflate B based on Gram matrix bound (paper eq. 38)
-    max_inflate_factor: float = 2.0  # Maximum B inflation factor to prevent optimizer instability
-    predictability_gamma: float = 0.1  # Relaxation γ for predictability condition (paper eq. 36)
+    predictability_gamma: float = 0.1  # Relaxation γ for predictability condition (paper eq. 36, 38)
     adaptive_gamma: bool = True  # Spectrum-relative γ: floor = γ * λ_max(L_wme)
     nonuniform_inflate: bool = False  # Per-eigenvalue boosting for sub-threshold L_wme eigenvalues
     eigenvalue_boost_target: float = 2.0  # Target eigenvalue as multiple of γ
@@ -173,21 +173,33 @@ class TwinExperimentResults:
         return cls(**data)
 
 
-class ForwardModelWrapper:
+class ForwardModelWrapper(AugmentedForwardModelWrapper):
     """
     Wrapper to adapt SWE4DVar solvers to the forward model interface
     expected by the cost functions.
     """
 
-    def __init__(self, solver, problem, solver_params: dict, t_start: float = 0.0):
-        self.solver = solver
-        self.problem = problem
-        self.solver_params = solver_params
-        self.dt = problem.dt
-        self.nt = problem.nt
-        self.t_start = t_start
-        self.comm = MPI.COMM_WORLD
-        self.var_form = getattr(solver, "var_form", None)
+    def __init__(
+        self,
+        solver,
+        problem,
+        solver_params: dict,
+        t_start: float = 0.0,
+        control_layout=None,
+        parameter_controller=None,
+        parameter_fd_steps=None,
+        reference_state=None,
+    ):
+        super().__init__(
+            solver=solver,
+            problem=problem,
+            solver_params=solver_params,
+            t_start=t_start,
+            control_layout=control_layout,
+            parameter_controller=parameter_controller,
+            parameter_fd_steps=parameter_fd_steps,
+            reference_state=reference_state,
+        )
 
     def get_mass_matrix(self) -> PETSc.Mat:
         """Assemble the mass matrix for the function space using UFL."""
@@ -214,61 +226,14 @@ class ForwardModelWrapper:
     def solve(
         self, m: PETSc.Vec, store_jacobians: bool = True
     ) -> Tuple[List[PETSc.Vec], Optional[List]]:
-        """Run forward model from initial condition m."""
-        self.solver.storage.clear()
+        """Run forward model from a control vector.
 
-        # Set initial condition
-        m_local = m.copy()
-        m_array = m_local.getArray()
-
-        u_owned_size = self.solver.V.dofmap.index_map.size_local
-        if len(m_array) == len(self.solver.u_n.x.array):
-            self.solver.u_n.x.array[:] = m_array
-            self.solver.u_n_old.x.array[:] = m_array
-            self.solver.u.x.array[:] = m_array
-        elif len(m_array) == u_owned_size:
-            self.solver.u_n.x.array[:u_owned_size] = m_array
-            self.solver.u_n_old.x.array[:u_owned_size] = m_array
-            self.solver.u.x.array[:u_owned_size] = m_array
-            self.solver.u_n.x.scatter_forward()
-            self.solver.u_n_old.x.scatter_forward()
-            self.solver.u.x.scatter_forward()
-        else:
-            raise ValueError(
-                f"Initial condition size {len(m_array)} does not match "
-                f"solver DOFs (owned={u_owned_size}, total={len(self.solver.u_n.x.array)})"
-            )
-        m_local.destroy()
-
-        self.problem.t = self.t_start
-
-        self.solver.time_loop(
-            solver_parameters=self.solver_params,
-            stations=np.array([[0.0, 0.0, 0.0]]),
-            plot_every=9999,
-            save_state=True,
-            store_jacobians=store_jacobians,
-            enable_video=False,
-        )
-
-        from dolfinx import la
-
-        u_owned_size = self.solver.V.dofmap.index_map.size_local
-        trajectory = []
-        for state_array in self.solver.storage.saved_states:
-            vec = la.create_petsc_vector(
-                self.solver.V.dofmap.index_map,
-                self.solver.V.dofmap.index_map_bs,
-            )
-            vec.setArray(state_array[:u_owned_size])
-            vec.assemble()
-            trajectory.append(vec)
-
-        jacobians = None
-        if store_jacobians and len(self.solver.storage.saved_jacobians) > 0:
-            jacobians = self.solver.storage.saved_jacobians.copy()
-
-        return trajectory, jacobians
+        By default this remains the original state-only behavior. When a
+        control layout and parameter controller are attached, ``m`` may be a
+        packed augmented control ``[u_0; theta]`` or a pure-parameter control
+        with an empty state block.
+        """
+        return super().solve(m, store_jacobians=store_jacobians)
 
 
 class TwinExperiment:
@@ -1292,7 +1257,13 @@ class TwinExperiment:
 
         Uses the same component magnitudes as _setup_background() to ensure
         B covariance matches the actual perturbation statistics.
+
+        Environment variable overrides (for controlled experiments):
+          SWE4DVAR_H_VARIANCE  — override h component variance
+          SWE4DVAR_UV_VARIANCE — override u/v component variance
         """
+        import os
+
         arr = self.m_true.getArray()
         h_indices, u_indices, v_indices = self._get_component_dof_indices(owned_only=True)
 
@@ -1301,6 +1272,16 @@ class TwinExperiment:
 
         h_variance = (self.config.background_error_std * h_mag) ** 2
         uv_variance = (self.config.background_error_std * uv_mag) ** 2
+
+        # Allow environment variable overrides for controlled experiments
+        h_override = os.environ.get("SWE4DVAR_H_VARIANCE")
+        uv_override = os.environ.get("SWE4DVAR_UV_VARIANCE")
+        if h_override is not None:
+            h_variance = float(h_override)
+            self.log(f"  [override] h_variance = {h_variance:.6e} (from SWE4DVAR_H_VARIANCE)")
+        if uv_override is not None:
+            uv_variance = float(uv_override)
+            self.log(f"  [override] uv_variance = {uv_variance:.6e} (from SWE4DVAR_UV_VARIANCE)")
 
         return h_variance, uv_variance
 
@@ -1349,7 +1330,6 @@ class TwinExperiment:
                 predicted_cov_wme=None,
                 n_l_wme_samples=self.config.l_wme_samples,
                 auto_inflate_B=self.config.auto_inflate_B,
-                max_inflate_factor=self.config.max_inflate_factor,
                 predictability_gamma=self.config.predictability_gamma,
                 adaptive_gamma=self.config.adaptive_gamma,
                 B_lwme=B_lwme,
@@ -1413,6 +1393,8 @@ class TwinExperiment:
         }
         if self.config.max_funcs is not None:
             opt_options["max_funcs"] = self.config.max_funcs
+        if hasattr(self, "optimization_iteration_callback"):
+            opt_options["iteration_callback"] = self.optimization_iteration_callback
 
         if self.config.use_bounds:
             lower, upper = self._create_physical_bounds()
