@@ -39,7 +39,7 @@ obs_fraction = 0.5
 obs_frequency = 2
 obs_noise_level = 0.01
 background_error_std = 0.02  # Test at 2% first
-cov_inflation_factor = 2000.0
+predictability_gamma = 0.1  # Eq 38 safety factor
 max_iterations = 10
 
 if rank == 0:
@@ -47,7 +47,7 @@ if rank == 0:
     print("DIAGNOSTIC: Test Cost Function Evaluation")
     print("=" * 70)
     print(f"  Background perturbation: {background_error_std*100}%")
-    print(f"  Inflation factor: {cov_inflation_factor}x")
+    print(f"  Eq 38 γ: {predictability_gamma}")
     print("=" * 70)
 
 # ================================================================
@@ -147,10 +147,13 @@ exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, obs_
 background_error = exp._setup_background()
 B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
 
-# Inflate B
-if cov_inflation_factor != 1.0:
-    B.diagonal.scale(cov_inflation_factor)
-    B.inv_diagonal.scale(1.0 / cov_inflation_factor)
+# Eq 38: Derive σ_b² from Gram matrix
+from run_comparison import _compute_eq38_variance_bound, _apply_eq38_to_B
+eq38_result = _compute_eq38_variance_bound(
+    obs_operator, exp.m_true, obs_noise_level, len(obs_times),
+    predictability_gamma=predictability_gamma, comm=comm, rank=rank,
+)
+_apply_eq38_to_B(B, eq38_result, rank=rank)
 
 n_obs = obs_operator.get_num_observations()
 if rank == 0:

@@ -31,6 +31,7 @@ import sys
 import time
 import numpy as np
 from pathlib import Path
+from typing import Dict, List
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
@@ -48,7 +49,7 @@ def parse_args():
         "--phase",
         type=str,
         default="0",
-        choices=["0", "0.5", "1", "2", "3", "4", "5", "6", "all"],
+        choices=["0", "0.5", "1", "2", "3", "4", "5", "6", "7", "all"],
         help="Experiment phase to run",
     )
 
@@ -57,7 +58,7 @@ def parse_args():
         type=str,
         default=None,
         choices=["noise", "obs_density", "obs_frequency", "bg_error",
-                 "cov_inflation", "window_length", "model_error", "all"],
+                 "predictability_gamma", "window_length", "model_error", "all"],
         help="Phase 6: which sweep dimension to run (default: all)",
     )
 
@@ -91,6 +92,14 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--phase6-suite",
+        type=str,
+        default="controlled",
+        choices=["legacy", "controlled"],
+        help="Phase 6: legacy a/b comparison or controlled ablation suite (default: controlled)",
+    )
+
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -98,6 +107,338 @@ def parse_args():
     )
 
     return parser.parse_args()
+
+
+PHASE6_DYNAMIC_VALIDATION_DIMS = {"noise", "window_length"}
+
+
+def _get_sweep_value(sweep_params: Dict, key: str, default):
+    """Return a sweep override if present, otherwise the provided default."""
+    if not sweep_params:
+        return default
+    return sweep_params.get(key, default)
+
+
+def _summarize_eigenvalues(eigvals) -> Dict[str, float]:
+    """Return compact spectral diagnostics for a 1D eigenvalue array."""
+    arr = np.asarray(eigvals, dtype=float)
+    if arr.size == 0:
+        return {
+            "count": 0,
+            "lambda_min": None,
+            "lambda_max": None,
+            "lambda_mean": None,
+            "condition_number": None,
+            "spread_pct": None,
+            "rank_gt_1e-10": 0,
+        }
+
+    lam_min = float(arr.min())
+    lam_max = float(arr.max())
+    lam_mean = float(arr.mean())
+    lam_floor = max(lam_min, 1e-30)
+    return {
+        "count": int(arr.size),
+        "lambda_min": lam_min,
+        "lambda_max": lam_max,
+        "lambda_mean": lam_mean,
+        "condition_number": float(lam_max / lam_floor),
+        "spread_pct": float(100.0 * (lam_max - lam_min) / max(abs(lam_mean), 1e-30)),
+        "rank_gt_1e-10": int(np.sum(arr > 1e-10)),
+    }
+
+
+def _phase6_method_suite(dim_name: str, suite: str = "controlled") -> List[Dict]:
+    """Return the Phase 6 method/ablation suite for a sweep dimension."""
+    legacy = [
+        {
+            "variant_key": "4dvar_baseline",
+            "sub_label": "a",
+            "method": "4dvar",
+            "l_wme_mode": "N/A",
+            "apply_eq38_background_scaling": False,
+            "description": "Classical 4D-Var baseline",
+        },
+        {
+            "variant_key": "dcwme_static",
+            "sub_label": "b",
+            "method": "dcwme",
+            "l_wme_mode": "static",
+            "apply_eq38_background_scaling": True,
+            "description": "DC-WME with static L_wme",
+        },
+    ]
+
+    if suite == "legacy":
+        return legacy
+
+    controlled = list(legacy)
+    controlled.append(
+        {
+            "variant_key": "4dvar_eq38",
+            "sub_label": "c",
+            "method": "4dvar",
+            "l_wme_mode": "N/A",
+            "apply_eq38_background_scaling": True,
+            "description": "4D-Var with matched Eq. 38 background scaling",
+        }
+    )
+    if dim_name in PHASE6_DYNAMIC_VALIDATION_DIMS:
+        controlled.append(
+            {
+                "variant_key": "dcwme_dynamic",
+                "sub_label": "d",
+                "method": "dcwme",
+                "l_wme_mode": "dynamic",
+                "apply_eq38_background_scaling": True,
+                "description": "DC-WME with dynamic L_wme",
+            }
+        )
+
+    return controlled
+
+
+def _make_state_rmse_iteration_callback(m_true, m_background):
+    """Create a lightweight callback that records control-space RMSE per iteration."""
+    def _callback(x, iteration, cost, grad_norm):
+        if x is None:
+            return {}
+
+        truth_diff = x.copy()
+        truth_diff.axpy(-1.0, m_true)
+        truth_rmse = float(np.sqrt(truth_diff.dot(truth_diff) / truth_diff.getSize()))
+        truth_diff.destroy()
+
+        bg_diff = x.copy()
+        bg_diff.axpy(-1.0, m_background)
+        bg_rmse = float(np.sqrt(bg_diff.dot(bg_diff) / bg_diff.getSize()))
+        bg_diff.destroy()
+
+        return {
+            "analysis_state_rmse": truth_rmse,
+            "distance_from_background_rmse": bg_rmse,
+        }
+
+    return _callback
+
+
+def _jsonify_metric_value(value):
+    """Convert numpy scalar metrics into JSON-friendly Python scalars."""
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    return value
+
+
+# ========================================================================
+# Eq 38 variance bound: σ_b² ≥ γ / λ_min(G)
+# where G = J_wme^T J_wme is the TLM-based Gram matrix
+# ========================================================================
+
+def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
+                            m_linearize, observations, obs_times,
+                            truth_trajectory, truth_jacobians,
+                            predictability_gamma=0.1,
+                            comm=None, rank=0):
+    """Compute σ_b² from Eq 38 using the truth trajectory's TLM (Spence et al. 2025).
+
+    Uses an already-computed trajectory + Jacobians (typically the truth trajectory)
+    to build the WME Gram matrix G[i,j] = a_i^T a_j where a_i = J_wme^T e_i.
+    No additional forward solve needed — reuses existing data.
+
+    σ_b² ≥ γ / λ_min(G)  (J_wme absorbs R^{-1/2} and 1/√N)
+
+    Parameters
+    ----------
+    forward_model : ForwardModelWrapper
+        Forward model (for WME QoI construction).
+    obs_operator : ObservationOperator
+        Point observation operator H.
+    obs_cov : CovarianceMatrix
+        Observation covariance R.
+    m_linearize : PETSc.Vec
+        State to linearize around (typically m_true or m_background).
+    observations : list of PETSc.Vec
+        Observation vectors.
+    obs_times : list of int
+        Observation time indices (0-based, relative to DA start).
+    truth_trajectory : list of PETSc.Vec
+        Pre-computed trajectory states.
+    truth_jacobians : list
+        Pre-computed Jacobians from the trajectory.
+    predictability_gamma : float
+        Safety factor γ for Eq 38.
+    comm : MPI.Comm, optional
+        MPI communicator.
+    rank : int
+        MPI rank for print control.
+
+    Returns
+    -------
+    dict
+        Keys: sigma_b_sq, lambda_min_G, lambda_max_G, gram_eigvals,
+        gram_condition, predictability_gamma.
+    """
+    import time as _time
+    import gc
+    from swe4dvar.data_assimilation.qoi_maps import WeightedMeanErrorQoI
+
+    t0 = _time.perf_counter()
+
+    if rank == 0:
+        print(f"  [Eq 38 TLM] Using pre-computed trajectory ({len(truth_trajectory)} states, "
+              f"{len(truth_jacobians) if truth_jacobians else 0} Jacobians)")
+
+    # Create WME QoI map and linearize using pre-computed trajectory
+    wme_qoi = WeightedMeanErrorQoI(
+        forward_model=forward_model,
+        observation_operator=obs_operator,
+        observations=observations,
+        observation_cov=obs_cov,
+        obs_times=obs_times,
+    )
+
+    linearized_wme = wme_qoi.linearize(
+        m_linearize, max(obs_times),
+        trajectory=truth_trajectory, jacobians=truth_jacobians,
+    )
+
+    # Observation space dimension (= number of obs points, not times)
+    n_obs = obs_operator.get_num_observations()
+
+    if rank == 0:
+        print(f"  [Eq 38 TLM] Computing Gram matrix ({n_obs} adjoint solves)...")
+    t1 = _time.perf_counter()
+
+    # Compute a_i = J_wme^T e_i for each obs basis vector
+    adjoint_vectors = []
+    from petsc4py import PETSc as _PETSc
+    e_i = _PETSc.Vec().createSeq(n_obs)
+    e_i.setUp()
+    for i in range(n_obs):
+        e_i.zeroEntries()
+        e_i.setValue(i, 1.0)
+        e_i.assemblyBegin()
+        e_i.assemblyEnd()
+        a_i = linearized_wme.apply_adjoint(e_i)
+        adjoint_vectors.append(a_i)
+        if (i + 1) % 50 == 0 or i == 0:
+            elapsed = _time.perf_counter() - t1
+            if rank == 0:
+                print(f"    Adjoint {i+1}/{n_obs} ({elapsed:.1f}s)")
+    e_i.destroy()
+
+    t_adj = _time.perf_counter() - t1
+
+    # Form Gram matrix G[i,j] = a_i^T a_j
+    G = np.zeros((n_obs, n_obs))
+    for i in range(n_obs):
+        for j in range(i, n_obs):
+            val = adjoint_vectors[i].dot(adjoint_vectors[j])
+            G[i, j] = val
+            G[j, i] = val
+
+    gram_eigvals = np.linalg.eigvalsh(G)
+    lambda_min_G = max(gram_eigvals.min(), 1e-30)
+    lambda_max_G = gram_eigvals.max()
+    condition = lambda_max_G / lambda_min_G
+
+    # Eq 38: σ_b² ≥ γ / λ_min(G)  (J_wme absorbs R^{-1/2} and 1/√N)
+    sigma_b_sq = predictability_gamma / lambda_min_G
+
+    if rank == 0:
+        print(f"  [Eq 38 TLM] Adjoint solves: {t_adj:.1f}s")
+        print(f"  [Eq 38 TLM] Gram matrix G ({n_obs}×{n_obs}):")
+        print(f"    λ_min(G) = {lambda_min_G:.6e}")
+        print(f"    λ_max(G) = {lambda_max_G:.6e}")
+        print(f"    condition = {condition:.2f}")
+        print(f"    spread = {100*(lambda_max_G - lambda_min_G)/max(gram_eigvals.mean(), 1e-30):.1f}%")
+        print(f"    rank (>1e-10) = {np.sum(gram_eigvals > 1e-10)}/{n_obs}")
+        print(f"  [Eq 38 TLM] σ_b² = γ / λ_min(G) = {predictability_gamma} / {lambda_min_G:.6e}")
+        print(f"  [Eq 38 TLM] σ_b² = {sigma_b_sq:.6e}  (σ_b = {np.sqrt(sigma_b_sq):.6e})")
+        print(f"  [Eq 38 TLM] Total time: {_time.perf_counter() - t0:.1f}s")
+
+    # Cleanup adjoint vectors (don't destroy trajectory — caller owns it)
+    for v in adjoint_vectors:
+        v.destroy()
+    del adjoint_vectors, G
+    gc.collect()
+
+    return {
+        "sigma_b_sq": sigma_b_sq,
+        "lambda_min_G": float(lambda_min_G),
+        "lambda_max_G": float(lambda_max_G),
+        "gram_eigvals": [float(v) for v in gram_eigvals],
+        "gram_condition": float(condition),
+        "predictability_gamma": predictability_gamma,
+        "gram_spectrum": _summarize_eigenvalues(gram_eigvals),
+    }
+
+
+def _apply_eq38_to_B(B, eq38_result, rank=0):
+    """Inflate B per-component so that every diagonal entry ≥ σ_b² from Eq 38.
+
+    Unlike uniform scaling (which over-inflates components already above the
+    bound), this only inflates DOFs whose variance is below the required σ_b².
+    Components already satisfying the bound are left unchanged.
+
+    Parameters
+    ----------
+    B : DiagonalCovariance
+        Background covariance (modified in place).
+    eq38_result : dict
+        Output from _compute_eq38_from_tlm. Must contain 'sigma_b_sq'.
+    rank : int
+        MPI rank for print control.
+
+    Returns
+    -------
+    float
+        Maximum scale factor applied to any single DOF.
+    """
+    sigma_b_sq = eq38_result["sigma_b_sq"]
+
+    diag_arr = B.diagonal.getArray()
+    inv_diag_arr = B.inv_diagonal.getArray()
+
+    n_total = diag_arr.size
+    below_mask = diag_arr < sigma_b_sq
+    n_below = int(np.sum(below_mask))
+    n_above = n_total - n_below
+
+    if rank == 0:
+        print(f"  [Eq 38] Required σ_b² = {sigma_b_sq:.6e}")
+        print(f"  [Eq 38] DOFs below bound: {n_below}/{n_total} "
+              f"(above: {n_above})")
+        if n_below > 0:
+            print(f"  [Eq 38] Below-bound range: [{diag_arr[below_mask].min():.6e}, "
+                  f"{diag_arr[below_mask].max():.6e}]")
+        if n_above > 0:
+            print(f"  [Eq 38] Above-bound range: [{diag_arr[~below_mask].min():.6e}, "
+                  f"{diag_arr[~below_mask].max():.6e}]")
+
+    if n_below > 0:
+        # Only inflate DOFs that are below the bound
+        max_scale = sigma_b_sq / diag_arr[below_mask].min()
+        diag_arr[below_mask] = sigma_b_sq
+        inv_diag_arr[below_mask] = 1.0 / sigma_b_sq
+
+        B.diagonal.setArray(diag_arr)
+        B.diagonal.assemble()
+        B.inv_diagonal.setArray(inv_diag_arr)
+        B.inv_diagonal.assemble()
+
+        if rank == 0:
+            print(f"  [Eq 38] Inflated {n_below} DOFs to σ_b²={sigma_b_sq:.6e} "
+                  f"(max scale: {max_scale:.2f}x)")
+            print(f"  [Eq 38] min(B) = {B.min_eigenvalue():.6e}")
+    else:
+        max_scale = 1.0
+        if rank == 0:
+            print(f"  [Eq 38] All DOFs already satisfy Eq 38 (no inflation needed)")
+
+    return max_scale
 
 
 def run_phase_0(args):
@@ -554,7 +895,6 @@ def run_phase_1(args):
     obs_frequency = 6       # Every 6 timesteps (= every hour) per plan
     obs_noise_level = 0.01  # 1% noise
     background_error_std = 0.02   # 2% perturbation RMS (larger gap for optimizer to find)
-    cov_inflation_factor = 10.0  # Weaken B^{-1} to let optimizer move (larger perturbation needs less inflation)
     max_iterations = 15     # Need more iters for full convergence with large perturbation
 
     if rank == 0:
@@ -697,13 +1037,6 @@ def run_phase_1(args):
     background_error = exp._setup_background()
     B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
 
-    # Inflate B to weaken B^{-1} penalty without increasing perturbation size
-    if cov_inflation_factor != 1.0:
-        B.diagonal.scale(cov_inflation_factor)
-        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
-        if rank == 0:
-            print(f"  B covariance inflated by {cov_inflation_factor}x")
-
     n_obs = obs_operator.get_num_observations()
     if rank == 0:
         print(f"  Observation points: {n_obs}")
@@ -844,6 +1177,16 @@ def run_phase_1(args):
             "convergence": {
                 "cost_history": [float(c) for c in cost_history],
                 "gradient_norm_history": [float(g) for g in gradient_history],
+                "analysis_state_rmse_history": [
+                    float(h["analysis_state_rmse"])
+                    for h in optimizer.convergence_history
+                    if "analysis_state_rmse" in h
+                ],
+                "distance_from_background_rmse_history": [
+                    float(h["distance_from_background_rmse"])
+                    for h in optimizer.convergence_history
+                    if "distance_from_background_rmse" in h
+                ],
             },
             "timing": {
                 "warmup_s": float(t_warmup),
@@ -913,7 +1256,6 @@ def run_phase_2(args):
     obs_frequency = 6
     obs_noise_level = 0.01
     background_error_std = 0.02
-    cov_inflation_factor = 10.0
     max_iterations = 15
     friction_scale_factor = 1.15  # 15% Manning's n error
 
@@ -1058,12 +1400,6 @@ def run_phase_2(args):
     exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, obs_times)
     background_error = exp._setup_background()
     B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
-
-    if cov_inflation_factor != 1.0:
-        B.diagonal.scale(cov_inflation_factor)
-        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
-        if rank == 0:
-            print(f"  B covariance inflated by {cov_inflation_factor}x")
 
     n_obs = obs_operator.get_num_observations()
     if rank == 0:
@@ -1235,12 +1571,17 @@ def run_phase_2(args):
 
 def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
                            m_template, predictability_gamma=0.1,
-                           adaptive_gamma=True, max_inflate_factor=5.0,
-                           comm=None, rank=0):
-    """Compute static L_wme = (N / σ²_obs) · H B_inflated Hᵀ (no adjoint solves).
+                           adaptive_gamma=True, comm=None, rank=0,
+                           skip_eq38_inflation=False):
+    """Compute static L_wme = I + (N / σ²_obs) · H B Hᵀ (no adjoint solves).
 
     This matches the near-linear limit of the dynamic L_wme. When M_{k:0} ≈ I,
-    J_wme → (√N/σ_obs)·H, so L_wme → (N/σ²_obs)·H B Hᵀ.
+    J_wme → (√N/σ_obs)·H, so L_wme → I + (N/σ²_obs)·H B Hᵀ.
+    The +I term is the observation noise contribution: (1/N) Σ_k R^{-1/2} Cov(ε_k) R^{-1/2} = I.
+
+    When skip_eq38_inflation=True, B is assumed to already have the correct
+    inflation (e.g., from a prior TLM-based Eq 38 computation). The internal
+    H·H^T-based inflation is skipped to avoid double-inflation.
 
     Parameters
     ----------
@@ -1255,11 +1596,9 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
     m_template : PETSc.Vec
         Template state vector for creating unit vectors.
     predictability_gamma : float
-        Relaxation parameter for eigenvalue flooring.
+        Relaxation parameter for eigenvalue flooring (Eq 38 γ).
     adaptive_gamma : bool
         If True, floor = gamma * lambda_max.
-    max_inflate_factor : float
-        Maximum B inflation factor.
     comm : MPI.Comm
         MPI communicator.
     rank : int
@@ -1312,11 +1651,6 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
     if rank == 0:
         print(f"  H extracted: {np.count_nonzero(H)} nonzeros out of {d_obs * n_state}")
 
-    # Step 1: Static B inflation from H Hᵀ eigenvalues
-    G_static = H @ H.T  # (d_obs × d_obs)
-    gram_eigvals = np.linalg.eigvalsh(G_static)
-    lambda_min_G = max(gram_eigvals.min(), 1e-30)
-
     # Get B diagonal
     B_diag = B.diagonal.getArray().copy()
     # Gather full diagonal (for MPI)
@@ -1329,31 +1663,51 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
 
     current_min_var = B_diag.min()
 
-    # Inflation factor from predictability bound
-    required_var = (predictability_gamma * obs_variance) / (n_obs_times * lambda_min_G)
-    alpha_uncapped = max(1.0, required_var / current_min_var) if current_min_var > 0 else 1.0
-    alpha = min(alpha_uncapped, max_inflate_factor)
+    # Step 1: B inflation for Eq 38 predictability bound
+    if skip_eq38_inflation:
+        # B was already inflated by a prior TLM-based Eq 38 computation.
+        # Skip the internal H·H^T approximation to avoid double-inflation.
+        alpha = 1.0
+        diagnostics = {
+            'inflation_factor': 1.0,
+            'skip_reason': 'B already inflated by TLM-based Eq 38',
+            'current_min_var': float(current_min_var),
+        }
+        if rank == 0:
+            print(f"  [Eq 38] Skipped — B already inflated by TLM (min(B) = {current_min_var:.6e})")
+    else:
+        # Fallback: approximate Gram matrix from H alone (no TLM).
+        # This is valid only when M_{k:0} ≈ I (near-identity propagator).
+        G_static = H @ H.T  # (d_obs × d_obs)
+        gram_eigvals = np.linalg.eigvalsh(G_static)
+        lambda_min_G = max(gram_eigvals.min(), 1e-30)
 
-    diagnostics = {
-        'gram_eigvals': gram_eigvals.tolist(),
-        'lambda_min_G': float(lambda_min_G),
-        'required_var': float(required_var),
-        'inflation_factor': float(alpha),
-        'inflation_capped': alpha < alpha_uncapped,
-    }
+        # Inflation factor: required_var = γ · σ²_obs / (N · λ_min(H H^T))
+        required_var = (predictability_gamma * obs_variance) / (n_obs_times * lambda_min_G)
+        alpha = max(1.0, required_var / current_min_var) if current_min_var > 0 else 1.0
 
-    if rank == 0:
-        if alpha > 1.0:
-            print(f"  Static B inflation: α = {alpha:.4f} "
-                  f"(required σ²_b = {required_var:.4e}, current = {current_min_var:.4e})")
-        else:
-            print(f"  Static: no B inflation needed")
+        diagnostics = {
+            'gram_eigvals': gram_eigvals.tolist(),
+            'lambda_min_G': float(lambda_min_G),
+            'required_var': float(required_var),
+            'inflation_factor': float(alpha),
+        }
+
+        if rank == 0:
+            if alpha > 1.0:
+                print(f"  [Eq 38] Static H·H^T inflation: α = {alpha:.4f} "
+                      f"(required σ²_b = {required_var:.4e}, current = {current_min_var:.4e})")
+            else:
+                print(f"  [Eq 38] Static: no B inflation needed")
 
     B_diag_inflated = B_diag * alpha if alpha > 1.0 else B_diag
 
-    # Step 2: Form L_static = (N/σ²_obs) · H B Hᵀ
+    # Step 2: Form L_static = I + (N/σ²_obs) · H B_inflated Hᵀ
+    # The +I term arises from the observation noise contribution to the
+    # WME predicted covariance: (1/N) Σ_k R^{-1/2} Cov(ε_k) R^{-1/2} = I.
+    # This matches the dynamic L_wme computation in cost_functions.py:1695.
     HB = H * B_diag_inflated[np.newaxis, :]
-    L_dense = (n_obs_times / obs_variance) * (HB @ H.T)
+    L_dense = np.eye(d_obs) + (n_obs_times / obs_variance) * (HB @ H.T)
 
     # Free large intermediate arrays
     del H, HB, B_diag_inflated
@@ -1383,6 +1737,8 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
     diagnostics['gamma_floor'] = float(gamma_floor)
     diagnostics['n_natural'] = int(n_natural)
     diagnostics['n_floored'] = int(n_floored)
+    diagnostics['raw_spectrum'] = _summarize_eigenvalues(eigvals)
+    diagnostics['regularized_spectrum'] = _summarize_eigenvalues(eigvals_reg)
 
     # Create PETSc Mat from numpy array
     mat = PETSc.Mat().create(comm=comm)
@@ -1405,7 +1761,9 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
 def _run_sub_experiment(args, sub_label, method, config_overrides=None,
                         static_L_wme=None, output_dir=None,
                         nt_da=12, nt_ramp=144, phase_prefix="3",
-                        sweep_params=None):
+                        sweep_params=None, l_wme_mode="dynamic",
+                        apply_eq38_background_scaling=False,
+                        method_variant_key=None):
     """Run a single sub-experiment.
 
     Parameters
@@ -1429,6 +1787,13 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
     sweep_params : dict, optional
         Parameter overrides for Phase 6 sweep. Keys override local
         configuration variables (obs_fraction, obs_frequency, etc.).
+    l_wme_mode : str, optional
+        DC-WME covariance mode: ``static`` or ``dynamic``.
+    apply_eq38_background_scaling : bool, optional
+        If True, apply the Eq. 38 background scaling even for non-DC-WME
+        branches so conditioning changes can be separated from methodology.
+    method_variant_key : str, optional
+        Human-readable label for result metadata.
 
     Returns
     -------
@@ -1459,30 +1824,37 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
     obs_frequency = 6
     obs_noise_level = 0.01
     background_error_std = 0.02
-    cov_inflation_factor = 10.0
     max_iterations = 15
     friction_scale_factor = 1.15
 
     # Override with sweep parameters (Phase 6)
     if sweep_params:
-        obs_fraction = sweep_params.get("obs_fraction", obs_fraction)
-        obs_frequency = sweep_params.get("obs_frequency", obs_frequency)
-        obs_noise_level = sweep_params.get("obs_noise_level", obs_noise_level)
-        background_error_std = sweep_params.get("background_error_std", background_error_std)
-        cov_inflation_factor = sweep_params.get("cov_inflation_factor", cov_inflation_factor)
-        friction_scale_factor = sweep_params.get("friction_scale_factor", friction_scale_factor)
+        obs_fraction = _get_sweep_value(sweep_params, "obs_fraction", obs_fraction)
+        obs_frequency = _get_sweep_value(sweep_params, "obs_frequency", obs_frequency)
+        obs_noise_level = _get_sweep_value(sweep_params, "obs_noise_level", obs_noise_level)
+        background_error_std = _get_sweep_value(sweep_params, "background_error_std", background_error_std)
+        friction_scale_factor = _get_sweep_value(sweep_params, "friction_scale_factor", friction_scale_factor)
 
-    # DC-WME parameters
-    predictability_gamma = 0.1
-    max_inflate_factor = 5.0
+    # DC-WME / Eq 38 parameters
+    predictability_gamma = _get_sweep_value(sweep_params, "predictability_gamma", 0.1)
     auto_inflate_B = True
     adaptive_gamma = True
 
+    effective_l_wme_mode = (
+        "static" if (method == "dcwme" and static_L_wme is not None)
+        else (l_wme_mode if method == "dcwme" else "N/A")
+    )
+
     if rank == 0:
         print(f"\n{'=' * 70}")
-        print(f"PHASE {phase_prefix}{sub_label.upper()}: {method.upper()}"
-              f"{' (static L_wme)' if sub_label == 'b' else ''}"
-              f"{' (dynamic L_wme)' if sub_label == 'c' else ''}")
+        method_label = method.upper()
+        if method == "dcwme":
+            method_label += f" ({effective_l_wme_mode} L_wme)"
+        if apply_eq38_background_scaling and method == "4dvar":
+            method_label += " + Eq38(B)"
+        if method_variant_key:
+            method_label += f" [{method_variant_key}]"
+        print(f"PHASE {phase_prefix}{sub_label.upper()}: {method_label}")
         print(f"{'=' * 70}")
 
     # ================================================================
@@ -1579,7 +1951,7 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
     if method == "dcwme":
         config_kwargs.update(
             predictability_gamma=predictability_gamma,
-            max_inflate_factor=max_inflate_factor,
+
             auto_inflate_B=auto_inflate_B,
             adaptive_gamma=adaptive_gamma,
         )
@@ -1639,13 +2011,37 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
 
     exp.config.method = original_method  # Restore original method
 
-    if cov_inflation_factor != 1.0:
-        B.diagonal.scale(cov_inflation_factor)
-        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
-        if rank == 0:
-            print(f"  B covariance inflated by {cov_inflation_factor}x")
-
+    # Eq 38: Derive σ_b² from TLM Gram matrix — DC-WME only
     n_obs = obs_operator.get_num_observations()
+    eq38_result = None
+    eq38_scale = 1.0
+    if method == "dcwme" or apply_eq38_background_scaling:
+        if rank == 0:
+            print(f"\n--- Step 5a: Computing σ_b² from Eq 38 via TLM ---")
+            print(f"  Running forward solve from m_true with DA model ({nt_da} steps)...")
+        from experiments.twin_experiment import ForwardModelWrapper
+        prob.nt = nt_da
+        gram_fwd = ForwardModelWrapper(
+            solver=solver, problem=prob,
+            solver_params=da_solver_params, t_start=t_da_start,
+        )
+        gram_trajectory, gram_jacobians = gram_fwd.solve(exp.m_true, store_jacobians=True)
+        eq38_result = _compute_eq38_from_tlm(
+            forward_model=gram_fwd,
+            obs_operator=obs_operator, obs_cov=R,
+            m_linearize=exp.m_true,
+            observations=exp.observations, obs_times=obs_times,
+            truth_trajectory=gram_trajectory, truth_jacobians=gram_jacobians,
+            predictability_gamma=predictability_gamma,
+            comm=comm, rank=rank,
+        )
+        eq38_scale = _apply_eq38_to_B(B, eq38_result, rank=rank)
+        for v in gram_trajectory:
+            v.destroy()
+        del gram_trajectory, gram_jacobians
+        solver.storage.clear()
+        import gc; gc.collect()
+
     if rank == 0:
         print(f"  Observation points: {n_obs}")
         print(f"  Observation times: {obs_times}")
@@ -1655,14 +2051,17 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
     # Step 5b: Compute static L_wme if needed
     # ================================================================
     static_diagnostics = None
-    if method == "dcwme" and static_L_wme is None:
+    if method == "dcwme" and effective_l_wme_mode == "static" and static_L_wme is None:
+        already_inflated = eq38_result is not None
         if rank == 0:
-            print("\n--- Step 5b: Computing static L_wme ---", flush=True)
+            print(f"\n--- Step 5b: Computing static L_wme "
+                  f"(skip_eq38_inflation={already_inflated}) ---", flush=True)
         static_L_wme, static_diagnostics = _compute_static_L_wme(
             obs_operator, B, len(obs_times), obs_noise_level ** 2,
             exp.m_true, predictability_gamma=predictability_gamma,
-            adaptive_gamma=adaptive_gamma, max_inflate_factor=max_inflate_factor,
+            adaptive_gamma=adaptive_gamma,
             comm=comm, rank=rank,
+            skip_eq38_inflation=already_inflated,
         )
         if rank == 0:
             print("  Static L_wme computed successfully", flush=True)
@@ -1687,11 +2086,11 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
     # ================================================================
     if rank == 0:
         method_label = method.upper()
-        if static_L_wme is not None:
-            method_label += " (static L_wme)"
+        if method == "dcwme":
+            method_label += f" ({effective_l_wme_mode} L_wme)"
         print(f"\n--- Step 7: Setting up {method_label} cost function ---", flush=True)
 
-    if static_L_wme is not None:
+    if method == "dcwme" and effective_l_wme_mode == "static" and static_L_wme is not None:
         # Phase 3b: pass precomputed static L_wme
         from swe4dvar.data_assimilation.cost_functions import DCWMEFourDVarCost
 
@@ -1706,7 +2105,7 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
             predicted_cov_wme=static_L_wme,
             n_l_wme_samples=0,  # Skip analytical computation
             auto_inflate_B=False,  # Already inflated in static computation
-            max_inflate_factor=max_inflate_factor,
+
             predictability_gamma=predictability_gamma,
             adaptive_gamma=adaptive_gamma,
             comm=comm,
@@ -1756,6 +2155,10 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
         if rank == 0:
             print(f"  Gradient smoother attached (L={gradient_smoothing_length}m)")
 
+    exp.optimization_iteration_callback = _make_state_rmse_iteration_callback(
+        exp.m_true, exp.m_background
+    )
+
     # ================================================================
     # Step 8: Run optimization
     # ================================================================
@@ -1766,6 +2169,16 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
 
     cost_history = [h["cost"] for h in optimizer.convergence_history]
     gradient_history = [h["grad_norm"] for h in optimizer.convergence_history]
+    analysis_state_rmse_history = [
+        float(h["analysis_state_rmse"])
+        for h in optimizer.convergence_history
+        if "analysis_state_rmse" in h
+    ]
+    distance_from_background_history = [
+        float(h["distance_from_background_rmse"])
+        for h in optimizer.convergence_history
+        if "distance_from_background_rmse" in h
+    ]
 
     if rank == 0:
         print(f"  Iterations: {optimizer.iteration}")
@@ -1806,6 +2219,7 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
     # Step 10: Extract DC-WME diagnostics
     # ================================================================
     dcwme_diagnostics = {}
+    eq38_diagnostics = eq38_result.copy() if eq38_result is not None else {}
     if method == "dcwme":
         # Get the inner cost function (unwrap boundary gradient zeroing)
         inner = cost_function
@@ -1831,6 +2245,11 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
                     l_eigvals = np.linalg.eigvalsh(L_dense_np)
                     dcwme_diagnostics['l_wme_eigenvalues'] = [float(v) for v in l_eigvals]
                     dcwme_diagnostics['l_wme_n_natural'] = int(np.sum(l_eigvals > predictability_gamma * l_eigvals.max()))
+                    dcwme_diagnostics['l_wme_spectrum'] = _summarize_eigenvalues(l_eigvals)
+                    if np.all(l_eigvals > 1.0):
+                        weights = 1.0 - 1.0 / l_eigvals
+                        dcwme_diagnostics['effective_weight_min'] = float(weights.min())
+                        dcwme_diagnostics['effective_weight_max'] = float(weights.max())
             except Exception as e:
                 if rank == 0:
                     print(f"  Warning: Could not extract L_wme eigenvalues: {e}")
@@ -1847,10 +2266,17 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
             "phase": f"{phase_prefix}{sub_label}",
             "status": "success",
             "method": method,
+            "method_variant": method_variant_key or method,
             "model_error": True,
             "model_error_type": "friction",
             "friction_scale_factor": friction_scale_factor,
-            "l_wme_type": "static" if sub_label == "b" else ("dynamic" if sub_label == "c" else "N/A"),
+            "l_wme_type": effective_l_wme_mode,
+            "experiment_controls": {
+                "apply_eq38_background_scaling": bool(apply_eq38_background_scaling),
+                "eq38_scaling_basis": "WME-TLM" if (eq38_result is not None) else "none",
+                "phase6_suite": getattr(args, "phase6_suite", None),
+                "method_variant_key": method_variant_key,
+            },
             "config": {
                 "dt": dt,
                 "nt_ramp": nt_ramp,
@@ -1860,11 +2286,14 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
                 "obs_frequency": obs_frequency,
                 "obs_noise_level": obs_noise_level,
                 "background_error_std": background_error_std,
+                "eq38_sigma_b_sq": eq38_result["sigma_b_sq"] if eq38_result else None,
+                "eq38_scale_factor": eq38_scale,
+                "eq38_lambda_min_G": eq38_result["lambda_min_G"] if eq38_result else None,
                 "max_iterations": max_iterations,
                 "n_obs_points": n_obs,
                 "obs_times": obs_times,
                 "predictability_gamma": predictability_gamma,
-                "max_inflate_factor": max_inflate_factor,
+
             },
             "results": {
                 "background_error": float(background_error),
@@ -1880,8 +2309,16 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
             "convergence": {
                 "cost_history": [float(c) for c in cost_history],
                 "gradient_norm_history": [float(g) for g in gradient_history],
+                "analysis_state_rmse_history": analysis_state_rmse_history,
+                "distance_from_background_rmse_history": distance_from_background_history,
+                "records": [
+                    {k: _jsonify_metric_value(v)
+                     for k, v in record.items()}
+                    for record in optimizer.convergence_history
+                ],
             },
             "dcwme_diagnostics": dcwme_diagnostics,
+            "eq38_diagnostics": eq38_diagnostics,
             "timing": {
                 "warmup_s": float(t_warmup),
                 "truth_generation_s": float(t_truth),
@@ -1895,9 +2332,12 @@ def _run_sub_experiment(args, sub_label, method, config_overrides=None,
             json.dump(results, f, indent=2)
 
         print(f"\n{'=' * 70}")
-        print(f"PHASE {phase_prefix}{sub_label.upper()}: {method.upper()}"
-              f"{' (static L_wme)' if sub_label == 'b' else ''}"
-              f"{' (dynamic L_wme)' if sub_label == 'c' else ''}")
+        method_label = method.upper()
+        if method == "dcwme":
+            method_label += f" ({effective_l_wme_mode})"
+        if apply_eq38_background_scaling and method == "4dvar":
+            method_label += " + Eq38(B)"
+        print(f"PHASE {phase_prefix}{sub_label.upper()}: {method_label}")
         print(f"  Error reduction: {error_reduction:.1f}%")
         print(f"  Iterations: {optimizer.iteration}")
         print(f"  Converged: {optimizer.converged}")
@@ -2049,13 +2489,11 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
     obs_frequency = 6      # every hour
     obs_noise_level = 0.01
     background_error_std = 0.02
-    cov_inflation_factor = 10.0
     max_iterations = 15
     friction_scale_factor = 1.15
 
-    # DC-WME parameters
+    # DC-WME / Eq 38 parameters
     predictability_gamma = 0.1
-    max_inflate_factor = 5.0
     auto_inflate_B = True
     adaptive_gamma = True
 
@@ -2171,7 +2609,7 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
     if method == "dcwme":
         config_kwargs.update(
             predictability_gamma=predictability_gamma,
-            max_inflate_factor=max_inflate_factor,
+
             auto_inflate_B=auto_inflate_B,
             adaptive_gamma=adaptive_gamma,
         )
@@ -2218,13 +2656,36 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
 
     exp.config.method = original_method
 
-    if cov_inflation_factor != 1.0:
-        B.diagonal.scale(cov_inflation_factor)
-        B.inv_diagonal.scale(1.0 / cov_inflation_factor)
-        if rank == 0:
-            print(f"  B covariance inflated by {cov_inflation_factor}x")
-
+    # Eq 38: Derive σ_b² from TLM Gram matrix — DC-WME only
     n_obs = obs_operator.get_num_observations()
+    eq38_result = None
+    if method == "dcwme":
+        if rank == 0:
+            print(f"\n--- Step 5a: Computing σ_b² from Eq 38 via TLM (DC-WME) ---")
+            print(f"  Running forward solve from m_true with DA model ({nt_da_total} steps)...")
+        from experiments.twin_experiment import ForwardModelWrapper
+        prob.nt = nt_da_total
+        gram_fwd = ForwardModelWrapper(
+            solver=solver, problem=prob,
+            solver_params=da_solver_params, t_start=t_da_start,
+        )
+        gram_trajectory, gram_jacobians = gram_fwd.solve(exp.m_true, store_jacobians=True)
+        eq38_result = _compute_eq38_from_tlm(
+            forward_model=gram_fwd,
+            obs_operator=obs_operator, obs_cov=R,
+            m_linearize=exp.m_true,
+            observations=exp.observations, obs_times=global_obs_times,
+            truth_trajectory=gram_trajectory, truth_jacobians=gram_jacobians,
+            predictability_gamma=predictability_gamma,
+            comm=comm, rank=rank,
+        )
+        _apply_eq38_to_B(B, eq38_result, rank=rank)
+        for v in gram_trajectory:
+            v.destroy()
+        del gram_trajectory, gram_jacobians
+        solver.storage.clear()
+        import gc; gc.collect()
+
     if rank == 0:
         print(f"  Observation points: {n_obs}")
         print(f"  Global observation times: {global_obs_times}")
@@ -2260,6 +2721,8 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
     per_window_results = []
     all_cost_history = []
     all_gradient_history = []
+    all_analysis_state_rmse_history = []
+    all_distance_from_background_history = []
     total_iterations = 0
 
     # Store original B diagonal for per-window scaling
@@ -2358,14 +2821,17 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
         static_L_wme = None
         static_diagnostics = None
         if method == "dcwme" and sub_label == "b":
+            already_inflated = eq38_result is not None
             if rank == 0:
-                print(f"  Computing static L_wme for window {w + 1}...", flush=True)
+                print(f"  Computing static L_wme for window {w + 1} "
+                      f"(skip_eq38_inflation={already_inflated})...", flush=True)
             t_lwme_start = time.time()
             static_L_wme, static_diagnostics = _compute_static_L_wme(
                 obs_operator, B, len(window_local_times), obs_noise_level ** 2,
                 exp.m_background, predictability_gamma=predictability_gamma,
-                adaptive_gamma=adaptive_gamma, max_inflate_factor=max_inflate_factor,
+                adaptive_gamma=adaptive_gamma,
                 comm=comm, rank=rank,
+                skip_eq38_inflation=already_inflated,
             )
             t_lwme = time.time() - t_lwme_start
             if rank == 0:
@@ -2395,7 +2861,7 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
                 predicted_cov_wme=static_L_wme,
                 n_l_wme_samples=0,
                 auto_inflate_B=False,
-                max_inflate_factor=max_inflate_factor,
+    
                 predictability_gamma=predictability_gamma,
                 adaptive_gamma=adaptive_gamma,
                 comm=comm,
@@ -2594,11 +3060,12 @@ def _run_cycling_experiment(args, sub_label, method, output_dir=None):
                 "obs_frequency": obs_frequency,
                 "obs_noise_level": obs_noise_level,
                 "background_error_std": background_error_std,
-                "cov_inflation_factor": cov_inflation_factor,
+                "eq38_sigma_b_sq": eq38_result["sigma_b_sq"] if eq38_result else None,
+                "eq38_lambda_min_G": eq38_result["lambda_min_G"] if eq38_result else None,
                 "max_iterations": max_iterations,
                 "n_obs_points": n_obs,
                 "predictability_gamma": predictability_gamma,
-                "max_inflate_factor": max_inflate_factor,
+
             },
             "per_window": per_window_results,
             "aggregate": {
@@ -2905,7 +3372,6 @@ SWEEP_BASELINE = {
     "obs_fraction": 0.1,
     "obs_frequency": 6,
     "background_error_std": 0.02,
-    "cov_inflation_factor": 10.0,
     "nt_da": 12,
     "nt_ramp": 144,
     "friction_scale_factor": 1.15,
@@ -2928,9 +3394,9 @@ SWEEP_DIMS = {
         "param": "background_error_std",
         "values": [0.01, 0.02, 0.05, 0.1],
     },
-    "cov_inflation": {
-        "param": "cov_inflation_factor",
-        "values": [1.0, 5.0, 10.0, 20.0],
+    "predictability_gamma": {
+        "param": "predictability_gamma",
+        "values": [0.01, 0.05, 0.1, 0.5, 1.0],
     },
     "window_length": {
         "param": "nt_da",
@@ -2949,29 +3415,28 @@ def _print_sweep_summary(all_results):
     for dim_name, dim_results in all_results.items():
         print(f"\n{'=' * 70}")
         print(f"SWEEP: {dim_name}")
-        print(f"{'Value':<15} {'4DVar Err%':<12} {'DCWME Err%':<12} {'Winner':<10}")
-        print(f"{'-' * 49}")
+        print(
+            f"{'Value':<15} {'4DVar':<10} {'DC-stat':<10} "
+            f"{'4DVar+Eq38':<12} {'DC-dyn':<10}"
+        )
+        print(f"{'-' * 62}")
         for point in dim_results:
             val = point["value"]
-            fdvar = point.get("4dvar", {})
-            dcwme = point.get("dcwme", {})
+            variants = [
+                point.get("4dvar_baseline", point.get("4dvar", {})),
+                point.get("dcwme_static", point.get("dcwme", {})),
+                point.get("4dvar_eq38", {}),
+                point.get("dcwme_dynamic", {}),
+            ]
 
-            fdvar_err = fdvar.get("results", {}).get("error_reduction", None)
-            if fdvar.get("status") == "failed":
-                fdvar_err = None
-            dcwme_err = dcwme.get("results", {}).get("error_reduction", None)
-            if dcwme.get("status") == "failed":
-                dcwme_err = None
+            rendered = []
+            for result in variants:
+                err = result.get("results", {}).get("error_reduction", None)
+                if result.get("status") == "failed":
+                    err = None
+                rendered.append(f"{err:.1f}" if err is not None else "FAIL")
 
-            fdvar_str = f"{fdvar_err:.1f}" if fdvar_err is not None else "FAIL"
-            dcwme_str = f"{dcwme_err:.1f}" if dcwme_err is not None else "FAIL"
-
-            if fdvar_err is not None and dcwme_err is not None:
-                winner = "4DVar" if fdvar_err > dcwme_err else "DCWME"
-            else:
-                winner = "N/A"
-
-            print(f"{str(val):<15} {fdvar_str:<12} {dcwme_str:<12} {winner:<10}")
+            print(f"{str(val):<15} {rendered[0]:<10} {rendered[1]:<10} {rendered[2]:<12} {rendered[3]:<10}")
         print(f"{'=' * 70}")
 
 
@@ -3108,6 +3573,7 @@ def _run_in_subprocess(run_config, mem_limit_mb, script_path):
             "status": "failed",
             "error": f"Killed by memory watchdog (>{mem_limit_mb:.0f} MB)",
             "method": run_config["method"],
+            "method_variant": run_config.get("variant_key"),
             "sweep_dimension": run_config.get("dim_name", ""),
             "sweep_param": run_config.get("param_name", ""),
             "sweep_value": run_config.get("val"),
@@ -3123,6 +3589,7 @@ def _run_in_subprocess(run_config, mem_limit_mb, script_path):
             "status": "failed",
             "error": f"Child exited with code {child.returncode}: {stderr_tail[-500:]}",
             "method": run_config["method"],
+            "method_variant": run_config.get("variant_key"),
             "sweep_dimension": run_config.get("dim_name", ""),
             "sweep_param": run_config.get("param_name", ""),
             "sweep_value": run_config.get("val"),
@@ -3165,6 +3632,7 @@ def _sweep_worker_main(config_json):
         sub=None,
         verbose=True,
         mem_limit_gb=config.get("mem_limit_gb", 12.0),
+        phase6_suite=config.get("phase6_suite", "controlled"),
     )
 
     sweep_params = config["sweep_params"]
@@ -3179,6 +3647,9 @@ def _sweep_worker_main(config_json):
             nt_ramp=config["nt_ramp"],
             phase_prefix=config["phase_prefix"],
             sweep_params=sweep_params,
+            l_wme_mode=config.get("l_wme_mode", "dynamic"),
+            apply_eq38_background_scaling=config.get("apply_eq38_background_scaling", False),
+            method_variant_key=config.get("variant_key"),
         )
     except Exception as e:
         result_file = Path(config["result_file"])
@@ -3187,6 +3658,7 @@ def _sweep_worker_main(config_json):
             "status": "failed",
             "error": str(e),
             "method": config["method"],
+            "method_variant": config.get("variant_key"),
             "sweep_dimension": config.get("dim_name", ""),
             "sweep_param": config.get("param_name", ""),
             "sweep_value": config.get("val"),
@@ -3202,10 +3674,14 @@ SWEEP_BATCH_SIZE = 10  # Max configs per batch before forced cleanup
 
 
 def run_phase_6(args):
-    """Phase 6: Parameter Sweep — 4D-Var vs Static DC-WME.
+    """Phase 6: Parameter Sweep with controlled ablations.
 
     One-at-a-time sweep across 7 parameter dimensions.
-    Each point runs both 4D-Var and static DC-WME.
+    In controlled mode, each point runs:
+      - classical 4D-Var baseline
+      - DC-WME with static L_wme
+      - 4D-Var with matched Eq. 38 background scaling
+      - DC-WME with dynamic L_wme on the noise/window-length sweeps
 
     Memory safety: each config runs in its own subprocess.
     A watchdog thread in the parent monitors the child's RSS and SIGKILLs
@@ -3229,6 +3705,7 @@ def run_phase_6(args):
 
     sweep_dim_filter = getattr(args, 'sweep_dim', None) or "all"
     dims_to_run = list(SWEEP_DIMS.keys()) if sweep_dim_filter == "all" else [sweep_dim_filter]
+    suite = getattr(args, "phase6_suite", "controlled")
 
     all_sweep_results = {}
 
@@ -3258,8 +3735,12 @@ def run_phase_6(args):
 
             val_str = str(val).replace(".", "p").replace(",", "_")
             point_results = {"dimension": dim_name, "param": param_name, "value": val}
+            method_suite = _phase6_method_suite(dim_name, suite=suite)
 
-            for method, sub_label in [("4dvar", "a"), ("dcwme", "b")]:
+            for spec in method_suite:
+                method = spec["method"]
+                sub_label = spec["sub_label"]
+                variant_key = spec["variant_key"]
                 phase_prefix = f"6_{dim_name}_{val_str}_"
                 result_file = data_dir / f"phase{phase_prefix}{sub_label}_results.json"
 
@@ -3269,11 +3750,15 @@ def run_phase_6(args):
                         print(f"\n  Skipping {result_file.name} (already exists)", flush=True)
                     with open(result_file) as f:
                         result = json.load(f)
-                    point_results[method] = result
+                    point_results[variant_key] = result
+                    if sub_label == "a":
+                        point_results["4dvar"] = result
+                    elif sub_label == "b":
+                        point_results["dcwme"] = result
                     continue
 
                 if rank == 0:
-                    print(f"\n  Running: {dim_name}={val}, method={method} "
+                    print(f"\n  Running: {dim_name}={val}, variant={variant_key} "
                           f"[subprocess, limit={mem_limit_mb:.0f} MB]", flush=True)
 
                 run_config = {
@@ -3281,6 +3766,9 @@ def run_phase_6(args):
                     "adios_file": args.adios_file,
                     "sub_label": sub_label,
                     "method": method,
+                    "variant_key": variant_key,
+                    "l_wme_mode": spec["l_wme_mode"],
+                    "apply_eq38_background_scaling": spec["apply_eq38_background_scaling"],
                     "nt_da": nt_da,
                     "nt_ramp": nt_ramp,
                     "phase_prefix": phase_prefix,
@@ -3290,10 +3778,15 @@ def run_phase_6(args):
                     "param_name": param_name,
                     "val": val,
                     "mem_limit_gb": getattr(args, 'mem_limit_gb', 12.0),
+                    "phase6_suite": suite,
                 }
 
                 result = _run_in_subprocess(run_config, mem_limit_mb, script_path)
-                point_results[method] = result
+                point_results[variant_key] = result
+                if sub_label == "a":
+                    point_results["4dvar"] = result
+                elif sub_label == "b":
+                    point_results["dcwme"] = result
 
                 status = result.get("status", "unknown")
                 if status == "failed":
@@ -3303,7 +3796,7 @@ def run_phase_6(args):
                 else:
                     if rank == 0:
                         err_red = result.get("results", {}).get("error_reduction", "?")
-                        print(f"  Done: error_reduction={err_red}", flush=True)
+                        print(f"  Done ({variant_key}): error_reduction={err_red}", flush=True)
 
             dim_results.append(point_results)
 
@@ -3320,6 +3813,943 @@ def run_phase_6(args):
         sys.stdout.flush()
 
     return all_sweep_results
+
+
+# ======================================================================
+# Phase 7: Wind-Driven Twin Experiment
+# ======================================================================
+
+WIND_SWEEP_BASELINE = {
+    "obs_noise_level": 0.01,
+    "obs_fraction": 0.1,
+    "obs_frequency": 6,
+    "background_error_std": 0.02,
+    "nt_da": 12,
+    "nt_ramp": 144,
+}
+
+
+def _run_sub_experiment_wind(args, sub_label, method, wind_truth_file, wind_perturbed_file,
+                              nt_da=12, nt_ramp=144, output_dir=None, phase_prefix="7_",
+                              sweep_params=None, l_wme_mode="dynamic", n_windows=1,
+                              apply_eq38_background_scaling=False,
+                              method_variant_key=None,
+                              skip_eq38=False):
+    """Run a single wind-driven twin experiment, optionally with cycling.
+
+    Two-problem architecture: truth problem uses truth wind, DA problem uses
+    perturbed wind. Model error comes from wind field mismatch.
+
+    Parameters
+    ----------
+    wind_truth_file : str
+        Path to truth wind HDF5 (used for warm-up + truth trajectory).
+    wind_perturbed_file : str
+        Path to perturbed wind HDF5 (used for DA model).
+    l_wme_mode : str
+        "dynamic" (adjoint-computed, 306 adjoint solves) or "static" (H·B·Hᵀ).
+    n_windows : int
+        Number of cycling DA windows. nt_da is the TOTAL DA timesteps,
+        divided into n_windows equal windows. Default 1 (no cycling).
+    """
+    import os
+    os.environ.setdefault("CC", "/usr/bin/clang")
+
+    from mpi4py import MPI
+    from swe4dvar.forward.adcirc_problem import ADCIRCProblem
+    from swe4dvar.forward.solvers import get_solver
+    from swe4dvar.utils import get_default_solver_params
+    from swe4dvar.physics.forcing import GriddedForcing
+    from experiments.twin_experiment import (
+        TwinExperiment, TwinExperimentConfig, ForwardModelWrapper,
+    )
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    # ================================================================
+    # Configuration
+    # ================================================================
+    dt = 600.0
+    obs_fraction = 0.1
+    obs_frequency = 6
+    obs_noise_level = 0.01
+    background_error_std = 0.02
+    max_iterations = 15
+    predictability_gamma = _get_sweep_value(sweep_params, "predictability_gamma", 0.1)
+
+    if sweep_params:
+        dt = _get_sweep_value(sweep_params, "dt", dt)
+        obs_fraction = _get_sweep_value(sweep_params, "obs_fraction", obs_fraction)
+        obs_frequency = _get_sweep_value(sweep_params, "obs_frequency", obs_frequency)
+        obs_noise_level = _get_sweep_value(sweep_params, "obs_noise_level", obs_noise_level)
+        background_error_std = _get_sweep_value(sweep_params, "background_error_std", background_error_std)
+
+    nt_total = nt_ramp + nt_da
+
+    method_label = method.upper()
+    if method == "dcwme":
+        method_label += f" ({l_wme_mode} L_wme)"
+    elif apply_eq38_background_scaling:
+        method_label += " + Eq38(B)"
+    if method_variant_key:
+        method_label += f" [{method_variant_key}]"
+
+    if rank == 0:
+        print(f"\n{'=' * 70}")
+        print(f"PHASE {phase_prefix}{sub_label.upper()}: {method_label}")
+        print(f"  Wind truth: {wind_truth_file}")
+        print(f"  Wind DA:    {wind_perturbed_file}")
+        print(f"{'=' * 70}")
+
+    # ================================================================
+    # Step 1: Create truth problem with truth wind
+    # ================================================================
+    if rank == 0:
+        print("\n--- Step 1: Creating truth problem ---")
+
+    forcing_truth = GriddedForcing(wind_truth_file, lat0=35)
+    prob_truth = ADCIRCProblem(
+        adios_file=args.adios_file,
+        spherical=True, solution_var="h", friction_law="mannings",
+        wd=True, wd_alpha=1.5, dt=dt, bathy_adjustment=0,
+        nt=nt_total, dramp=2.0, forcing=forcing_truth,
+    )
+    solver_truth = get_solver("DG")(prob_truth, theta=1.0, p_degree=[1, 1])
+
+    warmup_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=10,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=True,
+    )
+
+    if rank == 0:
+        n_dofs = len(solver_truth.u.x.array)
+        print(f"  DOFs: {n_dofs}")
+
+    # ================================================================
+    # Step 2: Warm-up (truth wind, tidal ramp)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 2: Running {nt_ramp}-step warm-up ---")
+
+    t_warmup_start = time.time()
+    prob_truth.nt = nt_ramp
+    solver_truth.time_loop(
+        solver_parameters=warmup_params,
+        stations=[], plot_every=9999,
+        save_state=False, store_jacobians=False,
+        enable_video=False, monitor_progress=(rank == 0),
+    )
+    t_warmup = time.time() - t_warmup_start
+    t_da_start = prob_truth.t
+
+    if rank == 0:
+        print(f"  Warm-up: {t_warmup:.1f}s, t_da_start={t_da_start:.0f}s")
+
+    # ================================================================
+    # Step 3: Generate truth trajectory (DA window)
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 3: Generating truth trajectory ({nt_da} steps) ---")
+
+    t_truth_start = time.time()
+    prob_truth.nt = nt_da
+    # store_jacobians=True: needed for TLM Gram matrix in Eq 38 (DC-WME)
+    solver_truth.time_loop(
+        solver_parameters=warmup_params,
+        stations=[], plot_every=9999,
+        save_state=True, store_jacobians=True,
+        enable_video=False, monitor_progress=(rank == 0),
+    )
+    t_truth = time.time() - t_truth_start
+
+    # Extract truth trajectory as PETSc vectors
+    from dolfinx import la
+    u_owned_size = solver_truth.V.dofmap.index_map.size_local
+    truth_trajectory = []
+    for state_array in solver_truth.storage.saved_states:
+        vec = la.create_petsc_vector(
+            solver_truth.V.dofmap.index_map,
+            solver_truth.V.dofmap.index_map_bs,
+        )
+        vec.setArray(state_array[:u_owned_size])
+        vec.assemble()
+        truth_trajectory.append(vec)
+
+    # Deep-copy Jacobians before truth solver is deleted (needed for Eq 38 TLM).
+    # Must duplicate each PETSc Mat — a shallow list copy would leave dangling references
+    # after solver_truth is destroyed.
+    truth_jacobians = None
+    if len(solver_truth.storage.saved_jacobians) > 0:
+        truth_jacobians = [J.duplicate() for J in solver_truth.storage.saved_jacobians]
+        if rank == 0:
+            print(f"  Jacobians deep-copied: {len(truth_jacobians)} matrices")
+
+    m_true = truth_trajectory[0].copy()
+
+    if rank == 0:
+        print(f"  Truth: {len(truth_trajectory)} states in {t_truth:.1f}s")
+
+    # Extract truth IC at DA start for background perturbation
+    truth_ic_array = m_true.getArray().copy()
+
+    # ================================================================
+    # Step 4: Clean up truth, create DA problem with perturbed wind
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 4: Creating DA problem with perturbed wind ---")
+
+    del solver_truth, prob_truth, forcing_truth
+    import gc; gc.collect()
+
+    forcing_da = GriddedForcing(wind_perturbed_file, lat0=35)
+    prob_da = ADCIRCProblem(
+        adios_file=args.adios_file,
+        spherical=True, solution_var="h", friction_law="mannings",
+        wd=True, wd_alpha=1.5, dt=dt, bathy_adjustment=0,
+        nt=nt_da, dramp=2.0, forcing=forcing_da,
+    )
+    solver_da = get_solver("DG")(prob_da, theta=1.0, p_degree=[1, 1])
+
+    da_solver_params = get_default_solver_params(
+        rtol=1e-5, atol=1e-6, max_it=50,
+        relaxation_parameter=1.0,
+        comm=comm, error_if_not_converged=False,
+        reduction_it=10,
+    )
+
+    # ================================================================
+    # Step 5: Set up TwinExperiment with injected truth
+    # ================================================================
+    if rank == 0:
+        print(f"\n--- Step 5: Setting up observations and background ---")
+
+    config_kwargs = dict(
+        method=method if method != "dcwme" else "4dvar",  # Prevent dense B_lwme
+        obs_fraction=obs_fraction,
+        obs_frequency=obs_frequency,
+        obs_noise_level=obs_noise_level,
+        background_error_std=background_error_std,
+        background_correlation_length=500.0,
+        max_iterations=max_iterations,
+        max_funcs=30,
+        gradient_tolerance=1e-3,
+        cost_tolerance=1e-4,
+        n_windows=1,
+        perturb_friction=False,  # Model error is from wind, not friction
+        friction_scale_factor=1.0,
+        use_bounds=True,
+        h_min=0.01,
+        interior_only=True,
+        component_aware_cov=True,
+        verbose=(rank == 0),
+    )
+    config = TwinExperimentConfig(**config_kwargs)
+
+    exp = TwinExperiment(
+        problem=prob_da, solver=solver_da, config=config,
+        solver_params=da_solver_params, comm=comm,
+    )
+
+    # Inject truth (skip _generate_truth which would run with DA wind)
+    exp.truth_trajectory = truth_trajectory
+    exp.m_true = m_true
+    exp.t_da_start = t_da_start
+
+    # Set up observations, background, covariances using the injected truth
+    obs_points, obs_operator, obs_times = exp._setup_observations()
+    exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, obs_times)
+    background_error = exp._setup_background()
+    B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
+
+    n_obs = obs_operator.get_num_observations()
+    N_obs_times = len(obs_times)
+
+    # ================================================================
+    # Eq 38: Derive σ_b² from TLM Gram matrix — DC-WME only
+    # Runs throwaway forward solve over full DA span, computes
+    # G[i,j] = a_i^T a_j where a_i = J_wme^T e_i, then:
+    # σ_b² ≥ γ / λ_min(G)
+    # ================================================================
+    eq38_result = None
+    eq38_scale = 1.0
+    if skip_eq38:
+        if rank == 0:
+            print(f"\n--- Step 5a: SKIPPED (--skip-eq38 flag set, using B as-is) ---")
+            print(f"  min(B) = {B.min_eigenvalue():.6e}")
+    elif (method == "dcwme" or apply_eq38_background_scaling) and truth_jacobians is not None:
+        if rank == 0:
+            print(f"\n--- Step 5a: Computing σ_b² from Eq 38 via TLM ---")
+            print(f"  Using truth trajectory ({len(truth_trajectory)} states, "
+                  f"{len(truth_jacobians)} Jacobians) — no extra forward solve")
+
+        # Use truth trajectory + Jacobians directly for TLM Gram matrix.
+        # The truth solver ran with truth wind (stable, converges easily).
+        # Need a ForwardModelWrapper for WME QoI constructor (won't solve).
+        from experiments.twin_experiment import ForwardModelWrapper
+        prob_da.nt = nt_da
+        gram_fwd = ForwardModelWrapper(
+            solver=solver_da, problem=prob_da,
+            solver_params=da_solver_params, t_start=t_da_start,
+        )
+
+        eq38_result = _compute_eq38_from_tlm(
+            forward_model=gram_fwd,
+            obs_operator=obs_operator, obs_cov=R,
+            m_linearize=m_true,
+            observations=exp.observations, obs_times=obs_times,
+            truth_trajectory=truth_trajectory, truth_jacobians=truth_jacobians,
+            predictability_gamma=predictability_gamma,
+            comm=comm, rank=rank,
+        )
+        eq38_scale = _apply_eq38_to_B(B, eq38_result, rank=rank)
+    elif method == "dcwme" or apply_eq38_background_scaling:
+        if rank == 0:
+            print(f"\n  WARNING: No truth Jacobians available for Eq 38 TLM computation")
+
+    if rank == 0:
+        print(f"  Final min(B) = {B.min_eigenvalue():.6e}")
+        print(f"  Observations: {n_obs} points, times={obs_times}")
+        print(f"  Background error: {background_error:.6f}")
+
+    # ================================================================
+    # Step 5b: Compute L_wme if DC-WME
+    # ================================================================
+    static_L_wme = None
+    static_diagnostics = None
+    if method == "dcwme":
+        if l_wme_mode == "static":
+            # If TLM-based Eq 38 already inflated B (step 5a), skip the
+            # internal H·H^T inflation to avoid double-inflation.
+            already_inflated = eq38_result is not None
+            if rank == 0:
+                print(f"\n--- Step 5b: Computing STATIC L_wme "
+                      f"(skip_eq38_inflation={already_inflated}) ---")
+            static_L_wme, static_diagnostics = _compute_static_L_wme(
+                obs_operator, B, len(obs_times), obs_noise_level ** 2,
+                m_true, predictability_gamma=predictability_gamma,
+                adaptive_gamma=True,
+                comm=comm, rank=rank,
+                skip_eq38_inflation=already_inflated,
+            )
+        elif l_wme_mode == "dynamic":
+            if rank == 0:
+                print("\n--- Step 5b: Dynamic L_wme will be computed during cost init ---")
+        # dynamic: L_wme computed inside DCWMEFourDVarCost via adjoint solves
+
+    # Memory cleanup
+    exp.solver.storage.clear()
+    gc.collect()
+
+    # ================================================================
+    # Steps 6-9: DA optimization (single window or cycling)
+    # ================================================================
+    window_nt = nt_da // n_windows if n_windows > 1 else nt_da
+    if n_windows > 1 and nt_da % n_windows != 0:
+        raise ValueError(f"nt_da ({nt_da}) must be divisible by n_windows ({n_windows})")
+
+    # Pre-build gradient smoother (reused across windows)
+    gradient_smoothing_length = 500.0
+    h_indices = u_indices = v_indices = smoothing_matrix = None
+    if config.background_correlation_length > 0:
+        h_indices, u_indices, v_indices = exp._get_component_dof_indices(owned_only=True)
+        smoothing_matrix = exp._build_smoothing_matrix(h_indices, gradient_smoothing_length)
+
+    boundary_dofs = exp._get_boundary_dofs() if config.interior_only else None
+
+    exp.optimization_iteration_callback = _make_state_rmse_iteration_callback(
+        exp.m_true, exp.m_background
+    )
+
+    all_cost_history = []
+    all_gradient_history = []
+    all_analysis_state_rmse_history = []
+    all_distance_from_background_history = []
+    total_opt_time = 0.0
+    total_iterations = 0
+    last_converged = False
+    window_results = []
+
+    if rank == 0 and n_windows > 1:
+        print(f"\n{'='*60}")
+        print(f"  CYCLING: {n_windows} windows × {window_nt} steps ({window_nt*dt/3600:.1f}h each)")
+        print(f"{'='*60}")
+
+    for w in range(n_windows):
+        t_start_window = t_da_start + w * window_nt * dt
+
+        if rank == 0:
+            if n_windows > 1:
+                print(f"\n--- Window {w+1}/{n_windows}: t={t_start_window/3600:.1f}h-{(t_start_window + window_nt*dt)/3600:.1f}h ---")
+            else:
+                print(f"\n--- Step 6: Creating forward model (t_start={t_start_window:.0f}s) ---")
+
+        # a) Temporarily set problem to window length
+        prob_da.nt = window_nt
+
+        # b) Subset observations for this window
+        window_obs_indices = []
+        window_local_times = []
+        for i, gt in enumerate(obs_times):
+            if n_windows == 1:
+                window_obs_indices.append(i)
+                window_local_times.append(gt)
+            else:
+                global_step = gt  # obs_times are relative to DA start (0-based)
+                win_start = w * window_nt
+                win_end = (w + 1) * window_nt
+                if win_start <= global_step <= win_end:
+                    window_obs_indices.append(i)
+                    window_local_times.append(global_step - win_start)
+
+        window_observations = [exp.observations[i] for i in window_obs_indices]
+
+        if rank == 0 and n_windows > 1:
+            print(f"  Window obs: {len(window_local_times)} at local times {window_local_times}")
+
+        if len(window_observations) == 0:
+            if rank == 0:
+                print(f"  WARNING: No observations in window {w+1}, skipping")
+            continue
+
+        # c) Create forward model for this window
+        forward_model = ForwardModelWrapper(
+            solver=solver_da,
+            problem=prob_da,
+            solver_params=da_solver_params,
+            t_start=t_start_window,
+        )
+
+        # d) Setup cost function
+        if method == "dcwme" and l_wme_mode == "static":
+            from swe4dvar.data_assimilation.cost_functions import DCWMEFourDVarCost
+            # Recompute static L_wme for this window's obs times.
+            # B was already inflated by TLM-based Eq 38 (step 5a) if available.
+            already_inflated = eq38_result is not None
+            win_static_L_wme, _ = _compute_static_L_wme(
+                obs_operator, B, len(window_local_times), obs_noise_level ** 2,
+                exp.m_background, predictability_gamma=predictability_gamma,
+                adaptive_gamma=True,
+                comm=comm, rank=rank,
+                skip_eq38_inflation=already_inflated,
+            )
+            cost_function = DCWMEFourDVarCost(
+                forward_model=forward_model,
+                observation_operator=obs_operator,
+                background_cov=B, observation_cov=R,
+                m_background=exp.m_background,
+                observations=window_observations, obs_times=window_local_times,
+                predicted_cov_wme=win_static_L_wme,
+                n_l_wme_samples=0,
+                auto_inflate_B=False,
+    
+                predictability_gamma=predictability_gamma,
+                adaptive_gamma=True, comm=comm,
+            )
+        elif method == "dcwme" and l_wme_mode == "dynamic":
+            from swe4dvar.data_assimilation.cost_functions import DCWMEFourDVarCost
+            cost_function = DCWMEFourDVarCost(
+                forward_model=forward_model,
+                observation_operator=obs_operator,
+                background_cov=B, observation_cov=R,
+                m_background=exp.m_background,
+                observations=window_observations, obs_times=window_local_times,
+                predicted_cov_wme=None,
+                n_l_wme_samples=100,
+                auto_inflate_B=True,
+    
+                predictability_gamma=predictability_gamma,
+                adaptive_gamma=True, comm=comm,
+            )
+        else:
+            orig_obs = exp.observations
+            exp.observations = window_observations
+            exp.config.method = "4dvar"
+            cost_function = exp._setup_cost_function(
+                forward_model, obs_operator, B, R, window_local_times, B_lwme=B_lwme
+            )
+            exp.observations = orig_obs
+
+        # Wrap with boundary gradient zeroing
+        if boundary_dofs is not None:
+            from experiments.twin_experiment import ZeroBoundaryGradientCost
+            cost_function = ZeroBoundaryGradientCost(cost_function, boundary_dofs)
+
+        # Attach gradient smoother
+        if smoothing_matrix is not None:
+            def gradient_smoother(grad_array, _h=h_indices, _u=u_indices, _v=v_indices, _sm=smoothing_matrix):
+                smoothed = grad_array.copy()
+                smoothed[_h] = _sm @ grad_array[_h]
+                smoothed[_u] = _sm @ grad_array[_u]
+                smoothed[_v] = _sm @ grad_array[_v]
+                return smoothed
+
+            inner_cost = cost_function
+            while hasattr(inner_cost, 'base_cost'):
+                inner_cost = inner_cost.base_cost
+            inner_cost.gradient_smoother = gradient_smoother
+
+        # e) Run optimization
+        if rank == 0:
+            print(f"  Running L-BFGS optimization...")
+
+        optimizer, opt_time_w = exp._run_optimization(cost_function)
+
+        w_costs = [h["cost"] for h in optimizer.convergence_history]
+        w_grads = [h["grad_norm"] for h in optimizer.convergence_history]
+        w_analysis_state_rmse = [
+            float(h["analysis_state_rmse"])
+            for h in optimizer.convergence_history
+            if "analysis_state_rmse" in h
+        ]
+        w_background_distance = [
+            float(h["distance_from_background_rmse"])
+            for h in optimizer.convergence_history
+            if "distance_from_background_rmse" in h
+        ]
+        all_cost_history.extend(w_costs)
+        all_gradient_history.extend(w_grads)
+        all_analysis_state_rmse_history.extend(w_analysis_state_rmse)
+        all_distance_from_background_history.extend(w_background_distance)
+        total_opt_time += opt_time_w
+        total_iterations += optimizer.iteration
+        last_converged = optimizer.converged
+
+        # Evaluate this window (use window-local obs times, not global)
+        w_err_red = 0.0
+        if w_costs and w_costs[-1] < 1e19:
+            w_analysis_error, w_err_red, _, _, _, _ = exp._evaluate_results(
+                obs_operator, window_local_times, background_error
+            )
+        else:
+            w_analysis_error = background_error
+
+        window_results.append({
+            "window": w, "error_reduction": float(w_err_red),
+            "analysis_error": float(w_analysis_error),
+            "iterations": int(optimizer.iteration),
+        })
+
+        if rank == 0:
+            print(f"  Window {w+1}: err_red={w_err_red:.1f}%, iters={optimizer.iteration}")
+
+        # f) Propagate analysis to next window's background
+        if w < n_windows - 1 and hasattr(exp, 'm_analysis') and exp.m_analysis is not None:
+            if rank == 0:
+                print(f"  Propagating analysis to next window...")
+            next_bg = exp._propagate_forward(exp.m_analysis, window_nt, t_start_window)
+            exp.m_background = next_bg
+
+        # Cleanup this window (keep last cost function for diagnostics)
+        last_cost_function = cost_function
+        exp.solver.storage.clear()
+        gc.collect()
+
+    # Restore nt
+    prob_da.nt = nt_da
+
+    # Final evaluation against truth
+    cost_history = all_cost_history
+    gradient_history = all_gradient_history
+    opt_time = total_opt_time
+
+    if cost_history and cost_history[-1] >= 1e19:
+        analysis_error = background_error
+        error_reduction = 0.0
+        innov_mean = innov_std = mean_rmse = data_misfit = 0.0
+    else:
+        analysis_error, error_reduction, innov_mean, innov_std, mean_rmse, data_misfit = (
+            exp._evaluate_results(obs_operator, obs_times, background_error)
+        )
+
+    total_time = t_warmup + t_truth + opt_time
+
+    if rank == 0:
+        print(f"\n  Background error: {background_error:.6f}")
+        print(f"  Analysis error:   {analysis_error:.6f}")
+        print(f"  Error reduction:  {error_reduction:.1f}%")
+        if n_windows > 1:
+            print(f"  Windows: {n_windows}, Total iterations: {total_iterations}")
+
+    # ================================================================
+    # Step 10: Extract DC-WME diagnostics
+    # ================================================================
+    dcwme_diagnostics = {}
+    cost_function = locals().get('last_cost_function', None)
+    if method == "dcwme" and cost_function is not None:
+        inner = cost_function
+        while hasattr(inner, 'base_cost'):
+            inner = inner.base_cost
+
+        if hasattr(inner, '_b_inflation_factor'):
+            dcwme_diagnostics['b_inflation_factor'] = float(inner._b_inflation_factor)
+        if hasattr(inner, '_gram_eigenvalues') and inner._gram_eigenvalues is not None:
+            dcwme_diagnostics['gram_eigenvalues'] = [float(v) for v in inner._gram_eigenvalues]
+        if hasattr(inner, '_L_wme') and inner._L_wme is not None:
+            try:
+                L_wme_mat = inner._L_wme
+                if hasattr(L_wme_mat, 'mat'):
+                    n = L_wme_mat.mat.getSize()[0]
+                    L_dense_np = np.zeros((n, n))
+                    rstart, rend = L_wme_mat.mat.getOwnershipRange()
+                    for i in range(rstart, rend):
+                        cols, vals = L_wme_mat.mat.getRow(i)
+                        for c, v in zip(cols, vals):
+                            L_dense_np[i, c] = v
+                    l_eigvals = np.linalg.eigvalsh(L_dense_np)
+                    dcwme_diagnostics['l_wme_eigenvalues'] = [float(v) for v in l_eigvals]
+                    dcwme_diagnostics['l_wme_spread_pct'] = float(
+                        100.0 * (l_eigvals.max() - l_eigvals.min()) / max(l_eigvals.mean(), 1e-30)
+                    )
+                    dcwme_diagnostics['l_wme_ratio'] = float(
+                        l_eigvals.max() / max(l_eigvals.min(), 1e-30)
+                    )
+                    dcwme_diagnostics['l_wme_spectrum'] = _summarize_eigenvalues(l_eigvals)
+                    if np.all(l_eigvals > 1.0):
+                        weights = 1.0 - 1.0 / l_eigvals
+                        dcwme_diagnostics['effective_weight_min'] = float(weights.min())
+                        dcwme_diagnostics['effective_weight_max'] = float(weights.max())
+            except Exception as e:
+                if rank == 0:
+                    print(f"  Warning: Could not extract L_wme eigenvalues: {e}")
+
+        if static_diagnostics is not None:
+            dcwme_diagnostics['static_lwme'] = static_diagnostics
+
+    # ================================================================
+    # Step 11: Save results
+    # ================================================================
+    results = None
+    if rank == 0:
+        results = {
+            "phase": f"{phase_prefix}{sub_label}",
+            "status": "success",
+            "method": method,
+            "method_variant": method_variant_key or method,
+            "model_error": True,
+            "model_error_type": "wind",
+            "l_wme_type": l_wme_mode if method == "dcwme" else "N/A",
+            "wind_truth_file": str(wind_truth_file),
+            "wind_perturbed_file": str(wind_perturbed_file),
+            "experiment_controls": {
+                "apply_eq38_background_scaling": bool(apply_eq38_background_scaling),
+                "eq38_scaling_basis": "WME-TLM" if (eq38_result is not None) else "none",
+                "method_variant_key": method_variant_key,
+            },
+            "config": {
+                "dt": dt, "nt_ramp": nt_ramp, "nt_da": nt_da,
+                "n_windows": n_windows, "window_nt": window_nt,
+                "t_da_start_s": t_da_start,
+                "obs_fraction": obs_fraction, "obs_frequency": obs_frequency,
+                "obs_noise_level": obs_noise_level,
+                "background_error_std": background_error_std,
+                "eq38_sigma_b_sq": eq38_result["sigma_b_sq"] if eq38_result else None,
+                "eq38_scale_factor": eq38_scale,
+                "eq38_lambda_min_G": eq38_result["lambda_min_G"] if eq38_result else None,
+                "max_iterations": max_iterations,
+                "n_obs_points": n_obs, "obs_times": obs_times,
+                "predictability_gamma": predictability_gamma,
+
+            },
+            "window_results": window_results,
+            "results": {
+                "background_error": float(background_error),
+                "analysis_error": float(analysis_error),
+                "error_reduction": float(error_reduction),
+                "mean_rmse": float(mean_rmse),
+                "data_misfit": float(data_misfit),
+                "innovation_mean": float(innov_mean),
+                "innovation_std": float(innov_std),
+                "num_iterations": int(optimizer.iteration),
+                "converged": bool(optimizer.converged),
+            },
+            "convergence": {
+                "cost_history": [float(c) for c in cost_history],
+                "gradient_norm_history": [float(g) for g in gradient_history],
+                "analysis_state_rmse_history": all_analysis_state_rmse_history,
+                "distance_from_background_rmse_history": all_distance_from_background_history,
+            },
+            "dcwme_diagnostics": dcwme_diagnostics,
+            "eq38_diagnostics": eq38_result.copy() if eq38_result is not None else {},
+            "timing": {
+                "warmup_s": float(t_warmup),
+                "truth_generation_s": float(t_truth),
+                "optimization_s": float(opt_time),
+                "total_s": float(total_time),
+            },
+        }
+
+        results_file = output_dir / "data" / f"phase{phase_prefix}{sub_label}_results.json"
+        with open(results_file, "w") as f:
+            json.dump(results, f, indent=2)
+
+        print(f"\n{'=' * 70}")
+        print(f"  Error reduction: {error_reduction:.1f}%")
+        print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
+        print(f"  Results: {results_file}")
+        print(f"{'=' * 70}")
+
+    del optimizer, cost_function, forward_model, exp, solver_da, prob_da
+    del B, R, B_lwme, obs_operator
+    _cleanup_petsc_objects()
+
+    return results
+
+
+def _wind_sweep_worker_main(config_json):
+    """Entry point for Phase 7 subprocess worker."""
+    import os
+    os.environ.setdefault("CC", "/usr/bin/clang")
+
+    config = json.loads(config_json)
+
+    args = argparse.Namespace(
+        phase="7",
+        output_dir=config["output_dir"],
+        adios_file=config["adios_file"],
+        mem_limit_gb=config.get("mem_limit_gb", 12.0),
+        verbose=True,
+    )
+
+    try:
+        result = _run_sub_experiment_wind(
+            args,
+            sub_label=config["sub_label"],
+            method=config["method"],
+            wind_truth_file=config["wind_truth_file"],
+            wind_perturbed_file=config["wind_perturbed_file"],
+            output_dir=Path(config["output_dir"]),
+            nt_da=config["nt_da"],
+            nt_ramp=config["nt_ramp"],
+            phase_prefix=config["phase_prefix"],
+            sweep_params=config.get("sweep_params"),
+            l_wme_mode=config.get("l_wme_mode", "dynamic"),
+            n_windows=config.get("n_windows", 1),
+            apply_eq38_background_scaling=config.get("apply_eq38_background_scaling", False),
+            method_variant_key=config.get("variant_key"),
+            skip_eq38=config.get("skip_eq38", False),
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        result_file = Path(config["result_file"])
+        result = {
+            "phase": config["phase_prefix"] + config["sub_label"],
+            "status": "failed",
+            "error": str(e),
+            "method": config["method"],
+            "method_variant": config.get("variant_key"),
+        }
+        with open(result_file, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        sys.exit(1)
+
+    sys.exit(0)
+
+
+def run_phase_7(args):
+    """Phase 7: restored WSE wind-ramp twin experiment.
+
+    This phase is intentionally a pure state-estimation problem:
+    the unknown is the initial hydrodynamic state at the start of the DA
+    window, while the wind forcing is prescribed from the truth or perturbed
+    HDF5 file and is never estimated. The original three-method sweep is
+    preserved: 4D-Var, DC-WME with dynamic L_wme, and DC-WME with static
+    L_wme.
+    """
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+
+    output_dir = Path(args.output_dir)
+    data_dir = output_dir / "data"
+    wind_dir = output_dir / "wind_fields"
+    if rank == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(exist_ok=True)
+        wind_dir.mkdir(exist_ok=True)
+    comm.Barrier()
+
+    mem_limit_mb = float(getattr(args, 'mem_limit_gb', 12.0)) * 1024
+    script_path = str(Path(__file__).resolve())
+
+    dt = 600.0
+    nt_ramp = WIND_SWEEP_BASELINE["nt_ramp"]
+    nt_da = WIND_SWEEP_BASELINE["nt_da"]
+
+    # ================================================================
+    # Step 1: Generate wind HDF5 files
+    # ================================================================
+    if rank == 0:
+        print("=" * 70)
+        print("PHASE 7: WIND-DRIVEN TWIN EXPERIMENT")
+        print("=" * 70)
+        print("\n--- Generating wind fields ---")
+
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        from wind_models import (
+            WindGridConfig, HollandHurricaneConfig,
+            generate_holland_wind_field, generate_zero_wind_field,
+            write_wind_hdf5, generate_perturbed_config, DEFAULT_TRACK,
+        )
+
+        grid = WindGridConfig()
+        times = np.arange(0, (nt_ramp + nt_da + 1) * dt, dt)
+        track_shift_km = 15.0
+
+        for Vmax in [0, 10, 20, 30, 40]:
+            truth_file = wind_dir / f"holland_V{Vmax}_truth.h5"
+            pert_file = wind_dir / f"holland_V{Vmax}_pert{track_shift_km:.0f}km.h5"
+
+            if not truth_file.exists():
+                if Vmax == 0:
+                    wx, wy, p = generate_zero_wind_field(grid, times)
+                else:
+                    config_h = HollandHurricaneConfig(
+                        track_waypoints=DEFAULT_TRACK, Vmax=float(Vmax),
+                    )
+                    wx, wy, p = generate_holland_wind_field(
+                        config_h, grid, times, wind_ramp_s=43200.0,
+                    )
+                write_wind_hdf5(str(truth_file), grid, times, wx, wy, p)
+
+            if not pert_file.exists():
+                if Vmax == 0:
+                    # No perturbation for zero wind (tidal-only control)
+                    import shutil
+                    shutil.copy(truth_file, pert_file)
+                    print(f"  Copied zero-wind: {pert_file.name}")
+                else:
+                    config_h = HollandHurricaneConfig(
+                        track_waypoints=DEFAULT_TRACK, Vmax=float(Vmax),
+                    )
+                    config_pert = generate_perturbed_config(
+                        config_h, "track_shift", track_shift_km,
+                    )
+                    wx_p, wy_p, p_p = generate_holland_wind_field(
+                        config_pert, grid, times, wind_ramp_s=43200.0,
+                    )
+                    write_wind_hdf5(str(pert_file), grid, times, wx_p, wy_p, p_p)
+
+    comm.Barrier()
+
+    # ================================================================
+    # Step 2: Run sweep
+    # ================================================================
+    track_shift_km = 15.0
+    Vmax_values = [0, 10, 20, 30, 40]
+    methods = [
+        ("4dvar", "a", "N/A", False, "4dvar"),
+        ("dcwme", "b", "dynamic", False, "dynamic"),
+        ("dcwme", "c", "static", False, "static"),
+    ]
+
+    all_results = []
+
+    for Vmax in Vmax_values:
+        truth_file = str(wind_dir / f"holland_V{Vmax}_truth.h5")
+        pert_file = str(wind_dir / f"holland_V{Vmax}_pert{track_shift_km:.0f}km.h5")
+
+        if rank == 0:
+            print(f"\n{'#' * 70}")
+            print(f"# Vmax = {Vmax} m/s")
+            print(f"# Memory limit: {mem_limit_mb:.0f} MB per child")
+            print(f"{'#' * 70}")
+
+        point_results = {"Vmax": Vmax}
+
+        for method, sub_label, l_wme_mode, apply_eq38_background_scaling, variant_key in methods:
+            phase_prefix = f"7_wind{Vmax}_"
+            result_file = data_dir / f"phase{phase_prefix}{sub_label}_results.json"
+
+            # Skip/resume
+            if result_file.exists():
+                if rank == 0:
+                    print(f"\n  Skipping {result_file.name} (already exists)")
+                with open(result_file) as f:
+                    result = json.load(f)
+                point_results[variant_key] = result
+                continue
+
+            if rank == 0:
+                method_label = method.upper()
+                if method == "dcwme":
+                    method_label += f" ({l_wme_mode})"
+                elif apply_eq38_background_scaling:
+                    method_label += " + Eq38(B)"
+                print(f"\n  Running: Vmax={Vmax}, {method_label} "
+                      f"[subprocess, limit={mem_limit_mb:.0f} MB]")
+
+            run_config = {
+                "output_dir": str(output_dir),
+                "adios_file": args.adios_file,
+                "sub_label": sub_label,
+                "method": method,
+                "wind_truth_file": truth_file,
+                "wind_perturbed_file": pert_file,
+                "nt_da": nt_da,
+                "nt_ramp": nt_ramp,
+                "phase_prefix": phase_prefix,
+                "sweep_params": dict(WIND_SWEEP_BASELINE),
+                "l_wme_mode": l_wme_mode,
+                "apply_eq38_background_scaling": apply_eq38_background_scaling,
+                "variant_key": variant_key,
+                "result_file": str(result_file),
+                "mem_limit_gb": getattr(args, 'mem_limit_gb', 12.0),
+                "worker_type": "wind",  # Tells dispatcher to use wind worker
+            }
+
+            result = _run_in_subprocess(run_config, mem_limit_mb, script_path)
+            point_results[variant_key] = result
+
+            status = result.get("status", "unknown")
+            if status == "failed":
+                if rank == 0:
+                    print(f"  FAILED: {result.get('error', '?')[:200]}")
+            else:
+                err_red = result.get("results", {}).get("error_reduction", "?")
+                if rank == 0:
+                    print(f"  Done: error_reduction={err_red}")
+
+        all_results.append(point_results)
+
+    # ================================================================
+    # Step 3: Summary
+    # ================================================================
+    if rank == 0:
+        summary_file = data_dir / "phase7_summary.json"
+        with open(summary_file, "w") as f:
+            json.dump(all_results, f, indent=2, default=str)
+
+        print(f"\n{'=' * 70}")
+        print("PHASE 7 SUMMARY: Restored WSE Wind-Ramp Experiment")
+        print(f"{'=' * 70}")
+        print(f"{'Vmax':>6} {'4DVar':>8} {'DC-dyn':>8} {'DC-stat':>8} {'L_spread':>10}")
+        print("-" * 52)
+        for point in all_results:
+            Vmax = point["Vmax"]
+            fdvar = point.get("4dvar", {})
+            dcdyn = point.get("dynamic", {})
+            dcstat = point.get("static", {})
+
+            def _err(r):
+                if r.get("status") == "failed":
+                    return "FAIL"
+                return f"{r.get('results', {}).get('error_reduction', '?'):.1f}"
+
+            spread = dcdyn.get("dcwme_diagnostics", {}).get("l_wme_spread_pct", "?")
+            spread_str = f"{spread:.1f}%" if isinstance(spread, (int, float)) else str(spread)
+
+            print(
+                f"{Vmax:>6} {_err(fdvar):>8} "
+                f"{_err(dcdyn):>8} {_err(dcstat):>8} {spread_str:>10}"
+            )
+        print(f"{'=' * 70}")
+
+    return all_results
 
 
 def main():
@@ -3343,6 +4773,8 @@ def main():
         run_phase_5(args)
     elif args.phase == "6":
         run_phase_6(args)
+    elif args.phase == "7":
+        run_phase_7(args)
     else:
         print(f"Phase {args.phase} not yet implemented.")
         return 1
@@ -3353,6 +4785,11 @@ def main():
 if __name__ == "__main__":
     # Hidden entry point for subprocess sweep workers
     if len(sys.argv) >= 3 and sys.argv[1] == "--_sweep-worker":
-        _sweep_worker_main(sys.argv[2])
+        config_json = sys.argv[2]
+        config = json.loads(config_json)
+        if config.get("worker_type") == "wind":
+            _wind_sweep_worker_main(config_json)
+        else:
+            _sweep_worker_main(config_json)
     else:
         sys.exit(main())
