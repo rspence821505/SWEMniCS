@@ -28,6 +28,7 @@ from petsc4py import PETSc
 from mpi4py import MPI
 import numpy as np
 import hashlib
+import time
 
 
 @dataclass
@@ -100,6 +101,16 @@ class CostFunction(ABC):
         self._jacobians: Optional[List[PETSc.Mat]] = None
         self._current_control: Optional[PETSc.Vec] = None
         self._control_hash: Optional[str] = None  # Hash for efficient cache checking
+        self.runtime_profiler = None
+
+    def _profile_event(self, event: str, **payload) -> None:
+        profiler = getattr(self, "runtime_profiler", None)
+        if profiler is None:
+            return
+        try:
+            profiler.log_event(event, **payload)
+        except Exception:
+            pass
 
     @abstractmethod
     def value(self, m: PETSc.Vec) -> float:
@@ -206,14 +217,31 @@ class CostFunction(ABC):
         """
         # Compute hash for cache lookup
         m_hash = self._get_control_hash(m)
+        self._profile_event(
+            "cost.run_forward_model.enter",
+            control_hash=m_hash,
+            store_jacobians=bool(store_jacobians),
+        )
 
         # Check if we can reuse cached trajectory
         if self._control_hash == m_hash and self._trajectory is not None:
             # If jacobians are requested but not cached, re-run
             if store_jacobians and self._jacobians is None:
+                refresh_start = time.perf_counter()
                 self._trajectory, self._jacobians = self.forward_model.solve(
                     m, store_jacobians=True
                 )
+                self._profile_event(
+                    "cost.run_forward_model.cache_refresh",
+                    duration_s=float(time.perf_counter() - refresh_start),
+                    trajectory_len=(len(self._trajectory) if self._trajectory is not None else 0),
+                    jacobian_len=(len(self._jacobians) if self._jacobians is not None else 0),
+                )
+            self._profile_event(
+                "cost.run_forward_model.cache_hit",
+                trajectory_len=(len(self._trajectory) if self._trajectory is not None else 0),
+                jacobian_len=(len(self._jacobians) if self._jacobians is not None else 0),
+            )
             return self._trajectory, self._jacobians
 
         # Clear solver storage and old trajectory/Jacobians to free memory.
@@ -244,12 +272,20 @@ class CostFunction(ABC):
         actual_solver._raise_on_newton_failure = True
 
         # Run forward model
+        solve_start = time.perf_counter()
         try:
             self._trajectory, self._jacobians = self.forward_model.solve(
                 m, store_jacobians=store_jacobians
             )
         finally:
             actual_solver._raise_on_newton_failure = False
+        self._profile_event(
+            "cost.run_forward_model.solve_end",
+            duration_s=float(time.perf_counter() - solve_start),
+            trajectory_len=(len(self._trajectory) if self._trajectory is not None else 0),
+            jacobian_len=(len(self._jacobians) if self._jacobians is not None else 0),
+            store_jacobians=bool(store_jacobians),
+        )
         self._current_control = m.copy()
         self._control_hash = m_hash
 
@@ -649,7 +685,13 @@ class FourDVarCost(CostFunction):
             Initial adjoint λ₀.
         """
         # Compute observation forcings at each time
+        forcing_start = time.perf_counter()
         obs_forcings = self._compute_observation_forcings(trajectory)
+        self._profile_event(
+            "cost.solve_adjoint.forcings_ready",
+            duration_s=float(time.perf_counter() - forcing_start),
+            num_forcings=len(obs_forcings),
+        )
 
         # Solve adjoint using implicit adjoint solver
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
@@ -699,7 +741,12 @@ class FourDVarCost(CostFunction):
         terminal = trajectory[-1].duplicate()
         terminal.zeroEntries()
 
+        solve_start = time.perf_counter()
         lambda_0 = adjoint_solver.solve(terminal, obs_forcings)
+        self._profile_event(
+            "cost.solve_adjoint.solve_end",
+            duration_s=float(time.perf_counter() - solve_start),
+        )
 
         return lambda_0
 
@@ -1200,7 +1247,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         predicted_cov_wme=None,
         n_l_wme_samples: int = 100,
         auto_inflate_B: bool = True,
-        max_inflate_factor: float = 2.0,
+        max_inflate_factor: float = None,  # Deprecated: Eq 38 inflation is uncapped
         predictability_gamma: float = 0.1,
         adaptive_gamma: bool = True,
         B_lwme=None,
@@ -1241,9 +1288,9 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             Gram matrix G = J_wme J_wme^T (paper eq. 38) and inflate B if
             needed to satisfy the predictability condition. Default True.
         max_inflate_factor : float, optional
-            Maximum allowed B inflation factor. Caps the inflation to prevent
-            weakening B⁻¹ too much, which can cause optimizer instability
-            (negative depths, Newton divergence). Default 2.0.
+            Deprecated for B inflation (Eq 38 inflation is now uncapped).
+            Only used for nonuniform L_wme eigenvalue boosting when
+            nonuniform_inflate=True. Default None.
         predictability_gamma : float, optional
             Relaxation parameter γ for the predictability condition (paper eq. 36).
             When adaptive_gamma=True (default), γ is spectrum-relative: the
@@ -1297,7 +1344,7 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         # WME-specific predicted covariance
         self._L_wme = predicted_cov_wme
         self._auto_inflate_B = auto_inflate_B
-        self._max_inflate_factor = max_inflate_factor
+        self._max_inflate_factor = max_inflate_factor  # Only used for nonuniform L_wme regularization
         self._predictability_gamma = predictability_gamma
         self._adaptive_gamma = adaptive_gamma
 
@@ -1486,17 +1533,21 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         return 0.5 * delta_Q.dot(L_inv_delta)
 
     def _compute_gram_and_inflate_B(self, adjoint_vectors: list) -> None:
-        """Compute Gram matrix G = J_wme J_wme^T and inflate B if needed.
+        """Compute Gram matrix G = J_wme J_wme^T and inflate B per Eq 38.
 
-        Following Section 6.2.1 of Spence et al. (2025), the Gram matrix
-        G[i,j] = a_i^T a_j (where a_i = J_wme^T e_i) allows estimating
-        the minimum background variance needed for predictability:
+        Following Spence et al. (2025), Eq 38, the Gram matrix
+        G[i,j] = a_i^T a_j (where a_i = J_wme^T e_i) determines the
+        minimum background variance for the predictability condition:
 
             σ²_b ≥ γ / λ_min(G)
 
-        Since L_wme = B^{1/2} G B^{1/2} (for isotropic B = σ²_b I), inflating
-        B by α scales all L_wme eigenvalues by α, restoring the predictability
-        condition λ_min(L_wme) ≥ γ.
+        Since J_wme absorbs R^{-1/2} and 1/√N, this is equivalent to
+        σ²_b ≥ γ · σ_obs⁴ / (N · λ_min(Q_k Q_k^T)) from the paper.
+
+        B is inflated by exactly the required factor — no cap applied.
+        The inflation applies to B for L_wme computation. If no separate
+        B_lwme exists, inflation applies to self.B (which also affects
+        the background term).
 
         Parameters
         ----------
@@ -1516,52 +1567,42 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         gram_eigvals = np.linalg.eigvalsh(G)
         self._gram_eigenvalues = gram_eigvals
 
-        print(f"  Gram matrix G eigenvalues: [{gram_eigvals.min():.6e}, {gram_eigvals.max():.6e}]")
-        print(f"  Gram matrix rank (>1e-10): {np.sum(gram_eigvals > 1e-10)}/{n_obs}")
+        lambda_min_G = max(gram_eigvals.min(), 1e-30)
+        print(f"  [Eq 38] Gram matrix G ({n_obs}×{n_obs}):")
+        print(f"    λ_min(G) = {gram_eigvals.min():.6e}")
+        print(f"    λ_max(G) = {gram_eigvals.max():.6e}")
+        print(f"    condition = {gram_eigvals.max() / lambda_min_G:.2f}")
+        print(f"    rank (>1e-10) = {np.sum(gram_eigvals > 1e-10)}/{n_obs}")
 
-        # Compute variance bounds for different γ values
-        lambda_min_G = max(gram_eigvals.min(), 1e-30)  # Guard against zero
-        gamma_values = [0.01, 0.1, 1.0]
-        bounds = {}
-        print(f"  Variance bound (σ²_b ≥ γ/λ_min(G)):")
-        for gamma in gamma_values:
-            bound = gamma / lambda_min_G
-            bounds[gamma] = bound
-            print(f"    γ={gamma:.2f}: σ²_b ≥ {bound:.6e}")
-        self._variance_bounds = bounds
+        # Compute required σ²_b for the configured γ
+        gamma_inflate = self._predictability_gamma
+        required_var = gamma_inflate / lambda_min_G
+        print(f"  [Eq 38] γ = {gamma_inflate}, required σ²_b = {required_var:.6e}")
+        self._variance_bounds = {gamma_inflate: required_var}
 
         # Determine which B to use for L_wme computation
         B_for_lwme = self._B_lwme if self._B_lwme is not None else self.B
         if self._B_lwme is not None:
-            print(f"  Using separate B_lwme for L_wme computation")
+            print(f"  [Eq 38] Using separate B_lwme for L_wme computation")
 
         current_min_var = B_for_lwme.min_eigenvalue()
-        print(f"  Current min(B_lwme eigenvalue) = {current_min_var:.6e}")
+        print(f"  [Eq 38] Current min(B) = {current_min_var:.6e}")
 
-        # Auto-inflate B_lwme if needed (using γ matching regularization)
+        # Inflate B to satisfy Eq 38 — no cap, no heuristic override
         if self._auto_inflate_B:
             from .covariance import ScaledCovariance
 
-            gamma_inflate = self._predictability_gamma
-            required_var = gamma_inflate / lambda_min_G
-            alpha_uncapped = required_var / current_min_var if current_min_var > 0 else 1.0
-            alpha_uncapped = max(1.0, alpha_uncapped)  # Never deflate
-            alpha = min(alpha_uncapped, self._max_inflate_factor)  # Cap inflation
-
-            if alpha_uncapped > 1.0:
-                if alpha < alpha_uncapped:
-                    print(f"  Inflation capped: α = {alpha_uncapped:.4f} → {alpha:.4f} (max_inflate_factor={self._max_inflate_factor})")
+            alpha = required_var / current_min_var if current_min_var > 0 else 1.0
+            alpha = max(1.0, alpha)  # Never deflate
 
             if alpha > 1.0:
                 if self._B_lwme is not None:
-                    # Inflate B_lwme only (self.B untouched for background term)
                     if self._B_original is None:
                         self._B_original = self._B_lwme
                     else:
                         self._B_lwme = self._B_original
                     self._B_lwme = ScaledCovariance(self._B_lwme, alpha)
                 else:
-                    # No separate B_lwme: inflate self.B (original behavior)
                     if self._B_original is None:
                         self._B_original = self.B
                     else:
@@ -1571,9 +1612,9 @@ class DCWMEFourDVarCost(DCFourDVarCost):
                 self._b_inflation_factor = alpha
                 B_for_lwme_inflated = self._B_lwme if self._B_lwme is not None else self.B
                 new_min_var = B_for_lwme_inflated.min_eigenvalue()
-                print(f"  B INFLATION: α = {alpha:.4f} (new min variance = {new_min_var:.6e})")
+                print(f"  [Eq 38] B INFLATED: α = {alpha:.4f} → min(B) = {new_min_var:.6e}")
             else:
-                print(f"  No B inflation needed (current variance sufficient)")
+                print(f"  [Eq 38] B already satisfies Eq 38 (no inflation needed)")
 
     def _compute_analytical_L_wme(self) -> 'CovarianceMatrix':
         """Compute L_wme = J_wme B J_wme^T analytically.
@@ -1647,13 +1688,17 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             b_j = B_for_lwme.apply(adjoint_vectors[j])
             B_adjoint_vectors.append(b_j)
 
-        # Step 3: Form L_wme[i,j] = a_i^T b_j (exploit symmetry)
-        L_dense = np.zeros((n_obs, n_obs))
+        # Step 3: Form L_wme[i,j] = a_i^T b_j + I (exploit symmetry)
+        # The +I comes from the observation noise contribution to the WME
+        # predicted covariance: L_wme = J_wme B J_wme^T + I
+        # where I arises from (1/N) sum_k R^{-1/2} Cov(eps_k) R^{-1/2} = I
+        L_dense = np.eye(n_obs)  # Start with identity (+I term)
         for i in range(n_obs):
             for j in range(i, n_obs):
                 val = adjoint_vectors[i].dot(B_adjoint_vectors[j])
-                L_dense[i, j] = val
-                L_dense[j, i] = val
+                L_dense[i, j] += val
+                if i != j:
+                    L_dense[j, i] += val
 
         # Clean up PETSc vectors
         for v in adjoint_vectors:
@@ -1704,14 +1749,13 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         if self._nonuniform_inflate:
             # Non-uniform per-eigenvalue boosting: boost sub-threshold eigenvalues
-            # towards a target above γ, capped by max multiplicative boost per eigenvalue.
-            # Natural eigenvalues (already ≥ γ) are left untouched.
+            # towards target = boost_target × γ_floor. No multiplicative cap — Eq 38
+            # requires uncapped inflation to satisfy predictability condition.
             target = self._eigenvalue_boost_target * gamma_floor
             eigvals_reg = eigvals_full.copy()
             for i in range(len(eigvals_full)):
                 if eigvals_full[i] < gamma_floor:
-                    boosted = min(eigvals_full[i] * self._max_inflate_factor, target)
-                    eigvals_reg[i] = max(boosted, gamma_floor)
+                    eigvals_reg[i] = max(min(target, gamma_floor * self._eigenvalue_boost_target), gamma_floor)
             n_boosted = int(np.sum((eigvals_reg > gamma_floor) & (eigvals_full < gamma_floor)))
             n_still_floored = int(np.sum(eigvals_reg <= gamma_floor))
         else:
@@ -1745,13 +1789,13 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             if n_boosted > 0:
                 boosted_weights = 1.0 - 1.0 / boosted_vals
                 print(f"  Non-uniform boost: {n_boosted} eigenvalues boosted above γ "
-                      f"(target={target:.2f}, max_boost={self._max_inflate_factor:.0f}x), "
+                      f"(target={target:.2f}), "
                       f"{n_still_floored} still floored")
                 print(f"    Boosted λ range: [{boosted_vals.min():.4e}, {boosted_vals.max():.4e}], "
                       f"weight range: [{boosted_weights.min():.4f}, {boosted_weights.max():.4f}]")
             else:
                 print(f"  Non-uniform boost: 0 eigenvalues boosted above γ "
-                      f"(all {n_floored} below γ/{self._max_inflate_factor:.0f}={gamma_floor/self._max_inflate_factor:.4e})")
+                      f"(all {n_floored} below target={target:.4e})")
             n_effective = n_natural + n_boosted
             print(f"  Effective predictable directions: {n_effective}/{n_obs} "
                   f"({n_natural} natural + {n_boosted} boosted)")
@@ -1881,7 +1925,14 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         """
         # Run forward model once for trajectory and Jacobians
         try:
+            stage_start = time.perf_counter()
             trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+            self._profile_event(
+                "dcwme.value_gradient.forward_ready",
+                duration_s=float(time.perf_counter() - stage_start),
+                trajectory_len=len(trajectory),
+                jacobian_len=(len(jacobians) if jacobians is not None else 0),
+            )
             # Share trajectory with QoIMap to avoid redundant forward solve in _compute_wme
             self._share_trajectory_with_qoi(m, trajectory, jacobians)
         except Exception as e:
@@ -1903,11 +1954,21 @@ class DCWMEFourDVarCost(DCFourDVarCost):
         background_term = 0.5 * delta_m.dot(B_inv_delta)
 
         # WME data misfit: ½||Q_wme(m)||²
+        stage_start = time.perf_counter()
         Q_wme_m = self._compute_wme(m)
+        self._profile_event(
+            "dcwme.value_gradient.q_wme_ready",
+            duration_s=float(time.perf_counter() - stage_start),
+        )
         data_misfit = 0.5 * Q_wme_m.dot(Q_wme_m)
 
         # Predictability term
+        stage_start = time.perf_counter()
         predictability = self._compute_wme_predictability(m, Q_wme_m)
+        self._profile_event(
+            "dcwme.value_gradient.predictability_ready",
+            duration_s=float(time.perf_counter() - stage_start),
+        )
 
         cost = background_term + data_misfit - predictability
 
@@ -1926,23 +1987,42 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         # Compute forcing: Q_wme - L_wme⁻¹(Q_wme - Q_wme,b)
         self._ensure_wme_predicted_covariance()
+        stage_start = time.perf_counter()
         L_inv_delta = self._L_wme.apply_inverse(delta_Q)
+        self._profile_event(
+            "dcwme.value_gradient.l_inv_ready",
+            duration_s=float(time.perf_counter() - stage_start),
+        )
 
         # Use copy() not duplicate() - duplicate() creates empty vector!
         forcing = Q_wme_m.copy()
         forcing.axpy(-1.0, L_inv_delta)
 
         # Apply adjoint of WME Jacobian (pass trajectory to avoid redundant forward solve)
+        stage_start = time.perf_counter()
         linearized_wme = self.qoi_map.linearize(
             m, max(self.obs_times), trajectory=self._trajectory, jacobians=self._jacobians
         )
+        self._profile_event(
+            "dcwme.value_gradient.linearize_ready",
+            duration_s=float(time.perf_counter() - stage_start),
+        )
+        stage_start = time.perf_counter()
         grad_wme = linearized_wme.apply_adjoint(forcing)
+        self._profile_event(
+            "dcwme.value_gradient.apply_adjoint_ready",
+            duration_s=float(time.perf_counter() - stage_start),
+        )
 
         # Accumulate
         grad.axpy(1.0, grad_wme)
 
         # Zero boundary DOF gradients (same as standard 4D-Var adjoint)
         grad = self._zero_boundary_gradient(grad)
+        self._profile_event(
+            "dcwme.value_gradient.complete",
+            cost=float(cost),
+        )
 
         return cost, grad
 
@@ -2030,8 +2110,24 @@ def create_cost_function(
         Configured cost function instance.
     """
     variant = variant.lower()
+    control_layout = getattr(forward_model, "control_layout", None)
+    has_augmented_parameters = (
+        control_layout is not None and getattr(control_layout, "theta_size", 0) > 0
+    )
 
     if variant == "4dvar" or variant == "standard":
+        if has_augmented_parameters:
+            from .augmented_cost_functions import AugmentedFourDVarCost
+
+            return AugmentedFourDVarCost(
+                forward_model,
+                observation_operator,
+                background_cov,
+                observation_cov,
+                m_background,
+                observations,
+                obs_times,
+            )
         return FourDVarCost(
             forward_model,
             observation_operator,
@@ -2042,6 +2138,21 @@ def create_cost_function(
             obs_times,
         )
     elif variant == "dc" or variant == "dc_4dvar":
+        if has_augmented_parameters:
+            from .augmented_cost_functions import AugmentedDCFourDVarCost
+
+            return AugmentedDCFourDVarCost(
+                forward_model,
+                observation_operator,
+                background_cov,
+                observation_cov,
+                m_background,
+                observations,
+                obs_times,
+                qoi_map=kwargs.get("qoi_map"),
+                predicted_cov=kwargs.get("predicted_cov"),
+                gamma=kwargs.get("gamma", 1.0),
+            )
         return DCFourDVarCost(
             forward_model,
             observation_operator,
@@ -2055,6 +2166,25 @@ def create_cost_function(
             gamma=kwargs.get("gamma", 1.0),
         )
     elif variant == "dc_wme" or variant == "wme":
+        if has_augmented_parameters:
+            from .augmented_cost_functions import AugmentedDCWMEFourDVarCost
+
+            return AugmentedDCWMEFourDVarCost(
+                forward_model,
+                observation_operator,
+                background_cov,
+                observation_cov,
+                m_background,
+                observations,
+                obs_times,
+                predicted_cov_wme=kwargs.get("predicted_cov_wme"),
+                auto_inflate_B=kwargs.get("auto_inflate_B", True),
+                predictability_gamma=kwargs.get("predictability_gamma", 0.1),
+                adaptive_gamma=kwargs.get("adaptive_gamma", True),
+                B_lwme=kwargs.get("B_lwme"),
+                nonuniform_inflate=kwargs.get("nonuniform_inflate", False),
+                eigenvalue_boost_target=kwargs.get("eigenvalue_boost_target", 2.0),
+            )
         return DCWMEFourDVarCost(
             forward_model,
             observation_operator,
@@ -2065,7 +2195,6 @@ def create_cost_function(
             obs_times,
             predicted_cov_wme=kwargs.get("predicted_cov_wme"),
             auto_inflate_B=kwargs.get("auto_inflate_B", True),
-            max_inflate_factor=kwargs.get("max_inflate_factor", 2.0),
             predictability_gamma=kwargs.get("predictability_gamma", 0.1),
             adaptive_gamma=kwargs.get("adaptive_gamma", True),
             B_lwme=kwargs.get("B_lwme"),

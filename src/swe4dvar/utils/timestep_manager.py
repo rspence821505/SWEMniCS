@@ -25,6 +25,7 @@ class TimeStepDataManager:
         save_bathy: bool = False,
         save_true_bathy: bool = False,
         store_jacobians: bool = False,
+        store_parameter_derivatives: bool = False,
         save_adjoints: bool = False,
         observation_times: Optional[Sequence[int]] = None,
         verbose: bool = False,
@@ -49,6 +50,7 @@ class TimeStepDataManager:
         self.save_bathy = save_bathy
         self.save_true_bathy = save_true_bathy
         self.store_jacobians = store_jacobians
+        self.store_parameter_derivatives = store_parameter_derivatives
         self.save_adjoints = save_adjoints
         self.verbose = verbose
 
@@ -73,7 +75,12 @@ class TimeStepDataManager:
             True if this timestep should trigger data saving
         """
         if self.observation_times is None:
-            return self.save_state or self.store_jacobians or self.save_adjoints
+            return (
+                self.save_state
+                or self.store_jacobians
+                or self.store_parameter_derivatives
+                or self.save_adjoints
+            )
         return timestep in self.observation_times
 
     def save_timestep(
@@ -98,6 +105,17 @@ class TimeStepDataManager:
 
         if J is not None and self.store_jacobians:
             self.solver.save_jacobians(J)
+            saved_anything = True
+
+        # Residual derivatives dR_k/dtheta only exist for solved timesteps k >= 1.
+        # Saving a synthetic row at timestep 0 misaligns the augmented adjoint
+        # accumulation with lambda-history indexing.
+        if (
+            self.store_parameter_derivatives
+            and timestep > 0
+            and hasattr(self.solver, "save_parameter_derivatives")
+        ):
+            self.solver.save_parameter_derivatives()
             saved_anything = True
 
         if self.save_adjoints and timestep > 0:
@@ -194,6 +212,9 @@ class TimeStepDataManager:
             "n_states": len(self.solver.saved_states),
             "n_jacobians": len(self.solver.saved_jacobians),
             "n_adjoints": len(self.solver.saved_adjoints),
+            "n_parameter_derivative_steps": len(
+                getattr(self.solver, "saved_parameter_derivatives", [])
+            ),
             "n_dry_nodes": len(self.solver.dry_nodes),
         }
 
@@ -216,6 +237,7 @@ class TimeStepDataManager:
         print(f"  States:            {summary['n_states']}")
         print(f"  Jacobians:         {summary['n_jacobians']}")
         print(f"  Adjoints:          {summary['n_adjoints']}")
+        print(f"  Parameter derivs:  {summary['n_parameter_derivative_steps']}")
         print(f"  Dry nodes:         {summary['n_dry_nodes']}")
         print("=" * 70)
 

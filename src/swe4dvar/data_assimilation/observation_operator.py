@@ -142,6 +142,7 @@ class PointObservationOperator(ObservationOperator):
         component_indices: Optional[List[int]] = None,
         comm: MPI.Comm = None,
         dg_averaging: str = "arithmetic",
+        sub_component: Optional[int] = None,
     ):
         """
         Initialize point observation operator.
@@ -149,17 +150,23 @@ class PointObservationOperator(ObservationOperator):
         Args:
             function_space: FEniCSx function space (CG or DG)
             observation_points: Array of (x, y) coordinates, shape (n_obs, 2)
-            component_indices: Which components to observe (for mixed spaces)
+            component_indices: Which components to observe (for mixed spaces).
+                             e.g. [0] for h, [1] for (u,v) in a mixed (h, (u,v)) space.
             comm: MPI communicator
             dg_averaging: For DG spaces, how to handle multiple values:
                          'arithmetic' - simple average (default)
                          'volume_weighted' - weight by cell volume
                          'first' - take first cell only (breaks adjoint consistency!)
+            sub_component: For vector sub-spaces, which scalar to extract.
+                          e.g. component_indices=[1] selects (u,v), then
+                          sub_component=0 extracts u, sub_component=1 extracts v.
+                          If None, extracts first scalar (backward-compatible).
         """
         super().__init__(function_space, comm)
         self.obs_points = observation_points
         self.n_obs = len(observation_points)
         self.components = component_indices
+        self.sub_component = sub_component
         self.dg_averaging = dg_averaging
 
         # Determine spatial dimension from mesh
@@ -352,6 +359,10 @@ class PointObservationOperator(ObservationOperator):
             u_sub = u.sub(comp_idx)
             # Need to collapse to get evaluable function
             u_eval = u_sub.collapse()
+            # For vector sub-spaces (e.g. velocity (u,v)), further extract
+            # a scalar component if sub_component is set.
+            if self.sub_component is not None:
+                u_eval = u_eval.sub(self.sub_component).collapse()
         else:
             u_eval = u
 
@@ -479,6 +490,12 @@ class PointObservationOperator(ObservationOperator):
             comp_idx = self.components[0] if self.components else 0
             sub_space = self.function_space.sub(comp_idx)
             sub_dofmap = sub_space.dofmap
+            # For vector sub-spaces with sub_component, we need to further
+            # select which scalar DOFs within the vector block to write to.
+            if self.sub_component is not None:
+                sub_sub_space = sub_space.sub(self.sub_component)
+                sub_dofmap = sub_sub_space.dofmap
+                sub_space = sub_sub_space
         else:
             sub_space = None
             sub_dofmap = None
@@ -861,17 +878,40 @@ class CompositeObservationOperator(ObservationOperator):
         self.operators = operators
 
     def forward(self, state: PETSc.Vec) -> PETSc.Vec:
-        """Apply all operators and concatenate results."""
-        # TODO: Implement in Sprint 2 when needed
-        raise NotImplementedError(
-            "CompositeObservationOperator to be implemented in Sprint 2"
-        )
+        """Apply all operators and concatenate results into a single vector."""
+        sub_vecs = [op.forward(state) for op in self.operators]
+        total_size = sum(v.getSize() for v in sub_vecs)
+        result = PETSc.Vec().createSeq(total_size, comm=PETSc.COMM_SELF)
+        offset = 0
+        for v in sub_vecs:
+            arr = v.getArray(readonly=True)
+            result.getArray()[offset:offset + arr.size] = arr
+            offset += arr.size
+            v.destroy()
+        result.assemble()
+        return result
 
     def adjoint(self, innovation: PETSc.Vec) -> PETSc.Vec:
-        """Apply all adjoint operators and sum contributions."""
-        raise NotImplementedError(
-            "CompositeObservationOperator to be implemented in Sprint 2"
-        )
+        """Split innovation across sub-operators, apply adjoints, and sum."""
+        innov_arr = innovation.getArray(readonly=True)
+        offset = 0
+        adj_state = None
+        for op in self.operators:
+            n = op.get_num_observations()
+            sub_innov = PETSc.Vec().createSeq(n, comm=PETSc.COMM_SELF)
+            sub_innov.setArray(innov_arr[offset:offset + n].copy())
+            sub_innov.assemble()
+            offset += n
+
+            sub_adj = op.adjoint(sub_innov)
+            sub_innov.destroy()
+
+            if adj_state is None:
+                adj_state = sub_adj
+            else:
+                adj_state.axpy(1.0, sub_adj)
+                sub_adj.destroy()
+        return adj_state
 
     def get_num_observations(self) -> int:
         """Return total number of observations."""

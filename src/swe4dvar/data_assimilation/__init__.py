@@ -99,6 +99,7 @@ from __future__ import annotations
 from .covariance import (
     CovarianceMatrix,
     DiagonalCovariance,
+    BlockDiagonalCovariance,
     ScaledCovariance,
     DenseCovariance,
     ImplicitCovariance,
@@ -117,6 +118,11 @@ from .cost_functions import (
     DCFourDVarCost,
     DCWMEFourDVarCost,
     create_cost_function,
+)
+from .augmented_cost_functions import (
+    AugmentedFourDVarCost,
+    AugmentedDCFourDVarCost,
+    AugmentedDCWMEFourDVarCost,
 )
 
 # Import QoI maps
@@ -158,6 +164,7 @@ __all__ = [
     # Covariance utilities
     "CovarianceMatrix",
     "DiagonalCovariance",
+    "BlockDiagonalCovariance",
     "DenseCovariance",
     "ImplicitCovariance",
     "create_observation_covariance",
@@ -170,6 +177,9 @@ __all__ = [
     "FourDVarCost",
     "DCFourDVarCost",
     "DCWMEFourDVarCost",
+    "AugmentedFourDVarCost",
+    "AugmentedDCFourDVarCost",
+    "AugmentedDCWMEFourDVarCost",
     "create_cost_function",
     # QoI maps
     "QoIMap",

@@ -32,6 +32,7 @@ class Optimizer(ABC):
         self.iteration = 0
         self.converged = False
         self.convergence_history = []
+        self.iteration_callback = self.options.get("iteration_callback")
 
     @abstractmethod
     def solve(self, x0: PETSc.Vec) -> PETSc.Vec:
@@ -81,9 +82,14 @@ class Optimizer(ABC):
             cost: Cost function value
             grad_norm: Gradient norm
         """
-        self.convergence_history.append(
-            {"iteration": self.iteration, "cost": cost, "grad_norm": grad_norm}
-        )
+        entry = {"iteration": self.iteration, "cost": cost, "grad_norm": grad_norm}
+
+        if self.iteration_callback is not None:
+            extra = self.iteration_callback(x, self.iteration, cost, grad_norm)
+            if isinstance(extra, dict):
+                entry.update(extra)
+
+        self.convergence_history.append(entry)
 
     def get_convergence_info(self) -> Dict:
         """

@@ -694,19 +694,50 @@ class LinearizedStandardQoI(LinearizedQoI):
         PETSc.Vec
             Perturbation in QoI space.
         """
-        # Import TLM solver
-        from ..adjoint.tangent_linear import TangentLinearModel
+        control_layout = getattr(self.forward_model, "control_layout", None)
+        is_augmented = control_layout is not None and control_layout.theta_size > 0
 
-        tlm = TangentLinearModel(self.forward_model, self._trajectory, self._jacobians)
+        if not is_augmented:
+            from ..adjoint.tangent_linear import TangentLinearModel
 
-        # Propagate perturbation to time k
-        delta_u_k = tlm.propagate(delta_m, target_time=self.k)
+            tlm = TangentLinearModel(self.forward_model, self._trajectory, self._jacobians)
+            delta_u_k = tlm.propagate(delta_m, target_time=self.k)
+            return self.obs_op.forward(delta_u_k)
 
-        # Apply observation operator (linearized at u_k)
-        # For linear observation operators like point interpolation, forward == forward_linearized
-        delta_q = self.obs_op.forward(delta_u_k)
+        delta_control = control_layout.unpack_vec(delta_m)
+        delta_u_k = None
 
-        return delta_q
+        if control_layout.state_size > 0:
+            from ..adjoint.tangent_linear import TangentLinearModel
+
+            state_vec = PETSc.Vec().createSeq(control_layout.state_size, comm=PETSc.COMM_SELF)
+            state_vec.setArray(delta_control.u0.copy())
+            state_vec.assemble()
+            tlm = TangentLinearModel(self.forward_model, self._trajectory, self._jacobians)
+            delta_u_k = tlm.propagate(state_vec, target_time=self.k)
+            state_vec.destroy()
+
+        bundle = self.forward_model.get_parameter_sensitivity_bundle(
+            self.m_bar,
+            base_trajectory=self._trajectory,
+            base_jacobians=self._jacobians,
+        )
+        if bundle is not None:
+            for p, coeff in enumerate(delta_control.theta):
+                if abs(coeff) < 1e-30:
+                    continue
+                sens = bundle.sensitivities[p][self.k]
+                if delta_u_k is None:
+                    delta_u_k = sens.copy()
+                    delta_u_k.scale(coeff)
+                else:
+                    delta_u_k.axpy(coeff, sens)
+
+        if delta_u_k is None:
+            delta_u_k = self._trajectory[self.k].duplicate()
+            delta_u_k.zeroEntries()
+
+        return self.obs_op.forward(delta_u_k)
 
     def apply_adjoint(self, delta_q: PETSc.Vec) -> PETSc.Vec:
         """
@@ -725,10 +756,11 @@ class LinearizedStandardQoI(LinearizedQoI):
         PETSc.Vec
             Perturbation in control space.
         """
-        # Apply adjoint observation operator
+        control_layout = getattr(self.forward_model, "control_layout", None)
+        is_augmented = control_layout is not None and control_layout.theta_size > 0
+
         delta_u_k = self.obs_op.adjoint(delta_q)
 
-        # Run adjoint from time k to 0
         from ..adjoint.implicit_adjoint import ImplicitAdjointSolver
 
         adjoint_solver = ImplicitAdjointSolver(
@@ -738,17 +770,36 @@ class LinearizedStandardQoI(LinearizedQoI):
             self.forward_model.dt,
         )
 
-        # Create forcing vector (only at time k)
         forcings = [None] * (self.k + 1)
         forcings[self.k] = delta_u_k
 
-        # Terminal condition
         terminal = delta_u_k.duplicate()
         terminal.zeroEntries()
+        state_grad = adjoint_solver.solve(terminal, forcings)
 
-        delta_m = adjoint_solver.solve(terminal, forcings)
+        if not is_augmented:
+            return state_grad
 
-        return delta_m
+        theta_grad = np.zeros(control_layout.theta_size, dtype=float)
+        bundle = self.forward_model.get_parameter_sensitivity_bundle(
+            self.m_bar,
+            base_trajectory=self._trajectory,
+            base_jacobians=self._jacobians,
+        )
+        if bundle is not None:
+            forcing = forcings[self.k]
+            for p in range(control_layout.theta_size):
+                theta_grad[p] = bundle.sensitivities[p][self.k].dot(forcing)
+
+        background = control_layout.create_petsc_vec()
+        background.zeroEntries()
+        packed = control_layout.combine_gradient(
+            background_gradient=background,
+            state_gradient=state_grad,
+            theta_gradient=theta_grad,
+        )
+        background.destroy()
+        return packed
 
 
 class LinearizedWMEQoI(LinearizedQoI):
@@ -862,37 +913,76 @@ class LinearizedWMEQoI(LinearizedQoI):
         PETSc.Vec
             Perturbation in WME space.
         """
-        from ..adjoint.tangent_linear import TangentLinearModel
+        control_layout = getattr(self.forward_model, "control_layout", None)
+        is_augmented = control_layout is not None and control_layout.theta_size > 0
 
-        tlm = TangentLinearModel(self.forward_model, self._trajectory, self._jacobians)
+        if not is_augmented:
+            from ..adjoint.tangent_linear import TangentLinearModel
 
-        # Accumulate contributions
-        I_k = [t for t in self.obs_times if t <= self.k]
-        result = None
+            tlm = TangentLinearModel(self.forward_model, self._trajectory, self._jacobians)
+            I_k = [t for t in self.obs_times if t <= self.k]
+            result = None
+            num_obs = 0
+            for t_j in I_k:
+                if t_j >= len(self._trajectory) or t_j not in self._obs_by_time:
+                    continue
+                delta_u_j = tlm.propagate(delta_m, target_time=t_j)
+                delta_Hu_j = self.obs_op.forward(delta_u_j)
+                scaled = self._apply_R_sqrt_inv(delta_Hu_j, t_j)
+                if result is None:
+                    result = scaled.copy()
+                else:
+                    result.axpy(1.0, scaled)
+                num_obs += 1
+        else:
+            delta_control = control_layout.unpack_vec(delta_m)
+            from ..adjoint.tangent_linear import TangentLinearModel
 
-        num_obs = 0
-        for t_j in I_k:
-            if t_j >= len(self._trajectory):
-                continue
-            if t_j not in self._obs_by_time:
-                continue
-
-            # Propagate perturbation to time t_j
-            delta_u_j = tlm.propagate(delta_m, target_time=t_j)
-
-            # Apply linearized observation operator
-            # For linear observation operators like point interpolation, forward == forward_linearized
-            delta_Hu_j = self.obs_op.forward(delta_u_j)
-
-            # Apply R^{-1/2}
-            scaled = self._apply_R_sqrt_inv(delta_Hu_j, t_j)
-
-            # Accumulate
-            if result is None:
-                result = scaled.copy()
+            tlm = None
+            if control_layout.state_size > 0:
+                state_vec = PETSc.Vec().createSeq(control_layout.state_size, comm=PETSc.COMM_SELF)
+                state_vec.setArray(delta_control.u0.copy())
+                state_vec.assemble()
+                tlm = TangentLinearModel(self.forward_model, self._trajectory, self._jacobians)
             else:
-                result.axpy(1.0, scaled)
-            num_obs += 1
+                state_vec = None
+
+            bundle = self.forward_model.get_parameter_sensitivity_bundle(
+                self.m_bar,
+                base_trajectory=self._trajectory,
+                base_jacobians=self._jacobians,
+            )
+            I_k = [t for t in self.obs_times if t <= self.k]
+            result = None
+            num_obs = 0
+            for t_j in I_k:
+                if t_j >= len(self._trajectory) or t_j not in self._obs_by_time:
+                    continue
+                delta_u_j = None
+                if state_vec is not None:
+                    delta_u_j = tlm.propagate(state_vec, target_time=t_j)
+                if bundle is not None:
+                    for p, coeff in enumerate(delta_control.theta):
+                        if abs(coeff) < 1e-30:
+                            continue
+                        sens = bundle.sensitivities[p][t_j]
+                        if delta_u_j is None:
+                            delta_u_j = sens.copy()
+                            delta_u_j.scale(coeff)
+                        else:
+                            delta_u_j.axpy(coeff, sens)
+                if delta_u_j is None:
+                    continue
+                delta_Hu_j = self.obs_op.forward(delta_u_j)
+                scaled = self._apply_R_sqrt_inv(delta_Hu_j, t_j)
+                if result is None:
+                    result = scaled.copy()
+                else:
+                    result.axpy(1.0, scaled)
+                num_obs += 1
+
+            if state_vec is not None:
+                state_vec.destroy()
 
         # Scale by 1/√|I_k|
         if result is None:
@@ -969,7 +1059,6 @@ class LinearizedWMEQoI(LinearizedQoI):
             boundary_dofs = get_boundary_dofs(V, mesh)
             bc_dof_indices = set(boundary_dofs.tolist())
 
-        # Single adjoint solve with all forcings
         adjoint_solver = ImplicitAdjointSolver(
             self.forward_model,
             self._trajectory,
@@ -981,8 +1070,36 @@ class LinearizedWMEQoI(LinearizedQoI):
 
         terminal = self._trajectory[-1].duplicate()
         terminal.zeroEntries()
+        state_grad = adjoint_solver.solve(terminal, forcings)
 
-        return adjoint_solver.solve(terminal, forcings)
+        control_layout = getattr(self.forward_model, "control_layout", None)
+        is_augmented = control_layout is not None and control_layout.theta_size > 0
+        if not is_augmented:
+            return state_grad
+
+        theta_grad = np.zeros(control_layout.theta_size, dtype=float)
+        bundle = self.forward_model.get_parameter_sensitivity_bundle(
+            self.m_bar,
+            base_trajectory=self._trajectory,
+            base_jacobians=self._jacobians,
+        )
+        if bundle is not None:
+            for p in range(control_layout.theta_size):
+                accum = 0.0
+                for t_j in I_k:
+                    if t_j < len(forcings) and forcings[t_j] is not None:
+                        accum += bundle.sensitivities[p][t_j].dot(forcings[t_j])
+                theta_grad[p] = accum
+
+        background = control_layout.create_petsc_vec()
+        background.zeroEntries()
+        packed = control_layout.combine_gradient(
+            background_gradient=background,
+            state_gradient=state_grad,
+            theta_gradient=theta_grad,
+        )
+        background.destroy()
+        return packed
 
     def _apply_R_sqrt_inv(self, v: PETSc.Vec, time_index: int) -> PETSc.Vec:
         """Apply R^{-1/2} to vector."""

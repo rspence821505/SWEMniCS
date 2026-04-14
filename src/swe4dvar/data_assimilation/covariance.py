@@ -1170,6 +1170,12 @@ class BlockDiagonalCovariance(CovarianceMatrix):
 
         return out
 
+    def min_eigenvalue(self) -> float:
+        return min(block.min_eigenvalue() for block in self.blocks)
+
+    def max_eigenvalue(self) -> float:
+        return max(block.max_eigenvalue() for block in self.blocks)
+
 
 class EnsembleCovariance(CovarianceMatrix):
     """

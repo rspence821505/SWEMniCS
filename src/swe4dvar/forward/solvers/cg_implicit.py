@@ -485,6 +485,18 @@ class CGImplicit(BaseSolver):
         if J is not None:
             self.storage.save_jacobian(J)
 
+    def save_parameter_derivatives(self):
+        """Save residual derivatives with respect to active control parameters."""
+        provider = getattr(self, "parameter_sensitivity_provider", None)
+        if provider is None:
+            return
+        derivative_vectors = provider.compute_timestep_parameter_jacobian(
+            problem=self.problem,
+            solver=self,
+        )
+        if derivative_vectors:
+            self.storage.save_parameter_derivatives(derivative_vectors)
+
     def save_states(self, water_height=None, dry_node_indices=None):
         """Save global state vector with optional wetting/drying adjustments."""
         u_sol = self.u.x.array.copy().flatten()
@@ -510,6 +522,7 @@ class CGImplicit(BaseSolver):
         save_true_bathy=False,
         make_wet=False,
         store_jacobians=False,
+        store_parameter_derivatives=False,
         observation_times=None,
         monitor_progress=False,
         newton_diagnostics_config=None,
@@ -541,6 +554,10 @@ class CGImplicit(BaseSolver):
             self.storage.saved_jacobians.clear()
             if self.verbose:
                 self.log("4D-Var mode: Jacobians will be stored during forward solve")
+        if store_parameter_derivatives:
+            self.storage.saved_parameter_derivatives.clear()
+            if self.verbose:
+                self.log("Augmented-control mode: timestep parameter derivatives will be stored")
 
         self.points_on_proc = local_points = self.init_stations(stations)
         self.station_data = np.zeros((self.problem.nt + 1, local_points.shape[0], 3))
@@ -579,6 +596,7 @@ class CGImplicit(BaseSolver):
             save_bathy=save_bathy,
             save_true_bathy=save_true_bathy,
             store_jacobians=store_jacobians,
+            store_parameter_derivatives=store_parameter_derivatives,
             save_adjoints=adjoint_method,
             observation_times=observation_times,
             verbose=self.verbose,

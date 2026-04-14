@@ -11,6 +11,7 @@ References:
 """
 
 from typing import Optional, Dict, Callable
+import time
 from petsc4py import PETSc
 import numpy as np
 from mpi4py import MPI
@@ -77,6 +78,8 @@ class PETScTAOWrapper(Optimizer):
         # Convergence tracking
         self.verbose = self.options.get("verbose", False)
         self.use_tao_monitor = self.options.get("tao_monitor", False)
+        self.runtime_profiler = self.options.get("runtime_profiler")
+        self.runtime_profile_label = self.options.get("runtime_profile_label", "tao")
 
         # Function evaluation counters
         self.n_func_evals = 0
@@ -93,6 +96,7 @@ class PETScTAOWrapper(Optimizer):
         Returns:
             Optimal solution
         """
+        self._profile("solve_start", tao_type=self.tao_type)
         # Create TAO solver
         self.tao = PETSc.TAO().create(comm=self.comm)
         self.tao.setType(self.tao_type)
@@ -162,8 +166,12 @@ class PETScTAOWrapper(Optimizer):
             self.tao.setMaximumFunctionEvaluations(max_funcs)
         self.tao.setTolerances(gatol=gatol, grtol=grtol, gttol=gttol)
 
-        # Set up monitoring
-        if self.use_tao_monitor:
+        # Set up monitoring. Even when verbose output is disabled, we still attach
+        # the custom monitor if iteration_callback is present so per-iteration
+        # diagnostics are recorded in convergence_history.
+        if self.iteration_callback is not None:
+            self.tao.setMonitor(self._custom_monitor_callback)
+        elif self.use_tao_monitor:
             self.tao.setMonitor(self._tao_monitor_callback)
         elif self.verbose:
             self.tao.setMonitor(self._custom_monitor_callback)
@@ -188,6 +196,14 @@ class PETScTAOWrapper(Optimizer):
 
         self.converged = reason > 0
         self.iteration = iterations
+        self._profile(
+            "solve_end",
+            converged=bool(self.converged),
+            reason=int(reason),
+            iterations=int(iterations),
+            n_func_evals=int(self.n_func_evals),
+            n_grad_evals=int(self.n_grad_evals),
+        )
 
         if self.verbose and self.comm.rank == 0:
             self._print_convergence_info(reason, iterations)
@@ -220,6 +236,13 @@ class PETScTAOWrapper(Optimizer):
         Returns:
             Objective function value
         """
+        eval_id = self.n_func_evals + 1
+        callback_start = time.perf_counter()
+        self._profile(
+            "objective_gradient_start",
+            eval_id=int(eval_id),
+            iter=int(tao.getIterationNumber()),
+        )
         try:
             # Enforce max function evaluations (PETSc's setMaximumFunctionEvaluations
             # is not enforced by all TAO types like BLMVM)
@@ -253,6 +276,15 @@ class PETScTAOWrapper(Optimizer):
 
                 self._last_cost = f
                 gnorm = grad.norm()
+                self._profile(
+                    "objective_gradient_end",
+                    eval_id=int(eval_id),
+                    iter=int(tao.getIterationNumber()),
+                    cost=float(f),
+                    grad_norm=float(gnorm),
+                    duration_s=float(time.perf_counter() - callback_start),
+                    mode="value_gradient",
+                )
                 if self.verbose and self.comm.rank == 0:
                     print(f"  [TAO callback] eval #{self.n_func_evals}: cost={f:.6f}, ||grad||={gnorm:.4e}")
 
@@ -286,6 +318,15 @@ class PETScTAOWrapper(Optimizer):
                 grad.copy(g)
                 grad.destroy()
                 self.n_grad_evals += 1
+                self._profile(
+                    "objective_gradient_end",
+                    eval_id=int(eval_id),
+                    iter=int(tao.getIterationNumber()),
+                    cost=float(f),
+                    grad_norm=float(g.norm()),
+                    duration_s=float(time.perf_counter() - callback_start),
+                    mode="separate",
+                )
 
                 return f
         except Exception as e:
@@ -305,6 +346,13 @@ class PETScTAOWrapper(Optimizer):
             else:
                 # Fallback: set small non-zero gradient to prevent TAO from thinking it converged
                 g.set(1e-10)
+            self._profile(
+                "objective_gradient_error",
+                eval_id=int(eval_id),
+                iter=int(tao.getIterationNumber()),
+                duration_s=float(time.perf_counter() - callback_start),
+                error=str(e),
+            )
             return 1e20
 
     def _tao_monitor_callback(self, tao: PETSc.TAO):
@@ -313,8 +361,19 @@ class PETScTAOWrapper(Optimizer):
 
         Displays iteration info using TAO's default format.
         """
-        # TAO handles printing internally
-        pass
+        f = tao.getFunctionValue()
+        grad = tao.getGradient()
+        if isinstance(grad, tuple):
+            grad = grad[0]
+        gnorm = grad.norm() if grad is not None else 0.0
+        x = tao.getSolution() if hasattr(tao, "getSolution") else None
+        self.record_iteration(x, f, gnorm)
+        self._profile(
+            "monitor",
+            iter=int(tao.getIterationNumber()),
+            cost=float(f),
+            grad_norm=float(gnorm),
+        )
 
     def _custom_monitor_callback(self, tao: PETSc.TAO):
         """
@@ -322,9 +381,6 @@ class PETScTAOWrapper(Optimizer):
 
         Matches the output style of L-BFGS optimizer.
         """
-        if self.comm.rank != 0:
-            return
-
         iteration = tao.getIterationNumber()
         f = tao.getFunctionValue()
         grad = tao.getGradient()
@@ -332,21 +388,31 @@ class PETScTAOWrapper(Optimizer):
         if isinstance(grad, tuple):
             grad = grad[0]
         gnorm = grad.norm() if grad is not None else 0.0
+        x = tao.getSolution() if hasattr(tao, "getSolution") else None
+
+        # Record for convergence history before any rank-0-only printing.
+        self.record_iteration(x, f, gnorm)
+        self._profile(
+            "monitor",
+            iter=int(iteration),
+            cost=float(f),
+            grad_norm=float(gnorm),
+        )
+
+        if self.comm.rank != 0:
+            return
 
         # Get step size (if available)
         step = "N/A"
         try:
-            step_vec = tao.getSolution()
             if hasattr(tao, "getStepSize"):
                 step_size = tao.getStepSize()
                 step = f"{step_size:.5e}"
-        except:
+        except Exception:
             pass
 
-        print(f"{iteration:6d} {f:15.8e} {gnorm:15.8e} {step:>12}")
-
-        # Record for convergence history
-        self.record_iteration(None, f, gnorm)  # x not available in callback
+        if self.verbose:
+            print(f"{iteration:6d} {f:15.8e} {gnorm:15.8e} {step:>12}")
 
     def _apply_tao_options(self):
         """
@@ -395,6 +461,17 @@ class PETScTAOWrapper(Optimizer):
         print(f"\nFunction evaluations: {self.n_func_evals}")
         print(f"Gradient evaluations: {self.n_grad_evals}")
         print(f"{'='*70}\n")
+
+    def _profile(self, event: str, **payload):
+        if self.runtime_profiler is None:
+            return
+        try:
+            self.runtime_profiler.log_event(
+                f"{self.runtime_profile_label}.{event}",
+                **payload,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _get_convergence_reason_string(reason: int) -> str:

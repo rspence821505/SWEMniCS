@@ -9,10 +9,31 @@ import numpy as np
 
 
 class GriddedForcing:
-    """Supports meteorological forcing on a regular lat/lon grid"""
+    """Supports meteorological forcing on a regular grid.
 
-    def __init__(self, filename, lat0=35):
-        """Initialize the forcing"""
+    For spherical meshes (Shinnecock, etc.), the grid is in lat/lon degrees
+    and mesh coordinates are reverse-projected from meters to degrees.
+
+    For Cartesian meshes (idealized inlet, etc.), set cartesian=True.
+    The grid coordinates ("latitude"/"longitude" in the HDF5) are then
+    interpreted directly as y/x coordinates in meters — no projection.
+    """
+
+    def __init__(self, filename, lat0=35, cartesian=False):
+        """Initialize the forcing.
+
+        Parameters
+        ----------
+        filename : str
+            Path to HDF5 file with datasets: latitude, longitude, time,
+            windx, windy, pressure.
+        lat0 : float
+            Reference latitude for spherical reverse-projection (ignored
+            when cartesian=True).
+        cartesian : bool
+            If True, grid coordinates are in meters (x, y) and no
+            spherical projection is applied.
+        """
         try:
             import h5py
         except ModuleNotFoundError:
@@ -33,20 +54,30 @@ class GriddedForcing:
         assert self._windy.shape == shape
         assert self._pressure.shape == shape
         self.lat0 = lat0
+        self.cartesian = cartesian
 
     def set_V(self, V):
-        """Set the FunctionSpace to be used"""
+        """Set the FunctionSpace and precompute interpolation weights.
 
+        For spherical meshes, reverse-projects mesh coords from projected
+        meters to lat/lon degrees before interpolation.
+        For Cartesian meshes (self.cartesian=True), uses mesh coords directly.
+        """
         self._V = V
         self.windx = fe.Function(V)
         self.windy = fe.Function(V)
         self.pressure = fe.Function(V)
         self.coords = V.tabulate_dof_coordinates()[:, :2]
-        # reverse projection. . .
-        self.coords = np.rad2deg(
-            self.coords / np.array([[R * np.cos(np.deg2rad(self.lat0)), R]])
-        )
+
+        if not self.cartesian:
+            # Reverse spherical projection: projected meters → degrees
+            self.coords = np.rad2deg(
+                self.coords / np.array([[R * np.cos(np.deg2rad(self.lat0)), R]])
+            )
+        # else: coords are already in the same units as the grid (meters)
+
         # determine insertion indices
+        # "lon" = x-axis grid, "lat" = y-axis grid (regardless of coordinate system)
         lon_inds = np.searchsorted(self.lon, self.coords[:, 0])
         lat_inds = np.searchsorted(self.lat, self.coords[:, 1])
         lower_lon_inds = lon_inds - 1
@@ -142,4 +173,121 @@ class GriddedForcing:
             + (1 - self.lon_pos)
             * (1 - self.lat_pos)
             * pressure[self.lat_inds, self.lon_inds]
+        )
+
+
+class ParametricWindForcing(GriddedForcing):
+    """Low-dimensional parameterization of a reference gridded wind field.
+
+    Parameters are interpreted as:
+    - theta[0]: zonal track shift in km
+    - theta[1]: multiplicative wind-intensity bias
+    - theta[2]: temporal offset in seconds
+
+    This stage-1 implementation deliberately keeps the mapping simple and
+    explicit so the control-to-forcing dependence is fully traceable.
+    """
+
+    parameter_names = ("track_shift_km", "intensity_bias", "timing_offset_s")
+
+    def __init__(self, filename, lat0=35, theta=None):
+        super().__init__(filename, lat0=lat0)
+        self.theta = np.zeros(3, dtype=float)
+        if theta is not None:
+            self.set_parameters(theta)
+
+    def set_parameters(self, theta):
+        theta = np.asarray(theta, dtype=float).reshape(-1)
+        if theta.size != 3:
+            raise ValueError(
+                f"ParametricWindForcing expects 3 parameters, got {theta.size}"
+            )
+        self.theta[:] = theta
+
+    def evaluate(self, t):
+        """Evaluate the transformed wind field at time ``t``."""
+        track_shift_km, intensity_bias, timing_offset_s = self.theta
+
+        effective_t = t + timing_offset_s
+        t_ind = np.searchsorted(self.time, effective_t)
+        time_resolution = self.time[1] - self.time[0]
+        last_ind = t_ind - 1
+        if last_ind < 0:
+            last_ind = 0
+        if t_ind >= len(self.time):
+            t_ind = len(self.time) - 1
+        t_pos = (effective_t - self.time[last_ind]) / time_resolution
+
+        windx = t_pos * self._windx[last_ind] + (1 - t_pos) * self._windx[t_ind]
+        windy = t_pos * self._windy[last_ind] + (1 - t_pos) * self._windy[t_ind]
+        pressure = (
+            t_pos * self._pressure[last_ind] + (1 - t_pos) * self._pressure[t_ind]
+        )
+
+        wind_scale = 1.0 + intensity_bias
+        pressure_deficit_scale = wind_scale * wind_scale
+        ambient_pressure = 1013.25
+        windx = wind_scale * windx
+        windy = wind_scale * windy
+        pressure = ambient_pressure + pressure_deficit_scale * (pressure - ambient_pressure)
+
+        shift_lon_deg = track_shift_km / (111.32 * np.cos(np.deg2rad(self.lat0)))
+        shifted_lon = self.coords[:, 0] - shift_lon_deg
+        shifted_lat = self.coords[:, 1]
+
+        lon_inds = np.searchsorted(self.lon, shifted_lon)
+        lat_inds = np.searchsorted(self.lat, shifted_lat)
+        lower_lon_inds = np.clip(lon_inds - 1, 0, len(self.lon) - 1)
+        lower_lat_inds = np.clip(lat_inds - 1, 0, len(self.lat) - 1)
+        lon_inds = np.clip(lon_inds, 0, len(self.lon) - 1)
+        lat_inds = np.clip(lat_inds, 0, len(self.lat) - 1)
+
+        lon_cellsize = self.lon[1] - self.lon[0]
+        lat_cellsize = self.lat[1] - self.lat[0]
+        lon_pos = (shifted_lon - self.lon[lower_lon_inds]) / lon_cellsize
+        lat_pos = (shifted_lat - self.lat[lower_lat_inds]) / lat_cellsize
+
+        self.windx.x.array[:] = (
+            lon_pos
+            * lat_pos
+            * windx[lower_lat_inds, lower_lon_inds]
+            + lon_pos
+            * (1 - lat_pos)
+            * windx[lat_inds, lower_lon_inds]
+            + (1 - lon_pos)
+            * lat_pos
+            * windx[lower_lat_inds, lon_inds]
+            + (1 - lon_pos)
+            * (1 - lat_pos)
+            * windx[lat_inds, lon_inds]
+        )
+
+        self.windy.x.array[:] = (
+            lon_pos
+            * lat_pos
+            * windy[lower_lat_inds, lower_lon_inds]
+            + lon_pos
+            * (1 - lat_pos)
+            * windy[lat_inds, lower_lon_inds]
+            + (1 - lon_pos)
+            * lat_pos
+            * windy[lower_lat_inds, lon_inds]
+            + (1 - lon_pos)
+            * (1 - lat_pos)
+            * windy[lat_inds, lon_inds]
+        )
+
+        self.pressure.x.array[:] = 100 * (
+            lon_pos
+            * lat_pos
+            * pressure[lower_lat_inds, lower_lon_inds]
+            + lon_pos
+            * (1 - lat_pos)
+            * pressure[lat_inds, lower_lon_inds]
+            + (1 - lon_pos)
+            * lat_pos
+            * pressure[lower_lat_inds, lon_inds]
+            + (1 - lon_pos)
+            * (1 - lat_pos)
+            * pressure[lat_inds, lon_inds]
         )

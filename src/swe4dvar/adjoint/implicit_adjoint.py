@@ -695,7 +695,8 @@ class ImplicitAdjointSolver:
         self,
         terminal_forcing: PETSc.Vec,
         observation_forcings: Optional[List[Optional[PETSc.Vec]]] = None,
-    ) -> PETSc.Vec:
+        return_history: bool = False,
+    ):
         """
         Solve adjoint equations backward in time.
 
@@ -713,8 +714,10 @@ class ImplicitAdjointSolver:
 
         Returns
         -------
-        PETSc.Vec
-            Adjoint at initial time λ_0 (gradient w.r.t. initial condition).
+        PETSc.Vec or Tuple[PETSc.Vec, List[Optional[PETSc.Vec]]]
+            By default returns the initial-time gradient contribution.
+            When ``return_history=True``, also returns the timestep adjoint
+            states ``[None, λ_1, ..., λ_N]``.
 
         Notes
         -----
@@ -742,6 +745,8 @@ class ImplicitAdjointSolver:
                 f"got {len(observation_forcings)}"
             )
 
+        lambda_history = [None] * (self.num_steps + 1) if return_history else None
+
         # Initialize adjoint at final time by solving J_N^T λ_N = -f_N
         # The adjoint equation at n=N is: J_N^T λ_N = terminal_forcing - f_N
         # NOTE: Previous code incorrectly set λ_N = f_N directly without solving!
@@ -755,6 +760,8 @@ class ImplicitAdjointSolver:
         # Solve J_N^T λ_N = RHS
         # Note: For n=N (final time), we use jacobians[N-1] = jacobians[num_steps-1]
         lambda_next = self._solve_transpose_system(self.num_steps, final_rhs)
+        if lambda_history is not None:
+            lambda_history[self.num_steps] = lambda_next.copy()
         final_rhs.destroy()
 
         # Backward sweep: n = N-1, N-2, ..., 1
@@ -768,6 +775,8 @@ class ImplicitAdjointSolver:
 
             # Solve transpose system: J_n^T·λ^n = forcing
             lambda_n = self._solve_transpose_system(n, forcing)
+            if lambda_history is not None:
+                lambda_history[n] = lambda_n.copy()
 
             # Shift for next iteration
             lambda_next_next = lambda_next
@@ -782,7 +791,8 @@ class ImplicitAdjointSolver:
         gradient_u0 = self._compute_initial_gradient(
             lambda_next, lambda_next_next, observation_forcings[0]
         )
-
+        if return_history:
+            return gradient_u0, lambda_history
         return gradient_u0
 
     def _solve_transpose_system(self, n: int, forcing: PETSc.Vec) -> PETSc.Vec:
@@ -807,12 +817,13 @@ class ImplicitAdjointSolver:
 
         Notes
         -----
-        - Uses GMRES with no preconditioning by default
-        - Tolerances set to 1e-10 (rtol) and 1e-12 (atol)
-        - The transpose solve is handled automatically by PETSc
-        - All operations maintain distributed parallelism
+        - Tries direct LU factorization first (fastest, exact).
+        - If LU fails (near-singular Jacobian), falls back to GMRES with
+          ILU preconditioning (more robust to ill-conditioning).
+        - The transpose solve is handled automatically by PETSc's
+          solveTranspose().
         - Jacobian indexing: jacobians[k] stores ∂R^(k+1)/∂u^(k+1),
-          so for λ^n we need jacobians[n-1] to get ∂R^n/∂u^n
+          so for λ^n we need jacobians[n-1] to get ∂R^n/∂u^n.
         """
         if n == 0:
             raise RuntimeError(
@@ -825,41 +836,105 @@ class ImplicitAdjointSolver:
         # This is stored in jacobians[n-1]
         J = self.jacobians[n - 1]
 
-        # Create KSP solver on the Jacobian's communicator
-        # Use direct solver (LU) for stability, matching forward solver
-        ksp = PETSc.KSP().create(J.getComm())
-        ksp.setOperators(J)
+        # Check for near-zero diagonal entries (dry nodes in wetting/drying).
+        # Dry nodes produce zero rows in J, making J^T singular.
+        # We regularize by using a shifted operator J + εI for the solve,
+        # then zero out the adjoint at dry-node DOFs afterward.
+        diag = J.getDiagonal()
+        diag_arr = diag.getArray()
+        tiny_mask = np.abs(diag_arr) < 1e-20
+        n_regularized = int(np.sum(tiny_mask))
+        diag.destroy()
+
+        # If regularization needed, create a shifted copy of J for the solve.
+        # Do NOT modify J in-place — it's shared across multiple adjoint solves.
+        if n_regularized > 0:
+            J_reg = J.copy()
+            shift_diag = J_reg.getDiagonal()
+            shift_arr = shift_diag.getArray()
+            shift_arr[tiny_mask] = 1.0  # Set dry-node diag to 1 (identity block)
+            shift_diag.setArray(shift_arr)
+            J_reg.setDiagonal(shift_diag)
+            J_reg.assemble()
+            shift_diag.destroy()
+            J_solve = J_reg
+        else:
+            J_solve = J
+            J_reg = None
+
+        lambda_n = forcing.duplicate()
+
+        # --- Strategy 1: Direct LU (fast, exact when it works) ---
+        ksp = PETSc.KSP().create(J_solve.getComm())
+        ksp.setOperators(J_solve)
         ksp.setType(PETSc.KSP.Type.PREONLY)
         ksp.getPC().setType(PETSc.PC.Type.LU)
-        ksp.setTolerances(rtol=1e-10, atol=1e-12)
+        ksp.setErrorIfNotConverged(False)
 
-        # Set transpose mode - this is critical!
-        ksp.setOperators(J)
-
-        # Solve transpose system: J^T·λ = forcing
-        lambda_n = forcing.duplicate()
         ksp.solveTranspose(forcing, lambda_n)
-
-        # Check convergence
         reason = ksp.getConvergedReason()
-        if reason < 0:
-            raise RuntimeError(
-                f"Adjoint transpose solve failed at step {n}: "
-                f"reason={reason}, iterations={ksp.getIterationNumber()}"
-            )
-
-        # Clean up
         ksp.destroy()
 
-        # NOTE: We do NOT zero the adjoint at boundary DOFs during backward propagation.
-        # With unmodified Jacobians (no identity rows at BC DOFs), the physics coupling
-        # propagates through all DOFs including boundaries. Zeroing here would cut off
-        # valid sensitivity pathways and corrupt interior DOF gradients.
-        #
-        # The boundary gradient zeroing happens ONLY at the final step in
-        # _compute_initial_gradient(), where we zero the gradient (not adjoint state)
-        # at BC DOFs. This ensures the optimizer doesn't modify fixed BC values
-        # while preserving accurate gradient computation for interior DOFs.
+        # --- Strategy 2: GMRES + ILU fallback if LU failed ---
+        if reason < 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Adjoint LU transpose solve failed at step {n} (reason={reason}). "
+                f"Falling back to GMRES+ILU."
+            )
+
+            ksp2 = PETSc.KSP().create(J_solve.getComm())
+            ksp2.setOperators(J_solve)
+            ksp2.setType(PETSc.KSP.Type.GMRES)
+            ksp2.getPC().setType(PETSc.PC.Type.ILU)
+            ksp2.setTolerances(rtol=1e-8, atol=1e-10, max_it=2000)
+            ksp2.setErrorIfNotConverged(False)
+
+            lambda_n.zeroEntries()
+            ksp2.solveTranspose(forcing, lambda_n)
+            reason2 = ksp2.getConvergedReason()
+            iters2 = ksp2.getIterationNumber()
+            ksp2.destroy()
+
+            if reason2 < 0:
+                # --- Strategy 3: GMRES with no preconditioning (last resort) ---
+                logging.getLogger(__name__).warning(
+                    f"Adjoint GMRES+ILU fallback also failed at step {n} "
+                    f"(reason={reason2}). Trying GMRES with no PC."
+                )
+                ksp3 = PETSc.KSP().create(J_solve.getComm())
+                ksp3.setOperators(J_solve)
+                ksp3.setType(PETSc.KSP.Type.GMRES)
+                ksp3.getPC().setType(PETSc.PC.Type.NONE)
+                ksp3.setTolerances(rtol=1e-6, atol=1e-8, max_it=5000)
+                ksp3.setErrorIfNotConverged(False)
+
+                lambda_n.zeroEntries()
+                ksp3.solveTranspose(forcing, lambda_n)
+                reason3 = ksp3.getConvergedReason()
+                iters3 = ksp3.getIterationNumber()
+                ksp3.destroy()
+
+                if reason3 < 0:
+                    if J_reg is not None:
+                        J_reg.destroy()
+                    raise RuntimeError(
+                        f"Adjoint transpose solve failed at step {n} after all "
+                        f"strategies: LU(reason={reason}), GMRES+ILU(reason={reason2}, "
+                        f"iters={iters2}), GMRES(reason={reason3}, iters={iters3})"
+                    )
+
+        # Clean up regularized copy
+        if J_reg is not None:
+            J_reg.destroy()
+
+        # Zero out adjoint at dry-node DOFs — these are numerically meaningless
+        # after solving with the regularized Jacobian.
+        if n_regularized > 0:
+            arr = lambda_n.getArray()
+            arr[tiny_mask] = 0.0
+            lambda_n.setArray(arr)
+            lambda_n.assemble()
 
         return lambda_n
 

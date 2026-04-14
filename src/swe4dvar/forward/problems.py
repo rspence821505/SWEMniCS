@@ -352,10 +352,10 @@ class BaseProblem(abc.ABC):
         elif friction_law == "mannings":
             # experimental but 1e-16 seems to be ok
             eps = 1e-8
-            # Use existing TAU_const if available, otherwise create a Constant
-            # Check for .value attribute to ensure it's a proper Constant (not a float)
-            if not hasattr(self, 'TAU_const') or not hasattr(self.TAU_const, 'value'):
-                self.TAU_const = fe.Constant(self.mesh, ScalarType(0.02))
+            tau_coeff = getattr(self, "TAU_const", None)
+            if tau_coeff is None:
+                tau_coeff = fe.Constant(self.mesh, ScalarType(0.02))
+                self.TAU_const = tau_coeff
             mag_v = conditional(
                 pow(ux * ux + uy * uy, 0.5) < eps, 0, pow(ux * ux + uy * uy, 0.5)
             )
@@ -366,8 +366,8 @@ class BaseProblem(abc.ABC):
             return as_vector(
                 (
                     0,
-                    g * self.TAU_const * self.TAU_const * ux * mag_v * pow(h, pwr_fac),
-                    g * self.TAU_const * self.TAU_const * uy * mag_v * pow(h, pwr_fac),
+                    g * tau_coeff * tau_coeff * ux * mag_v * pow(h, pwr_fac),
+                    g * tau_coeff * tau_coeff * uy * mag_v * pow(h, pwr_fac),
                 )
             )
 
@@ -780,7 +780,10 @@ class TidalProblem(BaseProblem):
             self._TAU = self.TAU
 
         if self.friction_law in ["linear", "mannings", "nolibf2", "quadratic"]:
-            self.TAU_const = fe.Constant(self.mesh, ScalarType(self._TAU))
+            if hasattr(self._TAU, "x"):
+                self.TAU_const = self._TAU
+            else:
+                self.TAU_const = fe.Constant(self.mesh, ScalarType(self._TAU))
 
     @abc.abstractmethod
     def make_h_init(self, V): ...

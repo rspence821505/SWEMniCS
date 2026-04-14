@@ -81,6 +81,7 @@ class BaseSolver:
         self.saved_true_bathy = self.storage.saved_true_bathy
         self.saved_bathy = self.storage.saved_bathy
         self.saved_jacobians = self.storage.saved_jacobians
+        self.saved_parameter_derivatives = self.storage.saved_parameter_derivatives
 
         self.init_fields()
         self.init_weak_form()

@@ -30,8 +30,13 @@ try:
 except PackageNotFoundError:
     __version__ = "1.0.0"
 
-# Core imports for convenient access
-from .forward.problems import FrictionLaw
+# Core imports for convenient access. Keep this lazy-safe so lightweight
+# subpackages (for example the augmented-control abstractions) can be
+# imported in environments that do not have the full forward-solver stack.
+try:
+    from .forward.problems import FrictionLaw
+except ModuleNotFoundError:
+    FrictionLaw = None
 
 __all__ = [
     "__version__",

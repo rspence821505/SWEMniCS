@@ -397,6 +397,7 @@ class ImplicitTLMSolver:
         jacobian: PETSc.Mat,
         delta_u_n: PETSc.Vec,
         delta_u_nm1: Optional[PETSc.Vec] = None,
+        timestep_forcing: Optional[PETSc.Vec] = None,
     ) -> PETSc.Vec:
         """
         Solve one TLM time step.
@@ -413,6 +414,9 @@ class ImplicitTLMSolver:
             Perturbation at time n.
         delta_u_nm1 : PETSc.Vec, optional
             Perturbation at time n-1 (None for first step, treated as zero).
+        timestep_forcing : PETSc.Vec, optional
+            Parameter-induced residual derivative term for this step. When
+            present, the solve becomes J·δu^{n+1} = RHS - timestep_forcing.
 
         Returns
         -------
@@ -421,6 +425,8 @@ class ImplicitTLMSolver:
         """
         # Assemble RHS from BDF2 time coupling
         rhs = self._assemble_tlm_rhs(delta_u_n, delta_u_nm1)
+        if timestep_forcing is not None:
+            rhs.axpy(-1.0, timestep_forcing)
 
         # Set up KSP solver with current Jacobian
         self._setup_ksp(jacobian)
@@ -522,6 +528,57 @@ class ImplicitTLMSolver:
             self.ksp.setTolerances(rtol=1e-8, atol=1e-10)
 
         self.ksp.setOperators(jacobian)
+
+
+class ForcedTangentLinearModel(TangentLinearModel):
+    """TLM with explicit timestep forcing terms.
+
+    This is used for parameter sensitivities when the linearized residual is
+        J_k δu_k + G_k δθ = time-coupling,
+    so the parameter source enters each linear solve through ``-G_k δθ``.
+    """
+
+    def propagate_forcing(
+        self,
+        timestep_forcings: List[Optional[PETSc.Vec]],
+        start_time: int = 0,
+        end_time: Optional[int] = None,
+    ) -> List[PETSc.Vec]:
+        if end_time is None:
+            end_time = self.num_steps
+        if end_time > self.num_steps:
+            raise ValueError(
+                f"end_time {end_time} exceeds trajectory length {self.num_steps}"
+            )
+
+        template = self.trajectory[0]
+        zero = template.duplicate()
+        zero.zeroEntries()
+
+        if self._tlm_solver is None:
+            mass_matrix = self._get_mass_matrix()
+            comm = template.getComm()
+            self._tlm_solver = ImplicitTLMSolver(self.dt, mass_matrix, comm)
+
+        perturbations = [zero.copy()]
+        delta_u_nm1 = zero.copy()
+        delta_u_n = zero.copy()
+
+        for n in range(start_time, end_time):
+            J = self._get_jacobian(n)
+            forcing = timestep_forcings[n] if n < len(timestep_forcings) else None
+            delta_u_next = self._tlm_solver.solve_tlm_step(
+                J,
+                delta_u_n,
+                delta_u_nm1,
+                timestep_forcing=forcing,
+            )
+            perturbations.append(delta_u_next.copy())
+            delta_u_nm1 = delta_u_n
+            delta_u_n = delta_u_next
+
+        zero.destroy()
+        return perturbations
 
 
 class FiniteDifferenceTLM:

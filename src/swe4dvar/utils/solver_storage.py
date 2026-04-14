@@ -26,6 +26,9 @@ class SolverStateStorage:
         self.saved_jacobians: List[PETSc.Mat] = []
         """List of Jacobian matrices from Newton solves (distributed)"""
 
+        self.saved_parameter_derivatives: List[List[PETSc.Vec]] = []
+        """Per-timestep residual derivatives ∂R_k/∂θ_i stored as PETSc vectors"""
+
         # Adjoint solve data
         self.saved_adjoints: List[PETSc.Mat] = []
         """List of adjoint Jacobian matrices (distributed)"""
@@ -72,6 +75,15 @@ class SolverStateStorage:
                 pass
         self.saved_adjoints.clear()
 
+        for derivative_row in self.saved_parameter_derivatives:
+            for vec in derivative_row:
+                try:
+                    if hasattr(vec, 'destroy') and callable(vec.destroy):
+                        vec.destroy()
+                except (PETSc.Error, RuntimeError, AttributeError):
+                    pass
+        self.saved_parameter_derivatives.clear()
+
     def save_state(self, state: np.ndarray):
         """Save a state vector.
 
@@ -99,6 +111,20 @@ class SolverStateStorage:
             adjoint: Adjoint matrix to save (will be copied)
         """
         self.saved_adjoints.append(adjoint.copy())
+
+    def save_parameter_derivatives(self, derivative_vectors: List[PETSc.Vec]):
+        """Save timestep residual derivatives with respect to parameters.
+
+        Args:
+            derivative_vectors: One residual-derivative vector per parameter.
+        """
+        copied = []
+        for vec in derivative_vectors:
+            if hasattr(vec, "copy"):
+                copied.append(vec.copy())
+            else:
+                copied.append(vec)
+        self.saved_parameter_derivatives.append(copied)
 
     def save_dry_nodes(self, dry_indices: np.ndarray):
         """Save dry node indices.
@@ -160,6 +186,10 @@ class SolverStateStorage:
         """Get number of saved adjoints."""
         return len(self.saved_adjoints)
 
+    def num_parameter_derivative_steps(self) -> int:
+        """Get number of timesteps with saved parameter derivatives."""
+        return len(self.saved_parameter_derivatives)
+
     def estimate_memory_mb(self) -> dict:
         """Estimate memory usage in MB for each storage component.
 
@@ -188,6 +218,17 @@ class SolverStateStorage:
             nnz = adj_info["nz_used"]
             estimates["adjoints"] = len(self.saved_adjoints) * nnz * 8 * bytes_to_mb
 
+        if self.saved_parameter_derivatives:
+            first_row = self.saved_parameter_derivatives[0]
+            if first_row:
+                vec_bytes = first_row[0].getLocalSize() * bytes_per_float
+                estimates["parameter_derivatives"] = (
+                    len(self.saved_parameter_derivatives)
+                    * len(first_row)
+                    * vec_bytes
+                    * bytes_to_mb
+                )
+
         # Wetting/drying data
         if self.dry_nodes:
             dry_bytes = sum(d.nbytes for d in self.dry_nodes)
@@ -211,5 +252,6 @@ class SolverStateStorage:
             f"states={self.num_states()}, "
             f"jacobians={self.num_jacobians()}, "
             f"adjoints={self.num_adjoints()}, "
+            f"parameter_derivatives={self.num_parameter_derivative_steps()}, "
             f"dry_nodes={len(self.dry_nodes)})"
         )
