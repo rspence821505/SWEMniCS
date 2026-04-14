@@ -61,7 +61,6 @@ config = TwinExperimentConfig(
     gradient_tolerance=1e-6,
     verbose=False,
     auto_inflate_B=True,
-    max_inflate_factor=3.0,
     predictability_gamma=5.0,
 )
 

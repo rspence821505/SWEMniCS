@@ -36,7 +36,7 @@ config = TwinExperimentConfig(
     method='dcwme', obs_fraction=0.5, obs_frequency=4,
     obs_noise_level=0.01, background_error_std=0.1,
     max_iterations=1, verbose=False,
-    auto_inflate_B=True, max_inflate_factor=3.0, predictability_gamma=5.0,
+    auto_inflate_B=True, predictability_gamma=5.0,
 )
 
 print("Running experiment...")

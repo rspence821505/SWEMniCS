@@ -146,7 +146,6 @@ class ComparisonRunner:
             "background_correlation_length": self.base_config.background_correlation_length,
             "l_wme_samples": self.base_config.l_wme_samples,
             "auto_inflate_B": self.base_config.auto_inflate_B,
-            "max_inflate_factor": self.base_config.max_inflate_factor,
             "predictability_gamma": self.base_config.predictability_gamma,
             "adaptive_gamma": self.base_config.adaptive_gamma,
         }
