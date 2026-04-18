@@ -85,6 +85,7 @@ class PETScTAOWrapper(Optimizer):
         self.n_func_evals = 0
         self.n_grad_evals = 0
         self._max_funcs = self.options.get("max_funcs", None)
+        self._last_grad = None
 
     def solve(self, x0: PETSc.Vec) -> PETSc.Vec:
         """
@@ -244,12 +245,16 @@ class PETScTAOWrapper(Optimizer):
             iter=int(tao.getIterationNumber()),
         )
         try:
-            # Enforce max function evaluations (PETSc's setMaximumFunctionEvaluations
-            # is not enforced by all TAO types like BLMVM)
+            # Max_funcs is enforced in the monitor callback (where
+            # setConvergedReason is respected). Here we just short-circuit
+            # to avoid expensive forward solves after the limit is hit.
+            # TAO will still call us a few more times before checking the
+            # monitor, but these calls are instant (no forward model).
             if self._max_funcs is not None and self.n_func_evals >= self._max_funcs:
-                if self.verbose and self.comm.rank == 0:
-                    print(f"  [TAO callback] max_funcs={self._max_funcs} reached, signaling convergence")
-                g.set(0.0)  # Zero gradient signals convergence to TAO
+                if hasattr(self, '_last_grad') and self._last_grad is not None:
+                    self._last_grad.copy(g)
+                else:
+                    g.set(0.0)
                 return self._last_cost if hasattr(self, '_last_cost') else 0.0
 
             # Use efficient combined method if available (avoids double forward solve)
@@ -262,7 +267,8 @@ class PETScTAOWrapper(Optimizer):
                 # Check for infinity (forward model failure)
                 if not np.isfinite(f):
                     if self.verbose and self.comm.rank == 0:
-                        print(f"  [TAO callback] eval #{self.n_func_evals}: cost=inf (forward model failure)")
+                        print(f"  [TAO callback] eval #{self.n_func_evals}: cost=inf (forward model failure)",
+                              flush=True)
                     # CRITICAL FIX: Don't set gradient to zero! TAO will think it converged.
                     # Instead, return background penalty gradient to push back toward m_b
                     if hasattr(self.cost_function, 'compute_background_gradient'):
@@ -275,6 +281,7 @@ class PETScTAOWrapper(Optimizer):
                     return 1e20
 
                 self._last_cost = f
+                self._last_grad = grad.copy()
                 gnorm = grad.norm()
                 self._profile(
                     "objective_gradient_end",
@@ -286,7 +293,8 @@ class PETScTAOWrapper(Optimizer):
                     mode="value_gradient",
                 )
                 if self.verbose and self.comm.rank == 0:
-                    print(f"  [TAO callback] eval #{self.n_func_evals}: cost={f:.6f}, ||grad||={gnorm:.4e}")
+                    print(f"  [TAO callback] eval #{self.n_func_evals}: cost={f:.6f}, ||grad||={gnorm:.4e}",
+                          flush=True)
 
                 # Copy gradient values into output vector g
                 # PETSc copy: source.copy(dest) copies FROM source TO dest
@@ -380,6 +388,11 @@ class PETScTAOWrapper(Optimizer):
         Custom monitor callback for consistent output format.
 
         Matches the output style of L-BFGS optimizer.
+        Also enforces max_funcs: TAO BLMVM ignores
+        setMaximumFunctionEvaluations, so we check here and set
+        the converged reason. The monitor runs after each TAO
+        iteration (not each line-search eval), where
+        setConvergedReason is respected.
         """
         iteration = tao.getIterationNumber()
         f = tao.getFunctionValue()
@@ -398,6 +411,14 @@ class PETScTAOWrapper(Optimizer):
             cost=float(f),
             grad_norm=float(gnorm),
         )
+
+        # Enforce max_funcs from the monitor (reliable, unlike the callback).
+        if self._max_funcs is not None and self.n_func_evals >= self._max_funcs:
+            if self.comm.rank == 0:
+                print(f"  [TAO monitor] max_funcs={self._max_funcs} reached at iter {iteration}, stopping",
+                      flush=True)
+            tao.setConvergedReason(PETSc.TAO.ConvergedReason.CONVERGED_USER)
+            return
 
         if self.comm.rank != 0:
             return

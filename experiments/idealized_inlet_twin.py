@@ -157,6 +157,10 @@ def generate_cartesian_vortex(
     ny = len(y_grid)
     nx = len(x_grid)
 
+    # Memory guard: 3 arrays of (nt, ny, nx) float64 + workspace
+    wind_bytes = 4 * nt * ny * nx * 8
+    _estimate_and_guard(f"wind field arrays ({nt}x{ny}x{nx})", wind_bytes)
+
     windx = np.zeros((nt, ny, nx))
     windy = np.zeros((nt, ny, nx))
     pressure = np.full((nt, ny, nx), config.p_ambient_Pa / 100.0)  # mbar
@@ -403,6 +407,9 @@ def main():
                         help="Memory limit in GB (default 8). Aborts if RSS exceeds this.")
     args = parser.parse_args()
 
+    global MEM_LIMIT_MB
+    MEM_LIMIT_MB = args.mem_limit_gb * 1024
+
     from mpi4py import MPI
     rank = MPI.COMM_WORLD.Get_rank()
 
@@ -430,6 +437,7 @@ def main():
     print(f"  Ramp: {args.nt_ramp} steps ({args.nt_ramp * args.dt / 3600:.1f}h)")
     print(f"  DA window: {args.nt_da} steps ({args.nt_da * args.dt / 3600:.1f}h)")
     print(f"  Total: {nt_total} steps ({nt_total * args.dt / 3600:.1f}h)")
+    print(f"  Memory limit: {args.mem_limit_gb:.1f} GB")
 
     # --- Step 1: Generate wind files ---
     if rank == 0:
@@ -476,25 +484,37 @@ def main():
 
     state_size = solver_truth.V.dofmap.index_map.size_local * solver_truth.V.dofmap.index_map_bs
     print(f"  State size: {state_size} DOFs")
+    _check_memory("after problem+solver construction")
+
+    # Memory estimate for trajectory storage
+    traj_bytes = (nt_total + 1) * state_size * 8
+    _estimate_and_guard(
+        f"truth trajectory ({nt_total+1} x {state_size} DOFs)", traj_bytes)
 
     # --- Step 3: Run truth and perturbed forward models ---
     t0 = time.time()
     truth_state, truth_traj = run_forward(
         prob_truth, solver_truth, solver_params, nt_total, "Truth")
+    _check_memory("after truth trajectory")
 
-    gc.collect()
+    _cleanup()
 
+    _estimate_and_guard(
+        f"perturbed trajectory ({nt_total+1} x {state_size} DOFs)", traj_bytes)
     pert_state, pert_traj = run_forward(
         prob_pert, solver_pert, solver_params, nt_total, "Perturbed")
+    _check_memory("after perturbed trajectory")
 
     print(f"  Total forward time: {time.time()-t0:.1f}s")
 
     # --- Step 4: Diagnostics ---
+    _check_memory("before diagnostics")
     obs_times = list(range(args.nt_ramp, nt_total + 1, args.obs_frequency))
     print(f"\n  Obs times: {obs_times} ({len(obs_times)} snapshots)")
 
     diag = compute_diagnostics(
         truth_traj, pert_traj, solver_truth, obs_times, args.obs_fraction)
+    _cleanup()
 
     print(f"\n{'='*60}")
     print("DIAGNOSTICS")

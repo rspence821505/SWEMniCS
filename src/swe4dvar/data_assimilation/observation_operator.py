@@ -35,14 +35,30 @@ def is_discontinuous_space(function_space) -> bool:
     try:
         basix_element = element.basix_element
     except RuntimeError:
-        # For mixed elements, basix_element raises RuntimeError
-        # Check if this is a mixed element with sub-elements
+        # For mixed elements, basix_element raises RuntimeError.
+        # Walk the sub-elements: if ANY is DG, treat the whole mixed
+        # space as DG (so the adjoint uses the multi-cell path).
+        # Previous code returned False for all mixed spaces, causing
+        # the adjoint to misclassify SWE's DG mixed space as CG.
         try:
-            if hasattr(element, "num_sub_elements") and element.num_sub_elements > 0:
-                # For mixed elements, return False - treat as CG
-                # This is safe because CG point evaluation works for both
+            n_sub = getattr(element, "num_sub_elements", 0)
+            if n_sub > 0:
+                for i in range(n_sub):
+                    sub_elem = function_space.sub(i).element
+                    try:
+                        sub_basix = sub_elem.basix_element
+                        if getattr(sub_basix, "discontinuous", False):
+                            return True
+                    except RuntimeError:
+                        # Nested mixed — recurse via the collapsed sub-space
+                        try:
+                            collapsed_sub, _ = function_space.sub(i).collapse()
+                            if is_discontinuous_space(collapsed_sub):
+                                return True
+                        except Exception:
+                            pass
                 return False
-        except:
+        except Exception:
             pass
         return False
 
@@ -290,6 +306,209 @@ class PointObservationOperator(ObservationOperator):
                 cells_all_per_point[i] for i in self._local_indices
             ]
 
+            # --- MPI parity fix for DG adjoint ---
+            # The adjoint must distribute each observation to ALL cells
+            # globally containing the point, not just this rank's LOCAL
+            # cells. Otherwise partition-boundary obs have partial
+            # contributions and the adjoint direction is partition-dependent.
+            #
+            # Critical: filter to OWNED cells only (exclude ghost cells)
+            # so we don't double-count: ghost cells are owned by another
+            # rank which will independently write to those cells' DOFs.
+            # Writing from both sides would double the contribution.
+            #
+            # Global cell count per point = sum of OWNED cells containing
+            # the point across all ranks (each cell counted exactly once).
+
+            # Get number of owned cells on this rank (rest are ghost)
+            tdim = self.mesh.topology.dim
+            cell_imap = self.mesh.topology.index_map(tdim)
+            n_cells_owned = cell_imap.size_local
+
+            # Filter local cells to OWNED only, per obs point
+            owned_cells_per_point = [
+                [c for c in cells_for_pt if c < n_cells_owned]
+                for cells_for_pt in cells_all_per_point
+            ]
+
+            # --- Basis-unity cell filter (MPI correctness for DG point obs) ---
+            # compute_colliding_cells returns cells whose geometry contains
+            # the point, but at partition boundaries DOLFINx may admit cells
+            # where the obs-point lies strictly inside the cell (not at a
+            # vertex) — often because adjacent ghost cells have bounding
+            # boxes extending over the vertex. Writing basis * value to
+            # those cells splatters the adjoint RHS across corners that
+            # aren't at the observation vertex.
+            #
+            # For VERTEX-located observations (our case: obs points are
+            # mesh vertices), a valid cell has exactly one basis value
+            # near 1 and the rest near 0 when evaluated at the point.
+            # Keep only cells satisfying this "one-hot" pattern.
+            #
+            # Tolerance: 1e-4 is loose enough to survive float error in
+            # point-in-reference-element mapping, tight enough to reject
+            # cells where the point is visibly interior (basis values
+            # ~1/3 in a uniform triangle center, or various splits along
+            # edges/medians).
+            bunity_tol = 1e-4
+            coord_tol = 1e-6  # tolerance (m) for DOF-coord vs obs-coord match
+            # Determine the sub-space to use for basis evaluation
+            if self.is_mixed:
+                comp_idx = self.components[0] if self.components else 0
+                bunity_sub_space = self.function_space.sub(comp_idx)
+                if self.sub_component is not None:
+                    bunity_sub_space = bunity_sub_space.sub(self.sub_component)
+            else:
+                bunity_sub_space = None
+
+            # Pre-build: (V-DOF index) -> (h-space coord) map for coord-match test
+            if bunity_sub_space is not None:
+                bunity_space, bunity_map = bunity_sub_space.collapse()
+            else:
+                bunity_space, bunity_map = self.function_space.collapse() if hasattr(self.function_space, "collapse") else (self.function_space, list(range(self.function_space.dofmap.index_map.size_local + self.function_space.dofmap.index_map.num_ghosts)))
+            bunity_map_arr = np.asarray(bunity_map, dtype=np.int64)
+            bunity_all_coords = bunity_space.tabulate_dof_coordinates()[:, :2]
+            bunity_v_to_h = {int(v): i for i, v in enumerate(bunity_map_arr)}
+
+            # For dofmap lookup we need the sub-space dofmap (mixed case) or self's dofmap
+            if bunity_sub_space is not None:
+                bunity_dofmap = bunity_sub_space.dofmap
+            else:
+                bunity_dofmap = self.function_space.dofmap
+
+            def _is_one_hot(bv):
+                n_near_one = int(np.sum(np.abs(np.asarray(bv) - 1.0) < bunity_tol))
+                n_near_zero = int(np.sum(np.abs(np.asarray(bv)) < bunity_tol))
+                return (n_near_one == 1) and (n_near_zero == len(bv) - 1)
+
+            filtered_owned = []
+            n_filtered_out = 0
+            n_filtered_wrong_vertex = 0
+            for i, cells_for_pt in enumerate(owned_cells_per_point):
+                if len(cells_for_pt) == 0:
+                    filtered_owned.append([])
+                    continue
+                pt_i = points[i]
+                pt_xy = np.asarray(pt_i[:2])
+                keep = []
+                for cell in cells_for_pt:
+                    try:
+                        if self.is_mixed:
+                            bv = self._evaluate_basis_at_point_mixed(
+                                pt_i, cell, bunity_sub_space
+                            )
+                        else:
+                            bv = self._evaluate_basis_at_point(pt_i, cell)
+                        if not _is_one_hot(bv):
+                            n_filtered_out += 1
+                            continue
+                        # Verify the one-hot DG DOF's coord matches obs point
+                        j_hot = int(np.argmax(np.asarray(bv)))
+                        cell_dofs = bunity_dofmap.cell_dofs(cell)
+                        dof = int(cell_dofs[j_hot])
+                        if dof in bunity_v_to_h:
+                            dof_coord = bunity_all_coords[bunity_v_to_h[dof]]
+                            if np.all(np.abs(dof_coord - pt_xy) < coord_tol):
+                                keep.append(cell)
+                            else:
+                                # Cell geometrically contains point but the
+                                # one-hot vertex is at a DIFFERENT coord —
+                                # reject to prevent adjoint splatter.
+                                n_filtered_wrong_vertex += 1
+                        else:
+                            n_filtered_out += 1
+                    except Exception:
+                        n_filtered_out += 1
+                filtered_owned.append(keep)
+
+            owned_cells_per_point = filtered_owned
+            self._my_owned_cells_per_point = owned_cells_per_point
+            self._n_cells_filtered_out = n_filtered_out
+            self._n_cells_filtered_wrong_vertex = n_filtered_wrong_vertex
+
+            # --- Coord-based DG DOF lookup (MPI-robust) ---
+            # For each obs point, find all OWNED DG DOFs on this rank whose
+            # spatial coordinate matches the obs point. These are the
+            # "correct" DG DOFs for vertex-located observations: one per
+            # cell sharing the vertex.
+            #
+            # This avoids issues with cell_dofs/basis ordering under MPI
+            # partitioning (where cell reordering can cause cell_dofs[j_hot]
+            # to refer to a DG DOF at a different vertex than expected).
+            n_owned_V = self.function_space.dofmap.index_map.size_local \
+                * self.function_space.dofmap.index_map_bs
+            # KD-tree over owned h-DOF coords
+            from scipy.spatial import cKDTree as _kd
+            owned_h_parent = []  # parent V-DOF indices for owned h
+            owned_h_coords = []
+            for vdof, hidx in bunity_v_to_h.items():
+                if vdof < n_owned_V:
+                    owned_h_parent.append(vdof)
+                    owned_h_coords.append(bunity_all_coords[hidx])
+            owned_h_parent = np.asarray(owned_h_parent, dtype=np.int64)
+            owned_h_coords = np.asarray(owned_h_coords)
+            if len(owned_h_coords) > 0:
+                self._owned_h_tree = _kd(owned_h_coords)
+                self._owned_h_parents = owned_h_parent
+            else:
+                self._owned_h_tree = None
+                self._owned_h_parents = owned_h_parent
+
+            # Per-obs: owned DG DOFs at the obs coord (coord match)
+            obs_local_dofs = []
+            for i in range(self.n_obs):
+                pt_xy = np.asarray(points[i][:2])
+                if self._owned_h_tree is not None:
+                    dists, idxs = self._owned_h_tree.query(
+                        pt_xy, k=min(20, len(owned_h_coords))
+                    )
+                    if np.isscalar(dists):
+                        dists = np.array([dists]); idxs = np.array([idxs])
+                    matching = idxs[dists < coord_tol]
+                    obs_local_dofs.append([int(self._owned_h_parents[m]) for m in matching])
+                else:
+                    obs_local_dofs.append([])
+            self._obs_owned_h_dofs = obs_local_dofs
+
+            # Global count of DG DOFs at each obs vertex (allreduce)
+            local_dof_count = np.array(
+                [len(d) for d in obs_local_dofs], dtype=np.int64
+            )
+            global_dof_count = np.zeros_like(local_dof_count)
+            self.comm.Allreduce(local_dof_count, global_dof_count, op=MPI.SUM)
+            self._obs_global_dof_count = global_dof_count
+
+            import os as _os
+            if _os.environ.get("SWE4DVAR_OBS_ADJ_DEBUG", "0") == "1":
+                n_kept = sum(len(c) for c in owned_cells_per_point)
+                n_dof_total = int(np.sum(local_dof_count))
+                # Count unique DOFs we'll write to
+                all_my_write_dofs = set()
+                for dof_list in obs_local_dofs:
+                    for d in dof_list:
+                        all_my_write_dofs.add(int(d))
+                # Check how many are < n_owned_V (owned V-DOFs)
+                n_in_owned = sum(1 for d in all_my_write_dofs if d < n_owned_V)
+                print(f"  [obs_adj_debug] rank{self.comm.Get_rank()} cell filter: "
+                      f"kept={n_kept}, filtered_out={n_filtered_out}, "
+                      f"filtered_wrong_vertex={n_filtered_wrong_vertex}, "
+                      f"obs_DOF_lookup_total={n_dof_total}, "
+                      f"unique_write_dofs={len(all_my_write_dofs)}, "
+                      f"in_owned_V={n_in_owned}, n_owned_V={n_owned_V}", flush=True)
+
+            # Global cell count = sum of OWNED cell counts (no double-count)
+            local_n_owned = np.array(
+                [len(c) for c in owned_cells_per_point], dtype=np.int64
+            )
+            global_n_cells = np.zeros_like(local_n_owned)
+            self.comm.Allreduce(local_n_owned, global_n_cells, op=MPI.SUM)
+            self._global_n_cells = global_n_cells
+
+            # Indices of obs points this rank has ANY OWNED cell for
+            self._indices_with_owned_cells = [
+                i for i in range(self.n_obs) if len(owned_cells_per_point[i]) > 0
+            ]
+
     def forward(self, state: PETSc.Vec) -> PETSc.Vec:
         """
         Extract point values from state.
@@ -501,20 +720,94 @@ class PointObservationOperator(ObservationOperator):
             sub_dofmap = None
 
         if self.is_dg:
-            # DG: Distribute to ALL cells containing each point
-            for local_idx, global_idx in enumerate(self._local_indices):
-                point = self._local_points[local_idx]
-                cells = self._local_cells_all[local_idx]  # ALL cells
+            # DG: Distribute to ALL cells globally containing each point.
+            #
+            # MPI parity fix: iterate over EVERY point that has ANY local
+            # cell on this rank (not just owned points), and use the
+            # GLOBAL cell count as the divisor. Each rank writes to its
+            # local cells' DOFs; together all ranks produce the same
+            # distribution as serial.
+            # --- COORD-LOOKUP PATH (MPI-robust DG adjoint) ---
+            # For each obs point, identify OWNED DG DOFs at the obs
+            # coordinate (precomputed in _setup_parallel_point_location).
+            # Write innov/global_n_dofs to each. Avoids cell-iteration
+            # pitfalls where cell_dofs[j_hot] under MPI may refer to a DG
+            # DOF at a vertex different from the observation point.
+            if hasattr(self, "_obs_owned_h_dofs") and self.dg_averaging != "first":
+                import os as _dbg_os
+                dbg_on = _dbg_os.environ.get("SWE4DVAR_OBS_ADJ_DEBUG", "0") == "1"
+                n_writes = 0
+                unique_dofs_written = set()
+                for global_idx in range(self.n_obs):
+                    my_dofs = self._obs_owned_h_dofs[global_idx]
+                    if len(my_dofs) == 0:
+                        continue
+                    global_n_dofs = int(self._obs_global_dof_count[global_idx])
+                    if global_n_dofs == 0:
+                        global_n_dofs = len(my_dofs)
+                    weight = 1.0 / global_n_dofs
+                    value = innov_array[global_idx]
+                    for dof in my_dofs:
+                        adj_state.setValueLocal(
+                            int(dof),
+                            value * weight,
+                            addv=PETSc.InsertMode.ADD,
+                        )
+                        n_writes += 1
+                        unique_dofs_written.add(int(dof))
+                adj_state.assemble()
+                if dbg_on:
+                    arr = adj_state.getArray()
+                    n_nonzero_pre = int(np.sum(np.abs(arr) > 1e-12))
+                    print(f"  [obs_adj_debug] rank{self.comm.Get_rank()} "
+                          f"writes={n_writes} unique_dofs={len(unique_dofs_written)} "
+                          f"nonzero_after_assemble={n_nonzero_pre}", flush=True)
+                adj_state.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+                adj_state.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+                if dbg_on:
+                    arr = adj_state.getArray()
+                    n_nonzero_post = int(np.sum(np.abs(arr) > 1e-12))
+                    print(f"  [obs_adj_debug] rank{self.comm.Get_rank()} "
+                          f"nonzero_after_scatter={n_nonzero_post}", flush=True)
+                return adj_state
+
+            # Fallback: cell-iteration path (dg_averaging="first" or legacy)
+            if hasattr(self, "_indices_with_owned_cells"):
+                iter_list = [
+                    (gi, self._my_owned_cells_per_point[gi])
+                    for gi in self._indices_with_owned_cells
+                ]
+                use_global_count = True
+            else:
+                iter_list = [
+                    (gi, self._local_cells_all[li])
+                    for li, gi in enumerate(self._local_indices)
+                ]
+                use_global_count = False
+
+            # The point coord lookup: for owned points we have _local_points
+            # keyed by local_idx; for non-owned we rebuild from self.obs_points.
+            for global_idx, cells in iter_list:
+                # Coord for this obs point (3D)
+                pt3 = np.zeros(3)
+                pt3[:self.obs_points.shape[1]] = self.obs_points[global_idx, :self.obs_points.shape[1]]
+                point = pt3
                 value = innov_array[global_idx]
 
                 if len(cells) == 0:
                     continue
 
                 # Weight for distributing to multiple cells
-                # Must use 1/n_cells to maintain adjoint consistency
+                # Must use 1/(global n_cells) for MPI parity
                 if self.dg_averaging == "first":
                     weight = 1.0
                     cells_to_use = [cells[0]]
+                elif use_global_count:
+                    global_n = int(self._global_n_cells[global_idx])
+                    if global_n == 0:
+                        global_n = len(cells)  # safety
+                    weight = 1.0 / global_n
+                    cells_to_use = cells
                 else:
                     weight = 1.0 / len(cells)
                     cells_to_use = cells
@@ -525,7 +818,7 @@ class PointObservationOperator(ObservationOperator):
                         cell_dofs = sub_dofmap.cell_dofs(cell)
                         basis_values = self._evaluate_basis_at_point_mixed(point, cell, sub_space)
                         for j, dof in enumerate(cell_dofs):
-                            adj_state.setValue(
+                            adj_state.setValueLocal(
                                 dof,
                                 value * basis_values[j] * weight,
                                 addv=PETSc.InsertMode.ADD,
@@ -542,14 +835,14 @@ class PointObservationOperator(ObservationOperator):
                                 dof_component = j % bs
                                 if dof_component == self.components[0]:
                                     basis_idx = j // bs
-                                    adj_state.setValue(
+                                    adj_state.setValueLocal(
                                         cell_dofs[j],
                                         value * basis_values[basis_idx] * weight,
                                         addv=PETSc.InsertMode.ADD,
                                     )
                         else:
                             for j, dof in enumerate(cell_dofs):
-                                adj_state.setValue(
+                                adj_state.setValueLocal(
                                     dof,
                                     value * basis_values[j] * weight,
                                     addv=PETSc.InsertMode.ADD,
@@ -566,7 +859,7 @@ class PointObservationOperator(ObservationOperator):
                     cell_dofs = sub_dofmap.cell_dofs(cell)
                     basis_values = self._evaluate_basis_at_point_mixed(point, cell, sub_space)
                     for j, dof in enumerate(cell_dofs):
-                        adj_state.setValue(
+                        adj_state.setValueLocal(
                             dof,
                             value * basis_values[j],
                             addv=PETSc.InsertMode.ADD,
@@ -583,7 +876,7 @@ class PointObservationOperator(ObservationOperator):
                             dof_component = j % bs
                             if dof_component == self.components[0]:
                                 basis_idx = j // bs
-                                adj_state.setValue(
+                                adj_state.setValueLocal(
                                     cell_dofs[j],
                                     value * basis_values[basis_idx],
                                     addv=PETSc.InsertMode.ADD,
@@ -591,7 +884,7 @@ class PointObservationOperator(ObservationOperator):
                     else:
                         # Scalar space - distribute to all DOFs
                         for j, dof in enumerate(cell_dofs):
-                            adj_state.setValue(
+                            adj_state.setValueLocal(
                                 dof, value * basis_values[j], addv=PETSc.InsertMode.ADD
                             )
 

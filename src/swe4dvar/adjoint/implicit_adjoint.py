@@ -116,6 +116,7 @@ class ImplicitAdjointSolver:
         uy_dof_indices: Optional[set] = None,  # NEW: Indices of uy DOFs (for full (∂Q/∂u)^T)
         bc_dof_indices: Optional[set] = None,  # NEW: Indices of Dirichlet BC DOFs
         theta: Optional[float] = None,  # NEW: Theta blending parameter for BDF2/BE
+        adjoint_regularization: float = 0.0,  # NEW: shift εI on transpose solve for stability
     ):
         """
         Initialize implicit adjoint solver.
@@ -234,6 +235,19 @@ class ImplicitAdjointSolver:
             else:
                 theta = 1.0  # Default to pure BDF2 (backward compatible)
         self.theta = theta
+
+        # Adjoint regularization: add εI to J before solving (J+εI)^T λ = f.
+        # Damps near-null directions so direct solvers pick consistent solutions
+        # across serial and distributed runs. Default 0.0 = no regularization.
+        # Env var SWE4DVAR_ADJOINT_REG overrides the constructor default.
+        import os
+        env_reg = os.environ.get("SWE4DVAR_ADJOINT_REG")
+        if env_reg is not None:
+            try:
+                adjoint_regularization = float(env_reg)
+            except ValueError:
+                pass
+        self.adjoint_regularization = float(adjoint_regularization)
 
         # Flux formulation handling
         self.flux_formulation = flux_formulation
@@ -846,13 +860,20 @@ class ImplicitAdjointSolver:
         n_regularized = int(np.sum(tiny_mask))
         diag.destroy()
 
-        # If regularization needed, create a shifted copy of J for the solve.
+        # Two regularizations combined into one shifted copy of J:
+        # 1. Dry-node regularization: set J[i,i] = 1 for near-zero diagonals
+        # 2. Global adjoint regularization: add εI to J (damps near-null directions
+        #    so serial and distributed LU/MUMPS converge to the same solution)
         # Do NOT modify J in-place — it's shared across multiple adjoint solves.
-        if n_regularized > 0:
+        eps = self.adjoint_regularization
+        if n_regularized > 0 or eps > 0:
             J_reg = J.copy()
             shift_diag = J_reg.getDiagonal()
             shift_arr = shift_diag.getArray()
-            shift_arr[tiny_mask] = 1.0  # Set dry-node diag to 1 (identity block)
+            if n_regularized > 0:
+                shift_arr[tiny_mask] = 1.0  # Dry-node identity block
+            if eps > 0:
+                shift_arr = shift_arr + eps  # Global εI
             shift_diag.setArray(shift_arr)
             J_reg.setDiagonal(shift_diag)
             J_reg.assemble()
@@ -864,16 +885,46 @@ class ImplicitAdjointSolver:
 
         lambda_n = forcing.duplicate()
 
-        # --- Strategy 1: Direct LU (fast, exact when it works) ---
-        ksp = PETSc.KSP().create(J_solve.getComm())
-        ksp.setOperators(J_solve)
-        ksp.setType(PETSc.KSP.Type.PREONLY)
-        ksp.getPC().setType(PETSc.PC.Type.LU)
-        ksp.setErrorIfNotConverged(False)
+        # Iterative-solve override: env var SWE4DVAR_ADJOINT_ITERATIVE=1 forces
+        # GMRES+ILU with tight tolerance instead of LU. Iterative Krylov methods
+        # converge to the solution in the residual-norm sense, which tends to
+        # be more reproducible across distribution layouts than direct LU
+        # (which is sensitive to pivoting order and null-space projections).
+        import os
+        force_iter = os.environ.get("SWE4DVAR_ADJOINT_ITERATIVE", "0") == "1"
 
-        ksp.solveTranspose(forcing, lambda_n)
-        reason = ksp.getConvergedReason()
-        ksp.destroy()
+        if force_iter:
+            ksp = PETSc.KSP().create(J_solve.getComm())
+            ksp.setOperators(J_solve)
+            ksp.setType(PETSc.KSP.Type.GMRES)
+            # Use block Jacobi with ILU sub-blocks in MPI (ILU alone doesn't
+            # work on mpiaij matrices in PETSc). In serial, this is equivalent
+            # to plain ILU.
+            comm_size = J_solve.getComm().getSize()
+            pc = ksp.getPC()
+            if comm_size > 1:
+                pc.setType(PETSc.PC.Type.BJACOBI)
+            else:
+                pc.setType(PETSc.PC.Type.ILU)
+            iter_rtol = float(os.environ.get("SWE4DVAR_ADJOINT_ITER_RTOL", "1e-10"))
+            iter_atol = float(os.environ.get("SWE4DVAR_ADJOINT_ITER_ATOL", "1e-14"))
+            iter_maxit = int(os.environ.get("SWE4DVAR_ADJOINT_ITER_MAXIT", "5000"))
+            ksp.setTolerances(rtol=iter_rtol, atol=iter_atol, max_it=iter_maxit)
+            ksp.setErrorIfNotConverged(False)
+            ksp.solveTranspose(forcing, lambda_n)
+            reason = ksp.getConvergedReason()
+            ksp.destroy()
+        else:
+            # --- Strategy 1: Direct LU (fast, exact when it works) ---
+            ksp = PETSc.KSP().create(J_solve.getComm())
+            ksp.setOperators(J_solve)
+            ksp.setType(PETSc.KSP.Type.PREONLY)
+            ksp.getPC().setType(PETSc.PC.Type.LU)
+            ksp.setErrorIfNotConverged(False)
+
+            ksp.solveTranspose(forcing, lambda_n)
+            reason = ksp.getConvergedReason()
+            ksp.destroy()
 
         # --- Strategy 2: GMRES + ILU fallback if LU failed ---
         if reason < 0:

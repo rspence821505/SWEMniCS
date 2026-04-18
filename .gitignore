@@ -179,6 +179,20 @@ outputs/figures/*
 outputs/checkpoints/*
 outputs/data/*
 !outputs/**/.gitkeep
+results/
+
+# -----------------------------------------------------------------------------
+# LaTeX build artifacts
+# -----------------------------------------------------------------------------
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.bbl
+*.blg
 
 # -----------------------------------------------------------------------------
 # Documentation build

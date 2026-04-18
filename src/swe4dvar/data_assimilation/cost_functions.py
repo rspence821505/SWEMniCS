@@ -632,10 +632,17 @@ class FourDVarCost(CostFunction):
         # Smoothing filters high-frequency components from the adjoint gradient,
         # producing search directions that stay within Newton's convergence basin.
         # This is equivalent to B-preconditioning when B has spatial correlation.
+        #
+        # The smoother can be either:
+        #   - a callable(numpy_array) -> numpy_array (legacy, local-only)
+        #   - a callable with .apply(petsc_vec) -> None (distributed, ghost-aware)
         if self.gradient_smoother is not None:
-            arr = grad.getArray().copy()
-            arr = self.gradient_smoother(arr)
-            grad.setArray(arr)
+            if hasattr(self.gradient_smoother, 'apply'):
+                self.gradient_smoother.apply(grad)
+            else:
+                arr = grad.getArray().copy()
+                arr = self.gradient_smoother(arr)
+                grad.setArray(arr)
 
         return cost, grad
 

@@ -229,9 +229,47 @@ class CustomNewtonProblem:
                 if self.comm.rank == 0:
                     print(f"  Linear solver diverged at timestep {timestep}, "
                           f"Newton iteration {i+1}: convergence code {linear_convergence}")
+
+                # Fallback: try direct LU if iterative solver failed
+                if self.pc_type != "lu":
+                    if self.comm.rank == 0:
+                        print(f"  Retrying Newton iteration {i+1} with direct LU solver...")
+                    fallback_ksp = PETSc.KSP().create(self.comm)
+                    fallback_ksp.setOperators(A)
+                    fallback_ksp.setType(PETSc.KSP.Type.PREONLY)
+                    fallback_ksp.getPC().setType(PETSc.PC.Type.LU)
+                    fallback_ksp.setErrorIfNotConverged(False)
+                    fallback_ksp.solve(L, dx.x.petsc_vec)
+                    lu_reason = fallback_ksp.getConvergedReason()
+                    fallback_ksp.destroy()
+
+                    if lu_reason >= 0:
+                        # LU succeeded — continue Newton iteration
+                        if self.comm.rank == 0:
+                            print(f"  LU fallback succeeded")
+                        dx.x.scatter_forward()
+                        u.x.array[:] += relaxation_parameter * dx.x.array[:]
+                        i += 1
+                        if i == 1:
+                            self.dx_0_norm = dx.x.petsc_vec.norm(0)
+                        if self.dx_0_norm > 1e-8:
+                            dx.x.array[:] = np.array(dx.x.array[:] / self.dx_0_norm)
+                        dx.x.petsc_vec.assemble()
+                        correction_norm = dx.x.petsc_vec.norm(0)
+                        self.diagnostics.log_iteration(
+                            iteration=i, residual_norm=residual_norm,
+                            correction_norm=correction_norm,
+                            linear_iterations=0,
+                        )
+                        if correction_norm < self.atol:
+                            converged = True
+                            break
+                        continue
+                    else:
+                        if self.comm.rank == 0:
+                            print(f"  LU fallback also failed (reason={lu_reason})")
+
                 # Rebuild KSP to recover from corrupted factorization state
-                # (e.g., MUMPS INFOG=-9 leaves the PC in a broken state that
-                # causes all subsequent solves to hang)
                 self._setup_ksp()
                 break
 
