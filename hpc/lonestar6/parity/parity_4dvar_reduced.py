@@ -178,6 +178,39 @@ def run_parity_4dvar(config=CONFIG):
     grad_linf_local = float(np.max(np.abs(grad_arr))) if grad_arr.size else 0.0
     grad_linf_global = comm.allreduce(grad_linf_local, op=MPI.MAX)
 
+    # --- Adjoint-vs-FD gradient check (serial only, cheap) ---------------
+    # On 5 deterministic interior DOFs, compute a central FD gradient at
+    # epsilon=1e-6 and report the max relative error against the adjoint.
+    # This replaces validation_ladder.py exp-1 for environments where
+    # adios4dolfinx / MPI-ADIOS2 is unavailable.
+    fd_rel_errs = []
+    fd_check = {}
+    if comm.size == 1:
+        eps = 1e-6
+        n_check = min(5, grad_arr.size)
+        test_dofs = list(range(n_check))
+        m_arr = m_true.getArray().copy()
+        for dof in test_dofs:
+            m_plus = m_true.duplicate()
+            a_plus = m_arr.copy(); a_plus[dof] += eps; m_plus.setArray(a_plus)
+            m_minus = m_true.duplicate()
+            a_minus = m_arr.copy(); a_minus[dof] -= eps; m_minus.setArray(a_minus)
+            cost_function.clear_cache(); J_plus = float(cost_function.value(m_plus))
+            cost_function.clear_cache(); J_minus = float(cost_function.value(m_minus))
+            fd_val = (J_plus - J_minus) / (2.0 * eps)
+            adj_val = float(grad_arr[dof])
+            denom = max(abs(adj_val), abs(fd_val), 1e-300)
+            rel_err = abs(adj_val - fd_val) / denom
+            fd_rel_errs.append(rel_err)
+            m_plus.destroy(); m_minus.destroy()
+        fd_check = {
+            "eps": eps,
+            "n_dofs_checked": n_check,
+            "fd_max_rel_err": max(fd_rel_errs),
+            "fd_mean_rel_err": sum(fd_rel_errs) / len(fd_rel_errs),
+            "fd_passed": all(r < 1e-3 for r in fd_rel_errs),
+        }
+
     # Trajectory summary (final state L2 norm, global)
     # Trajectory entries may be PETSc Vec or dolfinx Function depending on project version.
     last = trajectory[-1]
@@ -210,6 +243,8 @@ def run_parity_4dvar(config=CONFIG):
         "obs_l2_global": obs_l2_global,
         # First 3 gradient values on rank 0 for bit-level spot-check
         "grad_head_rank0": [float(x) for x in grad_arr[:3]] if rank == 0 else None,
+        # Adjoint vs FD check (serial only)
+        "fd_check": fd_check,
         # Config echo for traceability
         "config": config,
     }
