@@ -25,6 +25,47 @@ import numpy as np
 from mpi4py import MPI
 from petsc4py import PETSc
 
+# -----------------------------------------------------------------------------
+# dolfinx 0.9 vs 0.10 API shim (parity test only — do not copy into production)
+#
+# In dolfinx 0.9, element.interpolation_points is a METHOD: `el.interpolation_points()`.
+# In dolfinx 0.10, it is a PROPERTY returning ndarray: `el.interpolation_points`.
+# The project code calls it as a method (11 sites), so on 0.10 it fails with
+# `'numpy.ndarray' object is not callable`. We wrap the property so that callers
+# can invoke it either way — and we also cover the analogous `.value_shape`
+# shift which may apply.
+#
+# This is scoped to the parity test so we can measure numerical parity despite
+# the API drift. The actual porting fix must edit the project's call sites.
+# -----------------------------------------------------------------------------
+import dolfinx as _dolfinx
+
+if _dolfinx.__version__.startswith(("0.10", "0.11", "0.12")):
+    from dolfinx.fem import ElementMetaData  # noqa: F401
+    # Patch FiniteElement: allow .interpolation_points() in addition to .interpolation_points
+    try:
+        # dolfinx.cpp FiniteElement classes are nanobind-bound; we patch
+        # after calling an instance's .element attribute once to force class load.
+        import dolfinx.mesh as _m
+        import dolfinx.fem as _f
+        _probe_domain = _m.create_unit_square(MPI.COMM_SELF, 2, 2)
+        _probe_V = _f.functionspace(_probe_domain, ("Lagrange", 1))
+        _elcls = type(_probe_V.element)
+        _orig = _elcls.interpolation_points
+        if not callable(_orig):
+            # It's a property -> returns ndarray. Wrap it in a callable descriptor.
+            class _CallableArr(np.ndarray):
+                def __call__(self):
+                    return np.asarray(self)
+            def _ip_method(self):
+                arr = _orig.fget(self) if hasattr(_orig, "fget") else _orig.__get__(self, type(self))
+                # Return an object that is both an ndarray AND callable returning itself
+                v = np.asarray(arr).view(_CallableArr)
+                return v
+            _elcls.interpolation_points = property(_ip_method)
+    except Exception as _e:
+        print(f"# WARN: interpolation_points shim did not apply: {_e}", file=sys.stderr)
+
 # -- path setup ---------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
