@@ -2,6 +2,18 @@
 
 **Verified**: 2026-04-21 | **Host**: `login1.ls6.tacc.utexas.edu` | **User**: `tg876971`
 
+**Final verification on login node, 4 MPI ranks** (2026-04-21):
+```
+$ mpiexec -n 4 python hpc/lonestar6/environment/test_mpi.py
+[rank 0/4] [rank 1/4] [rank 2/4] [rank 3/4] all on login1
+allreduce sum of ranks+1 = 10  (expected 10)  OK
+MPI library: Intel(R) MPI Library 2021.12 for Linux* OS
+
+$ mpiexec -n 4 python hpc/lonestar6/environment/test_dolfinx.py
+dolfinx 0.10.0.post5, petsc4py (3, 22, 4), mpi4py ranks=4
+Poisson solved. global max(u) = 0.072783   OK
+```
+
 This is the **minimal working configuration** for `dolfinx 0.10` on LS6.
 Every line has been executed on the live system; nothing is aspirational.
 
@@ -85,8 +97,16 @@ export PETSC_ARCH=
 python -m pip install --no-cache-dir --no-build-isolation \
     --no-binary=petsc4py "petsc4py==3.22.*"
 
-# 6) FEniCSx Python: basix/ffcx/ufl are pure Python (binary wheels fine).
-python -m pip install "fenics-basix==0.10.*" "fenics-ufl>=2024.2.0" "fenics-ffcx==0.10.*"
+# 6) FEniCSx Python — IMPORTANT: basix and ffcx Python packages MUST come from
+#    the GitHub tag that matches the TACC C++ modules (`basix/0.10.0.post0`,
+#    `ffcx/0.10.1.post0`), NOT from PyPI. PyPI only has `fenics-basix==0.10.0`
+#    which is ABI-incompatible with dolfinx built against `0.10.0.post0`.
+#    (See FAILURE_LOG.md #9.)
+python -m pip install "fenics-ufl==2025.2.*"   # pure python, PyPI is fine
+python -m pip install --no-build-isolation \
+    "git+https://github.com/FEniCS/basix.git@v0.10.0.post0#subdirectory=python"
+python -m pip install --no-build-isolation \
+    "git+https://github.com/FEniCS/ffcx.git@v0.10.1.post0"
 
 # 7) dolfinx Python bindings — NOT on PyPI; install from GitHub at matching tag.
 #    CMAKE_PREFIX_PATH must include spdlog too (transitive dep of DOLFINXConfig.cmake).
@@ -113,6 +133,10 @@ module load gcc/13.2.0 impi/21.12 python/3.12.11 \
             basix/0.10.0.post0 ffcx/0.10.1.post0 \
             petsc/3.22 dolfinx/0.10.0.post5
 source $WORK/venvs/fenics-ls6/bin/activate
+
+# CRITICAL for direct `python` or `mpiexec python` (but NOT for `ibrun`, which handles this):
+# The MPI-4.0 symbols PETSc needs live in lib/release, not lib/.
+export LD_LIBRARY_PATH=$I_MPI_ROOT/lib/release:$LD_LIBRARY_PATH
 ```
 
 Save that in `$WORK/SWEMniCS/env.ls6.sh` so it's one line to source:

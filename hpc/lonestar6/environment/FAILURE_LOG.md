@@ -299,5 +299,44 @@ Always verify with `nm -D` which MPI library actually has the symbols your appli
 | 6 | `pip install petsc4py` (default build-isolation) | Cython 3.2.4 `ExpressionWriter` crash | Build-dep skew |
 | 7 | petsc4py with setuptools 80+ | `TypeError: execute() got unexpected kwarg 'dry_run'` | Upstream API removal |
 | 8 | Build with impi/21.11 (module spider says OK) | `undefined symbol: MPI_Neighbor_alltoallv_init` | **Module metadata error** |
+| 9 | fenics-basix==0.10.0 (PyPI) vs dolfinx built on TACC basix/0.10.0.post0 | `TypeError: CppElement incompatible function arguments` | **Basix Py/C++ patch-version skew** |
+
+---
+
+## Naive Attempt #9 — PyPI basix 0.10.0 vs dolfinx built against TACC basix 0.10.0.post0
+
+### Context
+Full install succeeded. Imports worked serially. Then running `fem.functionspace(domain, ("Lagrange", 1))` on 4 ranks:
+
+### Raw error
+```
+File "dolfinx/fem/function.py", line 619, in functionspace
+    return FiniteElement(CppElement(basix_e, value_shape, ufl_e.is_symmetric))
+TypeError: __init__(): incompatible function arguments. The following argument types are supported:
+    1. __init__(self, element: basix::FiniteElement<double>, ...)
+    2. __init__(self, elements: collections.abc.Sequence[dolfinx.cpp.fem.FiniteElement_float64])
+    3. __init__(self, cell_type: dolfinx.cpp.mesh.CellType, ...)
+
+Invoked with types: dolfinx.cpp.fem.FiniteElement_float64, basix._basixcpp.FiniteElement_float64, NoneType, bool
+```
+
+### Root cause
+- `fenics-basix 0.10.0` (PyPI, latest available) bundles basix C++ library at version 0.10.0.
+- `fenics-dolfinx 0.10.0.post5` (GitHub tag) was built against TACC's `basix/0.10.0.post0` C++ library.
+- nanobind-generated Python bindings carry type IDs that depend on the exact C++ class layout. Basix 0.10.0 and 0.10.0.post0 have subtly different class signatures (`block_shape` default, `symmetric` flag), so the dolfinx binding rejects Python objects coming from the "wrong" basix.
+
+### Fix
+Reinstall `fenics-basix` from the matching tag:
+```
+pip install --force-reinstall --no-build-isolation \
+    "git+https://github.com/FEniCS/basix.git@v0.10.0.post0#subdirectory=python"
+```
+This builds basix C++ at `0.10.0.post0` to match dolfinx, and installs Python bindings that talk to that library.
+
+### Classification
+**PATCH-VERSION ABI SKEW**. The user-facing version string is `0.10.0` in both; only the "post0" suffix distinguishes them. PyPI does not carry post-release tags. You can only get them from GitHub. No `pip install fenics-*==0.10.*` command will produce a consistent stack on LS6 without specifying git tags explicitly.
+
+### Moral
+For FEniCSx on TACC systems, **all four Python packages** (basix, ufl, ffcx, dolfinx) must be installed from the exact GitHub tags that match the TACC module versions. PyPI is a trap.
 
 See `DEPENDENCY_GRAPH.md` for the causal chain and `WHY_IT_BROKE.md` for the root-cause narrative.
