@@ -18,6 +18,11 @@ from .augmented_control import (
     ParameterSensitivityBundle,
 )
 
+# ADCIRC readers require adios4dolfinx with MPI-enabled ADIOS2. On
+# environments where only a serial ADIOS2 is available (e.g. pip's
+# `adios2` wheel in the LS6 venv), that dependency raises `ImportError`
+# at module load. Catch both `ModuleNotFoundError` and `ImportError` so
+# the non-ADCIRC problem classes remain available.
 try:
     from .ADCIRC_2_FENICS import ADCIRCMesh
     from .adcirc_problem import (
@@ -25,65 +30,44 @@ try:
         ADCIRCProblem,
         ADCIRCTidalPotential,
     )
-    from .newton import (
-        CustomNewtonProblem,
-        ElementBlockPreconditioner,
-        NewtonSolver,
-    )
-    from .problems import (
-        BaseProblem,
-        ConvergenceProblem,
-        DamProblem,
-        FrictionLaw,
-        IdealizedInlet,
-        RainProblem,
-        SlopedBeachProblem,
-        TidalProblem,
-        WellBalancedProblem,
-    )
-    from .solvers import (
-        BaseSolver,
-        CGImplicit,
-        DGSolver,
-        DGCGImplicit,
-        DGImplicit,
-        DGImplicitNonConservative,
-        SUPGImplicit,
-        get_solver,
-    )
-    from .variational_forms import (
-        LinearizedVariationalForm,
-        SWEVariationalForm,
-        VariationalForm,
-    )
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     ADCIRCMesh = None
     ADCIRCBoundaries = None
     ADCIRCProblem = None
     ADCIRCTidalPotential = None
-    BaseProblem = None
-    TidalProblem = None
-    IdealizedInlet = None
-    WellBalancedProblem = None
-    RainProblem = None
-    DamProblem = None
-    ConvergenceProblem = None
-    SlopedBeachProblem = None
-    FrictionLaw = None
-    BaseSolver = None
-    DGSolver = None
-    DGImplicit = None
-    DGImplicitNonConservative = None
-    DGCGImplicit = None
-    CGImplicit = None
-    SUPGImplicit = None
-    get_solver = None
-    CustomNewtonProblem = None
-    ElementBlockPreconditioner = None
-    NewtonSolver = None
-    VariationalForm = None
-    SWEVariationalForm = None
-    LinearizedVariationalForm = None
+
+# These do NOT depend on ADIOS2 and must always load.
+from .newton import (
+    CustomNewtonProblem,
+    ElementBlockPreconditioner,
+    NewtonSolver,
+)
+from .problems import (
+    BaseProblem,
+    ConvergenceProblem,
+    DamProblem,
+    FrictionLaw,
+    IdealizedInlet,
+    RainProblem,
+    SlopedBeachProblem,
+    TidalProblem,
+    WellBalancedProblem,
+)
+from .solvers import (
+    BaseSolver,
+    CGImplicit,
+    DGSolver,
+    DGCGImplicit,
+    DGImplicit,
+    DGImplicitNonConservative,
+    SUPGImplicit,
+    get_solver,
+)
+from .variational_forms import (
+    LinearizedVariationalForm,
+    SWEVariationalForm,
+    VariationalForm,
+)
 
 __all__ = [
     # ADCIRC utilities
