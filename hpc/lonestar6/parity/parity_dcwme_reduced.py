@@ -91,8 +91,10 @@ def run_parity_dcwme(config=CONFIG):
         observations=[obs_perturbed],
         obs_times=[len(trajectory) - 1],
         comm=comm,
-        # DC-WME-specific knobs: use static L_wme, no TLM build (parity test is small)
-        l_wme_mode="static",
+        # Use defaults (static L_wme implicit for a single obs time)
+        auto_inflate_B=False,        # keep B fixed so background term is deterministic
+        adaptive_gamma=False,        # disable gamma tuning for parity
+        predictability_gamma=0.1,
     )
 
     cost_function.clear_cache()
