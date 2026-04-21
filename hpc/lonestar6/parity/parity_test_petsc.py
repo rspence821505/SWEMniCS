@@ -58,9 +58,11 @@ residual.axpy(-1.0, b)          # r = A u - b
 res_norm = residual.norm(PETSc.NormType.NORM_2)
 rel_res = res_norm / b_norm if b_norm > 0 else res_norm
 
+# error = u - u_true. Note: PETSc Vec.copy(dst) copies SELF -> DST,
+# so correct pattern is u.copy(err), not err.copy(u).
 err = u.duplicate()
-err.copy(u)
-err.axpy(-1.0, u_true)
+u.copy(err)                       # err <- u
+err.axpy(-1.0, u_true)            # err <- err - u_true = u - u_true
 err_norm = err.norm(PETSc.NormType.NORM_2)
 rel_err = err_norm / u_true.norm(PETSc.NormType.NORM_2)
 
