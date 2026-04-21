@@ -44,8 +44,12 @@ a = ufl.dot(ufl.grad(u), ufl.grad(v)) * ufl.dx
 L = f * v * ufl.dx
 
 problem = LinearProblem(a, L, bcs=[bc],
+                        petsc_options_prefix="test_dolfinx_",  # required in dolfinx 0.10
                         petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
 uh = problem.solve()
+# LinearProblem.solve() in 0.10 returns (Function, info) tuple in some builds
+if isinstance(uh, tuple):
+    uh = uh[0]
 
 # Small check: interior max should be positive, boundary zero.
 local_max = uh.x.array.max()
