@@ -212,12 +212,12 @@ class ForwardModelWrapper:
 
         # Extract trajectory as PETSc vectors
         # Note: saved_states include ghost values, need proper distributed vectors
-        from dolfinx import la
+        from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm_
         u_owned_size = self.solver.V.dofmap.index_map.size_local
         trajectory = []
         for state_array in self.solver.storage.saved_states:
             # Create properly distributed PETSc vector
-            vec = la.create_petsc_vector(
+            vec = _cvm_(
                 self.solver.V.dofmap.index_map,
                 self.solver.V.dofmap.index_map_bs,
             )
@@ -937,7 +937,8 @@ def create_component_aware_covariance_from_function_space(
     )
 
     # Create diagonal vector using function space's index_map
-    instance.diagonal = la.create_petsc_vector(
+    from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm_
+    instance.diagonal = _cvm_(
         function_space.dofmap.index_map,
         function_space.dofmap.index_map_bs,
     )
