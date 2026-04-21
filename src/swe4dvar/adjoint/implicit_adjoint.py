@@ -474,9 +474,8 @@ class ImplicitAdjointSolver:
         )
 
         # Convert to owned-only PETSc Vec matching the adjoint vectors
-        result = la.create_petsc_vector(
-            V.dofmap.index_map, V.dofmap.index_map_bs
-        )
+        from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm_
+        result = _cvm_(V.dofmap.index_map, V.dofmap.index_map_bs)
         result.setArray(result_petsc.getArray()[:u_owned])
         result.assemble()
 

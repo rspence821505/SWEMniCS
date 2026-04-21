@@ -418,7 +418,8 @@ class DiagonalCovariance(CovarianceMatrix):
         )
 
         # Create diagonal vector using function space's index_map
-        instance.diagonal = la.create_petsc_vector(
+        from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm_
+        instance.diagonal = _cvm_(
             function_space.dofmap.index_map,
             function_space.dofmap.index_map_bs,
         )

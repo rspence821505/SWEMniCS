@@ -30,7 +30,10 @@ except ModuleNotFoundError:  # pragma: no cover - import-light path for tests/do
     PETSc = None
 
 from swe4dvar.control import ControlLayout, ControlVector
-from swe4dvar.utils.compat import create_vector_from_form as _cvf
+from swe4dvar.utils.compat import (
+    create_vector_from_form as _cvf,
+    create_petsc_vector_from_map as _cvm,
+)
 try:
     from swe4dvar.physics.forcing import ParametricWindForcing
 except ModuleNotFoundError:  # pragma: no cover - import-light path for tests/docs
@@ -643,7 +646,7 @@ class AugmentedForwardModelWrapper:
         )
         trajectory = []
         for state_array in self.solver.storage.saved_states:
-            vec = la.create_petsc_vector(
+            vec = _cvm(
                 self.solver.V.dofmap.index_map,
                 self.solver.V.dofmap.index_map_bs,
             )

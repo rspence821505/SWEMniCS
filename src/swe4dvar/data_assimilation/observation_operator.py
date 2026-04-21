@@ -691,10 +691,11 @@ class PointObservationOperator(ObservationOperator):
         Returns:
             State-space vector with distributed contributions
         """
-        # Create state-space vector using dolfinx.la
-        from dolfinx import la
+        # Create state-space vector (cross-version: dolfinx 0.9 la.create_petsc_vector,
+        # 0.10 la.petsc.create_vector)
+        from swe4dvar.utils.compat import create_petsc_vector_from_map
 
-        adj_state = la.create_petsc_vector(
+        adj_state = create_petsc_vector_from_map(
             self.function_space.dofmap.index_map,
             self.function_space.dofmap.index_map_bs,
         )

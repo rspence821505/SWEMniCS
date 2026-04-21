@@ -45,3 +45,18 @@ def create_vector_from_form(form):
     if _DOLFINX_010_OR_NEWER:
         return _petsc.create_vector([form.function_spaces[0]])
     return _petsc.create_vector(form)
+
+
+def create_petsc_vector_from_map(index_map, block_size):
+    """Create a PETSc ``Vec`` from a DOLFINx IndexMap.
+
+    Cross-version replacement for ``dolfinx.la.create_petsc_vector``:
+    dolfinx 0.9 exposes it at ``dolfinx.la.create_petsc_vector``;
+    0.10 relocated it to ``dolfinx.la.petsc.create_vector`` and
+    dropped the top-level ``la.create_petsc_vector`` symbol.
+    """
+    if _DOLFINX_010_OR_NEWER:
+        from dolfinx.la.petsc import create_vector as _create
+        return _create(index_map, block_size)
+    from dolfinx import la as _la
+    return _la.create_petsc_vector(index_map, block_size)

@@ -377,7 +377,8 @@ class MPIObjectExporter:
         else:
             raise ValueError(f"Unknown pattern: {pattern!r}")
 
-        vec = la.create_petsc_vector(self.V.dofmap.index_map, self.V.dofmap.index_map_bs)
+        from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm_
+        vec = _cvm_(self.V.dofmap.index_map, self.V.dofmap.index_map_bs)
         arr = np.zeros(self.n_owned)
         arr[self.h_owned] = vals_h * amp_h
         arr[self.u_owned] = vals_uv * amp_uv
