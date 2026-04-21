@@ -27,6 +27,7 @@ except ImportError:
 
 from petsc4py.PETSc import ScalarType
 from swe4dvar.physics.boundarycondition import BoundaryCondition, MarkBoundary
+from swe4dvar.utils.compat import interpolation_points as _ipts
 from dataclasses import dataclass
 from swe4dvar.physics.constants import g, R, omega, p_water, p_air
 from swe4dvar.physics.forcing import GriddedForcing
@@ -903,7 +904,7 @@ class TidalProblem(BaseProblem):
                 h_bc = self.u_bc.sub(0)
                 h_bc.interpolate(
                     fe.Expression(
-                        self.h_b, self.V.sub(0).element.interpolation_points()
+                        self.h_b, _ipts(self.V.sub(0).element)
                     )
                 )
                 self._hb_boundary = h_bc.x.array[self.dof_open]
@@ -1201,7 +1202,7 @@ class DamProblem(TidalProblem):
                             fe.Constant(self.mesh, ScalarType(0)),
                         ]
                     ),
-                    self.V.sub(1).element.interpolation_points(),
+                    _ipts(self.V.sub(1).element),
                 )
             )
 

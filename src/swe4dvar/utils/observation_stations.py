@@ -10,6 +10,8 @@ from dolfinx import fem as fe, geometry, mesh
 from mpi4py import MPI
 from typing import Tuple, List, Optional
 
+from swe4dvar.utils.compat import interpolation_points as _ipts
+
 
 class StationManager:
     """Manages observation stations for recording time series data.
@@ -130,7 +132,7 @@ class StationManager:
             if isinstance(self.h_b, ufl.core.expr.Expr):
                 expr = fe.Expression(
                     self.h_b,
-                    self.V_scalar.element.interpolation_points(),
+                    _ipts(self.V_scalar.element),
                 )
                 bathy_func.interpolate(expr)
             else:

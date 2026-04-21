@@ -22,6 +22,8 @@ import ufl
 from mpi4py import MPI
 from petsc4py import PETSc
 import numpy as np
+
+from swe4dvar.utils.compat import create_vector_from_form as _cvf
 from scipy.sparse import csr_matrix
 import numpy.linalg as la
 import sys
@@ -96,7 +98,7 @@ class CustomNewtonProblem:
         self._solver_parameters = solver_parameters
         self._mesh = obj1.problem.mesh
         self.A = petsc.create_matrix(self.jacobian)
-        self.L = petsc.create_vector(self.residual)
+        self.L = _cvf(self.residual)
         self._setup_ksp()
 
     def _setup_ksp(self):
@@ -423,7 +425,7 @@ class NewtonSolver:
 
         # the problem appears to be that the residual is humongous. . .
         res = fe.form(obj1.F)
-        test_res = petsc.create_vector(res)
+        test_res = _cvf(res)
         petsc.assemble_vector(test_res, res)
         # print(test_res.getArray())
         print(f"Calling NewtonSolver with {obj1.problem.name} problem")

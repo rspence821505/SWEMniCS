@@ -10,6 +10,8 @@ from dolfinx import fem as fe, io
 from typing import Optional
 import sys
 
+from swe4dvar.utils.compat import interpolation_points as _ipts
+
 try:
     import pyvista
     import dolfinx.plot
@@ -162,13 +164,13 @@ class SolverVisualizer:
         # Extract and write water surface elevation
         self.eta_expr = fe.Expression(
             u.sub(0).collapse() - self.problem.h_b,
-            self.V_scalar.element.interpolation_points(),
+            _ipts(self.V_scalar.element),
         )
         self.eta_plot.interpolate(self.eta_expr)
 
         # Extract and write velocity
         self.v_expr = fe.Expression(
-            u.sub(1).collapse(), self.V_vel.element.interpolation_points()
+            u.sub(1).collapse(), _ipts(self.V_vel.element)
         )
         self.vel_plot.interpolate(self.v_expr)
 
@@ -186,7 +188,7 @@ class SolverVisualizer:
                 print("Writing bathymetry")
             self.bathy_plot.interpolate(
                 fe.Expression(
-                    self.problem.h_b, self.V_scalar.element.interpolation_points()
+                    self.problem.h_b, _ipts(self.V_scalar.element)
                 )
             )
             self.bathy_writer.write(t)

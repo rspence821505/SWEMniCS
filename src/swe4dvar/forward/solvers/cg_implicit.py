@@ -35,6 +35,7 @@ from swe4dvar.forward.newton import CustomNewtonProblem
 from swe4dvar.utils.timestep_manager import TimeStepDataManager
 from swe4dvar.utils.observation_stations import StationManager
 from swe4dvar.utils.visualization import SolverVisualizer
+from swe4dvar.utils.compat import interpolation_points as _ipts, create_vector_from_form as _cvf
 
 from .base_solver import BaseSolver
 
@@ -92,14 +93,14 @@ class CGImplicit(BaseSolver):
             if self.problem.h_init is None:
                 self.u_n.sub(0).interpolate(
                     fe.Expression(
-                        self.problem.h_b, self.V.sub(0).element.interpolation_points()
+                        self.problem.h_b, _ipts(self.V.sub(0).element)
                     )
                 )
             else:
                 self.u_n.sub(0).interpolate(
                     fe.Expression(
                         self.problem.h_init,
-                        self.V.sub(0).element.interpolation_points(),
+                        _ipts(self.V.sub(0).element),
                     )
                 )
             if self.problem.vel_init is None:
@@ -112,14 +113,14 @@ class CGImplicit(BaseSolver):
                                 fe.Constant(self.domain, ScalarType(0.0)),
                             ]
                         ),
-                        self.V.sub(1).element.interpolation_points(),
+                        _ipts(self.V.sub(1).element),
                     )
                 )
             else:
                 self.u_n.sub(1).interpolate(
                     fe.Expression(
                         self.problem.vel_init,
-                        self.V.sub(1).element.interpolation_points(),
+                        _ipts(self.V.sub(1).element),
                     )
                 )
 
@@ -128,7 +129,7 @@ class CGImplicit(BaseSolver):
                 self.u_n.sub(0).interpolate(
                     fe.Expression(
                         self.problem.h_init - self.problem.h_b,
-                        self.V.sub(0).element.interpolation_points(),
+                        _ipts(self.V.sub(0).element),
                     )
                 )
 

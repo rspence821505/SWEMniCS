@@ -30,6 +30,7 @@ import numpy as np
 from swe4dvar.physics.constants import g, R
 from swe4dvar.utils.fem_utilities import create_element, create_mixed_element
 from swe4dvar.utils.solver_storage import SolverStateStorage
+from swe4dvar.utils.compat import create_vector_from_form as _cvf
 
 from typing import Literal
 
@@ -153,7 +154,7 @@ class BaseSolver:
 
         # the problem appears to be that the residual is humongous. . .
         res = fe.form(self.F)
-        test_res = fe.petsc.create_vector(res)
+        test_res = _cvf(res)
         fe.petsc.assemble_vector(test_res, res)
         print(f"Calling NewtonSolver", file=sys.stdout)
         solver = nls.petsc.NewtonSolver(MPI.COMM_WORLD, prob)

@@ -30,6 +30,7 @@ except ModuleNotFoundError:  # pragma: no cover - import-light path for tests/do
     PETSc = None
 
 from swe4dvar.control import ControlLayout, ControlVector
+from swe4dvar.utils.compat import create_vector_from_form as _cvf
 try:
     from swe4dvar.physics.forcing import ParametricWindForcing
 except ModuleNotFoundError:  # pragma: no cover - import-light path for tests/docs
@@ -272,7 +273,7 @@ class ManningsBasisController(ParameterSensitivityProvider):
 
         derivative_vectors = []
         for form in self._residual_derivative_forms:
-            vec = fem.petsc.create_vector(form)
+            vec = _cvf(form)
             with vec.localForm() as loc_vec:
                 loc_vec.set(0.0)
             fem.petsc.assemble_vector(vec, form)
