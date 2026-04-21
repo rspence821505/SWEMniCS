@@ -172,11 +172,37 @@ relative error:       1.272190e-05
 Exp1: Gradient Check: PASS
 ```
 
-### LS6 run
+### LS6 run of `experiments/validation_ladder.py` itself — **BLOCKED by infrastructure**
 
-(see §7 if the run is still in flight; when it lands it will be appended here with the same three-line summary.)
+Running `experiments/validation_ladder.py --experiment 1` on LS6 fails with:
+```
+ImportError: ADIOS2 must be built with MPI support
+```
+This is **not** a dolfinx 0.9/0.10 port issue. The root cause is that `validation_ladder` uses `ADCIRCProblem`, which depends on `adios4dolfinx`, which refuses to load without an **MPI-enabled ADIOS2** Python binding. The PyPI `adios2` wheel is serial-only, and TACC ships MPI-ADIOS2 Python bindings only for Python 3.11 (we're on 3.12). To make `validation_ladder` run on LS6 one must either:
+- pip-install `adios2` from source against `$TACC_ADIOS2_DIR`, OR
+- use `module load python/3.11.*` (not recommended — breaks venv), OR
+- install the `adios2` Python binding alongside `adios4dolfinx` in a way that picks up MPI symbols.
 
-The important invariant isn't the exact adjoint/FD numbers — those depend on PETSc iterative-solver randomness at the 5-digit level — it's that **both** sides report Gradient Check PASS with a relative error in the 1e-5 band. Anything worse than 1e-3 would flag a real discrepancy; anything better than 1e-6 would suggest the FD perturbation is too small. 1e-5 is the expected steady-state for `epsilon=1e-6` second-order FD on this problem.
+None of that is in scope for a dolfinx-port pass.
+
+### Adjoint–FD verification — **performed via inline check in `parity_4dvar_reduced.py`**
+
+To avoid leaving this category untested, the reduced 4D-Var parity test now includes a 5-DOF central-difference gradient check in serial mode. This exercises the full forward/adjoint/cost pipeline the same way `validation_ladder --experiment 1` does, but on the procedurally generated `TidalProblem` mesh so it needs no ADIOS2.
+
+| Side | max rel. err | mean rel. err | `fd_passed` (threshold 1e-3) |
+|---|---|---|---|
+| Local (dolfinx 0.9) | `3.20e-6` | `9.66e-7` | **true** |
+| LS6 (dolfinx 0.10) | `6.86e-6` | `1.87e-6` | **true** |
+
+Both sides report the same qualitative result `PASS`. The ~2× spread in max rel. err between the two environments is expected BLAS/reduction-order behavior at `ε=1e-6` and is far from the 1e-3 failure threshold.
+
+For context, the canonical `validation_ladder` local run (Shinnecock ADCIRC mesh, 2-parameter Manning's-n basis) reports:
+```
+adjoint θ gradient:   [-0.9991286946346533, -1.0724230857901411]
+FD θ gradient:        [-0.9991153649480111, -1.072410046845107]
+relative error:       1.272190e-05      ← PASS
+```
+The numbers are in the same 1e-5 band as our inline check, confirming both tests exercise the same gradient correctness property.
 
 ---
 
@@ -188,11 +214,11 @@ Known residual items (non-blocking):
 
 | Item | Impact | Priority |
 |---|---|---|
+| **MPI-enabled ADIOS2 Python binding** on LS6 | Any code path touching `adios4dolfinx` (Shinnecock ADCIRC reader, `validation_ladder.py`, checkpointing) fails with `ImportError: ADIOS2 must be built with MPI support`. The PyPI `adios2` wheel is serial-only. | **High** — blocks `validation_ladder` and ADCIRC experiments. Fix: build `adios2` Python binding from source against `$TACC_ADIOS2_DIR` with MPI on. Unblocks ADCIRC on LS6. |
 | 21 `la.create_petsc_vector` call sites in `experiments/` (outside `serial_da`) | Affects scripts like `shinnecock_study/run_comparison.py`, `run_dcwme_manual_B.py`, `twin_framework/parameter_runners.py`. Will fail at import/run time on LS6 until ported. | **Medium** — port each file when you want to run that specific experiment. Copy the same `_cvm_ = create_petsc_vector_from_map` import pattern. |
 | `CC=gcc` not auto-set in `env.ls6.sh` | FFCx JIT fails with "clang not found" error on first form compilation. | **High** — one-liner fix; add to `hpc/lonestar6/environment/WORKING_SETUP.md` activation script. |
-| `adios4dolfinx` not installed in LS6 venv | Some experiments may import it for checkpoint I/O. Silently fails with `ModuleNotFoundError`. | **Low** — `pip install adios4dolfinx` in the LS6 venv when needed. |
-| `experiments/validation_ladder.py --experiment {2,3,4}` not verified on LS6 | Experiment 1 is all that was required; later experiments exercise the TAO optimizer loop. | **Low** — run when scaling up to real experiments. |
-| Data files in `data/*.bp` | Not in git (they're large binaries); needed by experiments that use Shinnecock. | **Low** — `rsync -az data/*.bp ls6:$WORK/SWEMniCS/data/` on demand. |
+| `experiments/validation_ladder.py --experiment {2,3,4}` not verified on LS6 | Experiments 2-4 exercise the TAO optimizer loop. Blocked by the MPI-ADIOS2 issue above. | **Medium** — unblocks with the first item. |
+| Data files in `data/*.bp` | Not in git (they're large binaries); needed by experiments that use Shinnecock. The `shinnecock_inlet_mesh.bp` and `shinnecock_inlet_depth.bp` already rsync'd during this pass. | **Low** — `rsync -az data/*.bp ls6:$WORK/SWEMniCS/data/` on demand. |
 
 No item above prevents running a reduced 4D-Var or DC-WME on LS6 with procedurally generated geometry (`TidalProblem(nx=5, ny=3)`).
 
@@ -212,10 +238,10 @@ No item above prevents running a reduced 4D-Var or DC-WME on LS6 with procedural
 
 1. **Did the reduced 4D-Var parity pass?** — **YES.** 8 of 8 metrics MATCH, max rel. diff 9.4e-15.
 2. **Did the reduced DC-WME parity pass?** — **YES.** 5 of 5 metrics MATCH, max rel. diff 1.7e-15. Identical L_wme spectral summary on both sides.
-3. **Did the adjoint–FD validation still pass?** — **YES** on local (rel. err 1.27e-5 → PASS). LS6 run in progress; will be appended here on completion.
-4. **Is LS6 now safe for production runs?** — **YES**, subject to the three caveats above.
+3. **Did the adjoint–FD validation still pass?** — **YES on the substituted check** (built into `parity_4dvar_reduced.py`): max rel. err 3.20e-6 local / 6.86e-6 LS6, both well below the 1e-3 threshold. The canonical `validation_ladder.py` is **still blocked on LS6 by the MPI-ADIOS2 infrastructure issue** (not by any 0.9/0.10 dolfinx porting issue). The ADCIRC code path is orthogonal to the TidalProblem/reduced-experiment path and is a separate infrastructure item.
+4. **Is LS6 now safe for production runs?** — **YES, for non-ADCIRC reduced and mid-scale 4D-Var / DC-WME work.** For Shinnecock ADCIRC production, additionally fix the MPI-ADIOS2 blocker per §6.
 
 ### Transition verdict
 
 Before this pass: "stack parity passed, project blocked".
-After this pass: **"project parity passed; LS6 ready for production with caveats (§7)"**.
+After this pass: **"project parity passed; LS6 ready for non-ADCIRC production. ADCIRC path (Shinnecock) has one remaining infrastructure blocker (MPI-ADIOS2), narrowly identified."**
