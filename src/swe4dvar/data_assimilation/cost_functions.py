@@ -1440,8 +1440,20 @@ class DCWMEFourDVarCost(DCFourDVarCost):
             m_copy.destroy()
         m_hash = hashlib.md5(m_bytes).hexdigest()
 
+        # Evict stale entries before publishing the current one. Without this,
+        # DC-WME accumulates (trajectory, jacobians) tuples across TAO evals;
+        # each tuple retains 36 Jacobians with MUMPS factors (~1.8 GB) and
+        # pushes the process past the OOM limit within a few line-search probes.
+        # The stale refs are still live PETSc handles, so clear the dict keys
+        # but do not destroy the underlying objects — _run_forward_model's
+        # next call will destroy them when it overwrites self._trajectory.
+        cache = self.qoi_map._trajectory_cache
+        for stale_hash in list(cache.keys()):
+            if stale_hash != m_hash:
+                cache.pop(stale_hash, None)
+
         # Populate QoIMap's cache
-        self.qoi_map._trajectory_cache[m_hash] = (trajectory, jacobians)
+        cache[m_hash] = (trajectory, jacobians)
 
     def value(self, m: PETSc.Vec) -> float:
         """
@@ -2026,6 +2038,20 @@ class DCWMEFourDVarCost(DCFourDVarCost):
 
         # Zero boundary DOF gradients (same as standard 4D-Var adjoint)
         grad = self._zero_boundary_gradient(grad)
+
+        # Apply gradient smoothing. FourDVarCost applies this on the raw adjoint
+        # gradient; DC-WME must do the same or BLMVM's initial step sizing sees
+        # a spiky ~5x smaller ‖grad‖ and launches a step that drives h negative
+        # in the first line-search probe.
+        if getattr(self, "gradient_smoother", None) is not None:
+            smoother = self.gradient_smoother
+            if hasattr(smoother, "apply"):
+                smoother.apply(grad)
+            else:
+                arr = grad.getArray().copy()
+                arr = smoother(arr)
+                grad.setArray(arr)
+
         self._profile_event(
             "dcwme.value_gradient.complete",
             cost=float(cost),

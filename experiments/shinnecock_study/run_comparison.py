@@ -1572,7 +1572,9 @@ def run_phase_2(args):
 def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
                            m_template, predictability_gamma=0.1,
                            adaptive_gamma=True, comm=None, rank=0,
-                           skip_eq38_inflation=False):
+                           skip_eq38_inflation=False,
+                           obs_correlation_length=0.0,
+                           obs_correlation_variance=None):
     """Compute static L_wme = I + (N / σ²_obs) · H B Hᵀ (no adjoint solves).
 
     This matches the near-linear limit of the dynamic L_wme. When M_{k:0} ≈ I,
@@ -1603,6 +1605,16 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
         MPI communicator.
     rank : int
         MPI rank.
+    obs_correlation_length : float, optional
+        If > 0, the H B Hᵀ contribution is replaced by an obs-space
+        Gaussian kernel: K[i,j] = σ_b² × exp(−‖x_i − x_j‖² / 2 L²)
+        evaluated at observation coordinates. Mathematically equivalent to
+        a Gaussian-correlated B in the point-observation limit; approximation
+        error O((cell_size / L)²). Use this when forming a dense correlated
+        B is infeasible (e.g., ≫ 10⁴ DOFs).
+    obs_correlation_variance : float, optional
+        σ_b² for the obs-space kernel. If None, inferred from B.diagonal min
+        (matches the current diagonal B's variance level).
 
     Returns
     -------
@@ -1612,106 +1624,225 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
         Diagnostics dictionary.
     """
     from petsc4py import PETSc
+    from mpi4py import MPI
     from swe4dvar.data_assimilation.covariance import DenseCovariance
 
     d_obs = obs_operator.get_num_observations()
     n_state = m_template.getSize()
 
-    # Extract H matrix via adjoint: H^T e_i gives row i of H
-    # This is O(d_obs) applications instead of O(n_state) — much faster
-    # (306 vs 52020 for Shinnecock)
-    if rank == 0:
-        print(f"  Extracting H matrix ({d_obs} × {n_state}) via {d_obs} adjoint applications...")
-
-    H = np.zeros((d_obs, n_state))
-
-    # Create observation-space unit vector
-    obs_vec = obs_operator.forward(m_template)  # get correctly sized obs vector
-    obs_vec.zeroEntries()
-
-    for i in range(d_obs):
-        obs_vec.zeroEntries()
-        obs_vec.setValue(i, 1.0)
-        obs_vec.assemblyBegin()
-        obs_vec.assemblyEnd()
-        HT_ei = obs_operator.adjoint(obs_vec)  # H^T e_i = state-space vector
-        # Gather full vector across MPI ranks
-        local_arr = HT_ei.getArray()
-        if comm is not None and comm.Get_size() > 1:
-            full_arr = np.zeros(n_state)
-            start, end = HT_ei.getOwnershipRange()
-            full_arr[start:end] = local_arr
-            comm.Allreduce(full_arr.copy(), full_arr)
-            H[i, :] = full_arr
-        else:
-            H[i, :] = local_arr
-        HT_ei.destroy()
-    obs_vec.destroy()
-
-    if rank == 0:
-        print(f"  H extracted: {np.count_nonzero(H)} nonzeros out of {d_obs * n_state}")
-
-    # Get B diagonal
-    B_diag = B.diagonal.getArray().copy()
-    # Gather full diagonal (for MPI)
-    if comm is not None and comm.Get_size() > 1:
-        B_diag_full = np.zeros(n_state)
-        start, end = B.diagonal.getOwnershipRange()
-        B_diag_full[start:end] = B_diag
-        comm.Allreduce(B_diag_full.copy(), B_diag_full)
-        B_diag = B_diag_full
-
-    current_min_var = B_diag.min()
-
-    # Step 1: B inflation for Eq 38 predictability bound
-    if skip_eq38_inflation:
-        # B was already inflated by a prior TLM-based Eq 38 computation.
-        # Skip the internal H·H^T approximation to avoid double-inflation.
-        alpha = 1.0
-        diagnostics = {
-            'inflation_factor': 1.0,
-            'skip_reason': 'B already inflated by TLM-based Eq 38',
-            'current_min_var': float(current_min_var),
-        }
+    # Branch: obs-space Gaussian kernel path (for correlated-B experiments)
+    # ---------------------------------------------------------------------
+    # Mathematically equivalent to the point-observation limit of a Gaussian-
+    # correlated B: for H = point interpolation at obs coordinates,
+    #   (H B Hᵀ)[i, j] ≈ σ_b² × exp(−‖x_i − x_j‖² / 2 L²)
+    # Approximation error O((cell_size / L)²) ≈ 10% for our mesh with L ≥ 1000 m.
+    # This avoids building a 208K × 208K dense correlated B (346 GB).
+    if obs_correlation_length > 0:
         if rank == 0:
-            print(f"  [Eq 38] Skipped — B already inflated by TLM (min(B) = {current_min_var:.6e})")
-    else:
-        # Fallback: approximate Gram matrix from H alone (no TLM).
-        # This is valid only when M_{k:0} ≈ I (near-identity propagator).
-        G_static = H @ H.T  # (d_obs × d_obs)
-        gram_eigvals = np.linalg.eigvalsh(G_static)
-        lambda_min_G = max(gram_eigvals.min(), 1e-30)
+            print(f"  Using obs-space Gaussian kernel for H B Hᵀ "
+                  f"(L={obs_correlation_length:.0f} m)")
 
-        # Inflation factor: required_var = γ · σ²_obs / (N · λ_min(H H^T))
-        required_var = (predictability_gamma * obs_variance) / (n_obs_times * lambda_min_G)
-        alpha = max(1.0, required_var / current_min_var) if current_min_var > 0 else 1.0
-
-        diagnostics = {
-            'gram_eigvals': gram_eigvals.tolist(),
-            'lambda_min_G': float(lambda_min_G),
-            'required_var': float(required_var),
-            'inflation_factor': float(alpha),
-        }
-
-        if rank == 0:
-            if alpha > 1.0:
-                print(f"  [Eq 38] Static H·H^T inflation: α = {alpha:.4f} "
-                      f"(required σ²_b = {required_var:.4e}, current = {current_min_var:.4e})")
+        sigma_b2 = obs_correlation_variance
+        if sigma_b2 is None:
+            # Infer from B.diagonal. Taking the min picks up zero entries at
+            # boundary DOFs / dry cells, which breaks the kernel. Use the
+            # MEAN of positive entries instead — this matches the typical
+            # variance of a "real" DOF under a component-aware B.
+            if hasattr(B, 'diagonal'):
+                B_diag_arr = B.diagonal.getArray()
+                mask = B_diag_arr > 0
+                local_sum = float(B_diag_arr[mask].sum()) if mask.any() else 0.0
+                local_count = int(mask.sum())
+                if comm is not None and comm.Get_size() > 1:
+                    total_sum = float(comm.allreduce(local_sum, op=MPI.SUM))
+                    total_count = int(comm.allreduce(local_count, op=MPI.SUM))
+                else:
+                    total_sum = local_sum
+                    total_count = local_count
+                if total_count == 0:
+                    raise ValueError(
+                        "Cannot infer σ_b² from B.diagonal: no positive entries "
+                        "(pass obs_correlation_variance explicitly)."
+                    )
+                sigma_b2 = total_sum / total_count
             else:
-                print(f"  [Eq 38] Static: no B inflation needed")
+                raise ValueError(
+                    "obs_correlation_variance must be provided when B has no .diagonal"
+                )
 
-    B_diag_inflated = B_diag * alpha if alpha > 1.0 else B_diag
+        if rank == 0:
+            print(f"  σ_b² = {sigma_b2:.6e}")
 
-    # Step 2: Form L_static = I + (N/σ²_obs) · H B_inflated Hᵀ
-    # The +I term arises from the observation noise contribution to the
-    # WME predicted covariance: (1/N) Σ_k R^{-1/2} Cov(ε_k) R^{-1/2} = I.
-    # This matches the dynamic L_wme computation in cost_functions.py:1695.
-    HB = H * B_diag_inflated[np.newaxis, :]
-    L_dense = np.eye(d_obs) + (n_obs_times / obs_variance) * (HB @ H.T)
+        # Obs coordinates (identical on every rank — obs_operator holds these)
+        obs_coords = np.asarray(obs_operator.obs_points)[:, :2]
+        # Pairwise squared distances
+        from scipy.spatial.distance import cdist
+        D = cdist(obs_coords, obs_coords, metric='euclidean')
+        K = sigma_b2 * np.exp(-(D ** 2) / (2.0 * obs_correlation_length ** 2))
 
-    # Free large intermediate arrays
-    del H, HB, B_diag_inflated
-    import gc; gc.collect()
+        # Eq 38 inflation needs λ_min of the Gram matrix G = (H B Hᵀ)/σ_b² =
+        # exp(−D²/2L²). G is SPD but near-rank-deficient (many eigenvalues
+        # ≈ 0), which breaks np.linalg.eigvalsh on large matrices.
+        # Workaround: compute the eigenspectrum of the well-conditioned
+        # L_unadj = I + (N/σ²_obs)·K (all eigenvalues ≥ 1) and back out
+        # λ(G) = (λ(L_unadj) − 1) · σ²_obs / (N · σ_b²).
+        L_unadj = np.eye(d_obs) + (n_obs_times / obs_variance) * K
+        eigvals_L = np.linalg.eigvalsh(L_unadj)
+        eigvals_K = np.maximum((eigvals_L - 1.0) * obs_variance / n_obs_times, 0.0)
+        gram_eigvals = eigvals_K / sigma_b2
+
+        # Floor λ_min(G) with the adaptive γ × λ_max(G). A Gaussian kernel is
+        # intentionally rank-deficient, so a literal λ_min ≈ 0 would send the
+        # Eq-38 "required σ_b²" to infinity and produce an absurd inflation
+        # factor (10²⁷+). The adaptive floor is the consistent choice because
+        # it's the SAME floor used to regularize the L_wme eigenvalues below;
+        # directions below γ·λ_max are spectrally clipped anyway and should
+        # not drive B inflation.
+        gram_min_floor = predictability_gamma * gram_eigvals.max()
+        lambda_min_G = max(gram_eigvals.min(), gram_min_floor, 1e-30)
+
+        current_min_var = sigma_b2
+        if skip_eq38_inflation:
+            alpha = 1.0
+            diagnostics = {
+                'obs_correlation_length': float(obs_correlation_length),
+                'sigma_b2': float(sigma_b2),
+                'lambda_min_G': float(lambda_min_G),
+                'lambda_max_G': float(gram_eigvals.max()),
+                'inflation_factor': 1.0,
+                'skip_reason': 'B already inflated by TLM-based Eq 38',
+            }
+            if rank == 0:
+                print(f"  [Eq 38] Skipped — B already inflated by TLM")
+                print(f"  [Kernel] λ_min(G)={gram_eigvals.min():.4e}, "
+                      f"λ_max(G)={gram_eigvals.max():.4e}, "
+                      f"ratio={gram_eigvals.max()/lambda_min_G:.2e}")
+        else:
+            required_var = (predictability_gamma * obs_variance) / (n_obs_times * lambda_min_G)
+            alpha = max(1.0, required_var / current_min_var) if current_min_var > 0 else 1.0
+            diagnostics = {
+                'obs_correlation_length': float(obs_correlation_length),
+                'sigma_b2': float(sigma_b2),
+                'lambda_min_G': float(lambda_min_G),
+                'lambda_max_G': float(gram_eigvals.max()),
+                'required_var': float(required_var),
+                'inflation_factor': float(alpha),
+            }
+            if rank == 0:
+                print(f"  [Kernel] λ_min(G)={gram_eigvals.min():.4e}, "
+                      f"λ_max(G)={gram_eigvals.max():.4e}, "
+                      f"ratio={gram_eigvals.max()/lambda_min_G:.2e}")
+                if alpha > 1.0:
+                    print(f"  [Eq 38] Kernel inflation: α = {alpha:.4f} "
+                          f"(required σ²_b = {required_var:.4e}, "
+                          f"current = {current_min_var:.4e})")
+                else:
+                    print(f"  [Eq 38] Kernel: no B inflation needed")
+
+        # L_static = I + (N/σ²_obs) · α σ_b² × exp(−D²/2L²)
+        if alpha > 1.0:
+            L_dense = np.eye(d_obs) + (n_obs_times / obs_variance) * (alpha * K)
+        else:
+            L_dense = L_unadj  # reuse
+        del K, D, L_unadj
+        import gc; gc.collect()
+    else:
+        # Original diagonal-B path (fast path via explicit H materialization)
+        # Extract H matrix via adjoint: H^T e_i gives row i of H
+        # This is O(d_obs) applications instead of O(n_state) — much faster
+        # (306 vs 52020 for Shinnecock)
+        if rank == 0:
+            print(f"  Extracting H matrix ({d_obs} × {n_state}) via {d_obs} adjoint applications...")
+
+        H = np.zeros((d_obs, n_state))
+
+        # Create observation-space unit vector
+        obs_vec = obs_operator.forward(m_template)  # get correctly sized obs vector
+        obs_vec.zeroEntries()
+
+        for i in range(d_obs):
+            obs_vec.zeroEntries()
+            obs_vec.setValue(i, 1.0)
+            obs_vec.assemblyBegin()
+            obs_vec.assemblyEnd()
+            HT_ei = obs_operator.adjoint(obs_vec)  # H^T e_i = state-space vector
+            # Gather full vector across MPI ranks
+            local_arr = HT_ei.getArray()
+            if comm is not None and comm.Get_size() > 1:
+                full_arr = np.zeros(n_state)
+                start, end = HT_ei.getOwnershipRange()
+                full_arr[start:end] = local_arr
+                comm.Allreduce(full_arr.copy(), full_arr)
+                H[i, :] = full_arr
+            else:
+                H[i, :] = local_arr
+            HT_ei.destroy()
+        obs_vec.destroy()
+
+        if rank == 0:
+            print(f"  H extracted: {np.count_nonzero(H)} nonzeros out of {d_obs * n_state}")
+
+        # Get B diagonal
+        B_diag = B.diagonal.getArray().copy()
+        # Gather full diagonal (for MPI)
+        if comm is not None and comm.Get_size() > 1:
+            B_diag_full = np.zeros(n_state)
+            start, end = B.diagonal.getOwnershipRange()
+            B_diag_full[start:end] = B_diag
+            comm.Allreduce(B_diag_full.copy(), B_diag_full)
+            B_diag = B_diag_full
+
+        current_min_var = B_diag.min()
+
+        # Step 1: B inflation for Eq 38 predictability bound
+        if skip_eq38_inflation:
+            # B was already inflated by a prior TLM-based Eq 38 computation.
+            # Skip the internal H·H^T approximation to avoid double-inflation.
+            alpha = 1.0
+            diagnostics = {
+                'inflation_factor': 1.0,
+                'skip_reason': 'B already inflated by TLM-based Eq 38',
+                'current_min_var': float(current_min_var),
+            }
+            if rank == 0:
+                print(f"  [Eq 38] Skipped — B already inflated by TLM (min(B) = {current_min_var:.6e})")
+        else:
+            # Fallback: approximate Gram matrix from H alone (no TLM).
+            # This is valid only when M_{k:0} ≈ I (near-identity propagator).
+            G_static = H @ H.T  # (d_obs × d_obs)
+            gram_eigvals = np.linalg.eigvalsh(G_static)
+            lambda_min_G = max(gram_eigvals.min(), 1e-30)
+
+            # Inflation factor: required_var = γ · σ²_obs / (N · λ_min(H H^T))
+            required_var = (predictability_gamma * obs_variance) / (n_obs_times * lambda_min_G)
+            alpha = max(1.0, required_var / current_min_var) if current_min_var > 0 else 1.0
+
+            diagnostics = {
+                'gram_eigvals': gram_eigvals.tolist(),
+                'lambda_min_G': float(lambda_min_G),
+                'required_var': float(required_var),
+                'inflation_factor': float(alpha),
+            }
+
+            if rank == 0:
+                if alpha > 1.0:
+                    print(f"  [Eq 38] Static H·H^T inflation: α = {alpha:.4f} "
+                          f"(required σ²_b = {required_var:.4e}, current = {current_min_var:.4e})")
+                else:
+                    print(f"  [Eq 38] Static: no B inflation needed")
+
+        B_diag_inflated = B_diag * alpha if alpha > 1.0 else B_diag
+
+        # Step 2: Form L_static = I + (N/σ²_obs) · H B_inflated Hᵀ
+        # The +I term arises from the observation noise contribution to the
+        # WME predicted covariance: (1/N) Σ_k R^{-1/2} Cov(ε_k) R^{-1/2} = I.
+        # This matches the dynamic L_wme computation in cost_functions.py:1695.
+        HB = H * B_diag_inflated[np.newaxis, :]
+        L_dense = np.eye(d_obs) + (n_obs_times / obs_variance) * (HB @ H.T)
+
+        # Free large intermediate arrays
+        del H, HB, B_diag_inflated
+        import gc; gc.collect()
 
     # Step 3: Eigenvalue regularization (same as dynamic Layer 2)
     eigvals, eigvecs = np.linalg.eigh(L_dense)
@@ -1729,31 +1860,49 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
     eigvals_reg = np.maximum(eigvals, gamma_floor)
     L_dense = eigvecs @ np.diag(eigvals_reg) @ eigvecs.T
 
+    lambda_min_raw = float(eigvals.min())
+    lambda_max_raw = float(eigvals.max())
+    ratio_raw = lambda_max_raw / max(lambda_min_raw, 1e-30)
     if rank == 0:
         print(f"  Static L_wme: {n_natural}/{d_obs} natural, {n_floored}/{d_obs} floored")
+        print(f"  [L_wme spectrum] λ_max={lambda_max_raw:.4e}  λ_min={lambda_min_raw:.4e}  "
+              f"ratio={ratio_raw:.2e}")
+        if obs_correlation_length > 0:
+            # Report how many eigenvalues meaningfully exceed 1 — these are the
+            # directions where the predictability term actually does work.
+            n_above_2 = int(np.sum(eigvals > 2.0))
+            n_above_10 = int(np.sum(eigvals > 10.0))
+            n_above_100 = int(np.sum(eigvals > 100.0))
+            print(f"  [L_wme spectrum] eigenvalues > 2.0: {n_above_2}/{d_obs}, "
+                  f"> 10: {n_above_10}, > 100: {n_above_100}")
 
     diagnostics['eigvals_raw'] = eigvals.tolist()
     diagnostics['eigvals_regularized'] = eigvals_reg.tolist()
     diagnostics['gamma_floor'] = float(gamma_floor)
     diagnostics['n_natural'] = int(n_natural)
     diagnostics['n_floored'] = int(n_floored)
+    diagnostics['lambda_min_raw'] = lambda_min_raw
+    diagnostics['lambda_max_raw'] = lambda_max_raw
+    diagnostics['spectrum_ratio_raw'] = float(ratio_raw)
     diagnostics['raw_spectrum'] = _summarize_eigenvalues(eigvals)
     diagnostics['regularized_spectrum'] = _summarize_eigenvalues(eigvals_reg)
 
-    # Create PETSc Mat from numpy array
-    mat = PETSc.Mat().create(comm=comm)
+    # L_wme operates on sequential Q_wme vectors (obs-space is COMM_SELF).
+    # Build the matrix on COMM_SELF so every rank holds an identical full copy
+    # that matches Q_wme's communicator. Distributed MPI Cholesky would require
+    # MUMPS; this serial-per-rank path is cheaper and MPI-safe for small d_obs.
+    mat = PETSc.Mat().create(comm=PETSc.COMM_SELF)
     mat.setSizes((d_obs, d_obs))
     mat.setType(PETSc.Mat.Type.DENSE)
     mat.setUp()
 
-    if rank == 0:
-        for i in range(d_obs):
-            mat.setValues(i, list(range(d_obs)), L_dense[i, :])
+    for i in range(d_obs):
+        mat.setValues(i, list(range(d_obs)), L_dense[i, :])
 
     mat.assemblyBegin()
     mat.assemblyEnd()
 
-    L_wme_cov = DenseCovariance(comm, mat, inverse_method="cholesky")
+    L_wme_cov = DenseCovariance(PETSc.COMM_SELF, mat, inverse_method="cholesky")
 
     return L_wme_cov, diagnostics
 

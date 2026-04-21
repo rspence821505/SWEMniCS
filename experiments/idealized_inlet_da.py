@@ -52,6 +52,15 @@ MEM_LIMIT_MB = 8 * 1024
 
 
 def _get_process_memory_mb():
+    """Current RSS in MB. Prefers psutil (current RSS); falls back to
+    ru_maxrss (which is PEAK RSS on macOS and monotonic-non-decreasing,
+    overly conservative for a per-iteration guard).
+    """
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        pass
     try:
         import resource, platform
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -444,8 +453,14 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         # Uses the truth trajectory + Jacobians to compute the Gram matrix
         # G = J_wme^T J_wme over the full DA window, then derives
         # σ_b² ≥ γ / λ_min(G) and inflates B per-component.
+        # Cost: 1 adjoint solve per observation point. For 1163 obs at
+        # ~25 s/adjoint = ~8 hours. Skip with --skip-tlm-eq38 for fast
+        # comparisons; falls back to default σ_b² without inflation.
         eq38_result = None
-        if truth_jacobians is not None:
+        if args.skip_tlm_eq38:
+            print("  Step 7a: --skip-tlm-eq38 set — skipping TLM Eq 38 (using default σ_b²)")
+            obs_variance = float(obs_noise_stds.mean() ** 2)
+        elif truth_jacobians is not None:
             print("  Step 7a: Computing σ_b² from Eq 38 via TLM...")
             # Need a forward model wrapper for the WME QoI constructor
             gram_fwd = ForwardModelWrapper(
@@ -474,12 +489,15 @@ def run_single_method(args, method, l_wme_mode, output_dir):
 
         # Step 7b: Static L_wme (skip internal inflation since TLM already inflated B)
         already_inflated = eq38_result is not None
-        print(f"  Step 7b: Computing static L_wme (skip_eq38_inflation={already_inflated})...")
-        static_lwme, _ = _compute_static_L_wme(
+        print(f"  Step 7b: Computing static L_wme (skip_eq38_inflation={already_inflated}, "
+              f"obs_correlation_length={args.obs_correlation_length:.0f} m, "
+              f"predictability_gamma={args.predictability_gamma})...")
+        static_lwme, lwme_diag = _compute_static_L_wme(
             obs_operator, B, len(obs_times), obs_variance,
-            m_true, predictability_gamma=0.1,
+            m_true, predictability_gamma=args.predictability_gamma,
             adaptive_gamma=True, comm=comm, rank=rank,
             skip_eq38_inflation=already_inflated,
+            obs_correlation_length=args.obs_correlation_length,
         )
         _check_memory("after static L_wme")
 
@@ -557,9 +575,24 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         history["cost"].append(float(f))
         history["grad_norm"].append(float(gnorm))
         history["rmse_from_truth"].append(rmse)
+
+        # Memory safety: PETSc + Python GC between iterations to release
+        # transient trajectory/Jacobian objects, then check RSS against
+        # a HARD limit. If exceeded, abort cleanly instead of swap-thrashing.
+        _cleanup()
+        rss = _get_process_memory_mb()
+        hard_limit = MEM_LIMIT_MB  # from env --mem-limit-gb
         if rank == 0:
             print(f"  [iter {iteration}] cost={f:.4f}  ||grad||={gnorm:.4e}  "
-                  f"RMSE_truth={rmse:.6f}", flush=True)
+                  f"RMSE_truth={rmse:.6f}  RSS={rss:.0f} MB", flush=True)
+        if rss is not None and rss > hard_limit:
+            msg = (f"Rank {rank}: RSS {rss:.0f} MB exceeded limit "
+                   f"{hard_limit:.0f} MB at iter {iteration}. Aborting to "
+                   f"protect the system.")
+            if rank == 0:
+                print(f"  [ABORT] {msg}", flush=True)
+            # Abort MPI cleanly rather than let the OS OOM-kill or swap-thrash
+            comm.Abort(1)
 
     optimizer = PETScTAOWrapper(
         cost_fn, tao_type="blmvm",
@@ -572,6 +605,18 @@ def run_single_method(args, method, l_wme_mode, output_dir):
             "cost_tolerance": 1e-4,
             "verbose": True,
             "iteration_callback": iteration_callback,
+            # Cap per-step backtracks. Default 30 lets TAO spend an hour+
+            # silently probing after a single forward failure (observed in
+            # DC-WME runs v1/v2/v3 before LS_FAILURE would be raised).
+            # With 5, any genuinely bad direction fails fast and control
+            # returns to our 3-consecutive-failure bailout in the wrapper.
+            "line_search_max_funcs": 5,
+            # Memory-safety: cap BLMVM's limited-memory Hessian history.
+            # Each history pair is 2 state vectors (208K × 8 B × 2 ≈ 3.3 MB
+            # × 2 ranks), and PETSc internals duplicate these. Default is
+            # 5 — we set 3 explicitly for safety on this mesh.
+            "tao_lmvm_hist_size": 3,
+            "tao_blmvm_hist_size": 3,
         },
     )
 
@@ -613,6 +658,30 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     except Exception:
         conv_info = {"converged": bool(optimizer.converged), "iteration": int(optimizer.iteration)}
 
+    # Strip verbose fields from L_wme diagnostics before JSON dump (eigvalue
+    # lists of size d_obs=1163 bloat the file); keep summary scalars + the
+    # top/bottom 20 eigenvalues for inspection.
+    lwme_diagnostics_summary = None
+    if method == "dcwme" and 'lwme_diag' in locals() and lwme_diag is not None:
+        evr = np.asarray(lwme_diag.get('eigvals_raw', []), dtype=float)
+        lwme_diagnostics_summary = {
+            "obs_correlation_length": lwme_diag.get('obs_correlation_length', 0.0),
+            "sigma_b2": lwme_diag.get('sigma_b2'),
+            "lambda_min_G": lwme_diag.get('lambda_min_G'),
+            "lambda_max_G": lwme_diag.get('lambda_max_G'),
+            "lambda_min_raw": lwme_diag.get('lambda_min_raw'),
+            "lambda_max_raw": lwme_diag.get('lambda_max_raw'),
+            "spectrum_ratio_raw": lwme_diag.get('spectrum_ratio_raw'),
+            "inflation_factor": lwme_diag.get('inflation_factor'),
+            "gamma_floor": lwme_diag.get('gamma_floor'),
+            "n_natural": lwme_diag.get('n_natural'),
+            "n_floored": lwme_diag.get('n_floored'),
+            "raw_spectrum": lwme_diag.get('raw_spectrum'),
+            "regularized_spectrum": lwme_diag.get('regularized_spectrum'),
+            "eigvals_top20": sorted(evr.tolist(), reverse=True)[:20] if evr.size else [],
+            "eigvals_bot20": sorted(evr.tolist())[:20] if evr.size else [],
+        }
+
     result = {
         "method": method,
         "l_wme_mode": l_wme_mode,
@@ -624,6 +693,7 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         "mpi_size": comm.size,
         "iteration_history": history,
         "convergence": conv_info,
+        "lwme_diagnostics": lwme_diagnostics_summary,
         "config": {
             "vmax": args.vmax, "track_shift_km": args.track_shift,
             "nt_ramp": nt_ramp, "nt_da": nt_da, "dt": dt,
@@ -631,11 +701,16 @@ def run_single_method(args, method, l_wme_mode, output_dir):
             "obs_frequency": args.obs_frequency,
             "obs_noise_level": args.obs_noise_level,
             "background_error_std": args.background_error_std,
+            "obs_correlation_length": args.obs_correlation_length,
+            "predictability_gamma": args.predictability_gamma,
         },
     }
 
     safe_mode = l_wme_mode.replace("/", "_")
-    result_file = output_dir / f"result_{method}_{safe_mode}.json"
+    tag = f"_Lcorr{int(args.obs_correlation_length):d}" if args.obs_correlation_length > 0 else ""
+    if method == "dcwme" and abs(args.predictability_gamma - 0.1) > 1e-9:
+        tag += f"_g{args.predictability_gamma:.3f}".rstrip('0').rstrip('.')
+    result_file = output_dir / f"result_{method}_{safe_mode}{tag}.json"
     if rank == 0:
         with open(result_file, "w") as f:
             json.dump(result, f, indent=2)
@@ -676,6 +751,23 @@ def main():
                         help="Gradient smoother correlation length (m). Default 500. "
                              "Larger L blows up the sparse smoother (nnz ~ L^2): on idealized inlet, "
                              "L=500 -> ~2 GB, L=1000 -> ~8 GB, L=2000 -> ~32 GB. Stay <=700.")
+    parser.add_argument("--skip-tlm-eq38", action="store_true",
+                        help="Skip TLM-based Eq 38 inflation in DC-WME setup. "
+                             "Eq 38 requires 1 adjoint solve per obs point (~8h for 1163 obs). "
+                             "Falls back to default obs_variance for σ_b².")
+    parser.add_argument("--obs-correlation-length", type=float, default=0.0,
+                        help="If > 0, build DC-WME static L_wme from an obs-space Gaussian "
+                             "kernel with this correlation length (m) — mathematically "
+                             "equivalent to using a Gaussian-correlated B in the point-obs "
+                             "limit (error O((cell_size/L)²)). Avoids building a dense "
+                             "correlated B (infeasible at 208K DOFs). Background penalty "
+                             "remains diagonal for both methods. Typical L: 1000-2000 m.")
+    parser.add_argument("--predictability-gamma", type=float, default=0.1,
+                        help="DC-WME spectral floor parameter γ (adaptive: floor = γ·λ_max). "
+                             "Lower γ → less aggressive flooring → wider per-direction weight "
+                             "range [1 − 1/γ·λ_max, 1 − 1/λ_max]. Default 0.1 collapses most "
+                             "weights to ≈ 1 − 1/γ·λ_max on a correlated-B spectrum; try "
+                             "0.01 or 0.001 to broaden the differential descent.")
     parser.add_argument("--mem-limit-gb", type=float, default=8.0)
     args = parser.parse_args()
 

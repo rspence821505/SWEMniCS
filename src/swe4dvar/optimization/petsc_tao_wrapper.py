@@ -257,6 +257,12 @@ class PETScTAOWrapper(Optimizer):
                     g.set(0.0)
                 return self._last_cost if hasattr(self, '_last_cost') else 0.0
 
+            # Diagnostic: log entry to obj_grad callback so we can see if TAO
+            # is calling us (vs. spinning in internal BLMVM work).
+            if self.verbose and self.comm.rank == 0:
+                print(f"  [TAO callback] entering eval #{self.n_func_evals + 1}",
+                      flush=True)
+
             # Use efficient combined method if available (avoids double forward solve)
             if hasattr(self.cost_function, 'value_gradient'):
                 f, grad = self.cost_function.value_gradient(x)
@@ -266,19 +272,41 @@ class PETScTAOWrapper(Optimizer):
 
                 # Check for infinity (forward model failure)
                 if not np.isfinite(f):
+                    self._consec_failures = getattr(self, '_consec_failures', 0) + 1
                     if self.verbose and self.comm.rank == 0:
-                        print(f"  [TAO callback] eval #{self.n_func_evals}: cost=inf (forward model failure)",
+                        print(f"  [TAO callback] eval #{self.n_func_evals}: cost=inf "
+                              f"(forward model failure, consec={self._consec_failures})",
                               flush=True)
                     # CRITICAL FIX: Don't set gradient to zero! TAO will think it converged.
                     # Instead, return background penalty gradient to push back toward m_b
                     if hasattr(self.cost_function, 'compute_background_gradient'):
+                        if self.verbose and self.comm.rank == 0:
+                            print(f"  [TAO callback] computing background gradient...",
+                                  flush=True)
                         grad_b = self.cost_function.compute_background_gradient(x)
                         grad_b.copy(g)
                         grad_b.destroy()
+                        if self.verbose and self.comm.rank == 0:
+                            print(f"  [TAO callback] returning 1e20 for eval #{self.n_func_evals}",
+                                  flush=True)
                     else:
                         # Fallback: set small non-zero gradient to prevent TAO from thinking it converged
                         g.set(1e-10)
+                    # Bail out if too many consecutive forward failures — TAO
+                    # BLMVM can silently stall on repeated inf returns; set
+                    # DIVERGED_USER so the solver exits cleanly.
+                    if self._consec_failures >= 3:
+                        if self.verbose and self.comm.rank == 0:
+                            print(f"  [TAO callback] {self._consec_failures} consecutive "
+                                  f"forward failures — requesting TAO termination",
+                                  flush=True)
+                        tao.setConvergedReason(
+                            PETSc.TAO.ConvergedReason.DIVERGED_USER
+                        )
                     return 1e20
+                else:
+                    # Reset consecutive-failure counter on any successful eval.
+                    self._consec_failures = 0
 
                 self._last_cost = f
                 self._last_grad = grad.copy()
