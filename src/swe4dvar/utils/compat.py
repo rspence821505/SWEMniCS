@@ -51,12 +51,13 @@ def create_petsc_vector_from_map(index_map, block_size):
     """Create a PETSc ``Vec`` from a DOLFINx IndexMap.
 
     Cross-version replacement for ``dolfinx.la.create_petsc_vector``:
-    dolfinx 0.9 exposes it at ``dolfinx.la.create_petsc_vector``;
-    0.10 relocated it to ``dolfinx.la.petsc.create_vector`` and
-    dropped the top-level ``la.create_petsc_vector`` symbol.
+
+    - dolfinx 0.9: ``la.create_petsc_vector(index_map, block_size)``
+    - dolfinx 0.10: ``la.petsc.create_vector(maps)`` where ``maps`` is a
+      ``list[tuple[IndexMap, int]]``.
     """
     if _DOLFINX_010_OR_NEWER:
         from dolfinx.la.petsc import create_vector as _create
-        return _create(index_map, block_size)
+        return _create([(index_map, block_size)])
     from dolfinx import la as _la
     return _la.create_petsc_vector(index_map, block_size)
