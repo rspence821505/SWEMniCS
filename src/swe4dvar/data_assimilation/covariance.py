@@ -70,8 +70,14 @@ class CovarianceMatrix(ABC):
         # communicator (COMM_SELF obs vectors vs. COMM_WORLD covariance was the
         # np=2 bug at covariance.py:193). Template's getComm() wins over the
         # `comm` argument.
+        #
+        # petsc4py.PETSc.Vec.getComm() returns a `petsc4py.PETSc.Comm`, which
+        # does NOT have `.allreduce` / `.Get_size` / etc. used by this class
+        # (e.g. min_eigenvalue). Convert to mpi4py via .tompi4py() so self.comm
+        # is always an mpi4py.MPI.Comm regardless of the provenance.
         if template_vec is not None:
-            self.comm = template_vec.getComm()
+            raw_comm = template_vec.getComm()
+            self.comm = raw_comm.tompi4py() if hasattr(raw_comm, "tompi4py") else raw_comm
             self.local_size = template_vec.getLocalSize()
             self.ownership_range = template_vec.getOwnershipRange()
         else:
