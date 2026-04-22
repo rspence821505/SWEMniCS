@@ -470,6 +470,19 @@ def run_single_method(args, method, l_wme_mode, output_dir):
             )
             obs_variance = float(obs_noise_stds.mean() ** 2)
 
+            # Optional: component-aware Eq 38 (separate h / uv Grams). Reuses
+            # the same adjoint vectors; adds O(n_obs²) dot products and two
+            # small eigen-decompositions — trivial vs the adjoint cost.
+            component_indices = None
+            if getattr(args, "eq38_component_aware", False):
+                import numpy as _np
+                uv_owned = _np.concatenate([u_indices, v_indices])
+                uv_owned.sort()
+                component_indices = {"h": h_indices, "uv": uv_owned}
+                print(f"  Step 7a: component-aware Eq 38 enabled "
+                      f"(h DOFs={len(h_indices)}, uv DOFs={len(uv_owned)})",
+                      flush=True)
+
             eq38_result = _compute_eq38_from_tlm(
                 forward_model=gram_fwd,
                 obs_operator=obs_operator,
@@ -481,8 +494,10 @@ def run_single_method(args, method, l_wme_mode, output_dir):
                 truth_jacobians=truth_jacobians,
                 predictability_gamma=0.1,
                 comm=comm, rank=rank,
+                component_indices=component_indices,
             )
-            _apply_eq38_to_B(B, eq38_result, rank=rank)
+            _apply_eq38_to_B(B, eq38_result, rank=rank,
+                             component_indices=component_indices)
             _check_memory("after TLM Eq 38")
         else:
             print("  Step 7a: No truth Jacobians — skipping TLM Eq 38")
@@ -769,6 +784,14 @@ def main():
                              "range [1 − 1/γ·λ_max, 1 − 1/λ_max]. Default 0.1 collapses most "
                              "weights to ≈ 1 − 1/γ·λ_max on a correlated-B spectrum; try "
                              "0.01 or 0.001 to broaden the differential descent.")
+    parser.add_argument("--eq38-component-aware", action="store_true",
+                        help="Run TLM Eq 38 with separate h / uv Grams and apply "
+                             "per-component σ_b² bounds to B (instead of the "
+                             "scalar bound applied regardless of component). No "
+                             "extra adjoint solves — the per-component Grams are "
+                             "built from the same adjoint vectors. See "
+                             "experiments/shinnecock_study/run_comparison.py:"
+                             "_compute_eq38_from_tlm.")
     parser.add_argument("--mem-limit-gb", type=float, default=8.0)
     args = parser.parse_args()
 

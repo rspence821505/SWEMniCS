@@ -240,7 +240,8 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
                             m_linearize, observations, obs_times,
                             truth_trajectory, truth_jacobians,
                             predictability_gamma=0.1,
-                            comm=None, rank=0):
+                            comm=None, rank=0,
+                            component_indices=None):
     """Compute σ_b² from Eq 38 using the truth trajectory's TLM (Spence et al. 2025).
 
     Uses an already-computed trajectory + Jacobians (typically the truth trajectory)
@@ -273,12 +274,19 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
         MPI communicator.
     rank : int
         MPI rank for print control.
+    component_indices : dict, optional
+        When provided, also build per-component Grams and return per-component
+        σ_b² bounds. Expected keys: ``"h"`` (local-owned DOF indices for h)
+        and ``"uv"`` (local-owned DOF indices for combined u,v). Adjoint
+        solves are shared with the scalar path — this is a cheap extension.
 
     Returns
     -------
     dict
         Keys: sigma_b_sq, lambda_min_G, lambda_max_G, gram_eigvals,
         gram_condition, predictability_gamma.
+        When ``component_indices`` is given, additionally:
+        sigma_b_sq_h, sigma_b_sq_uv, lambda_min_G_h, lambda_min_G_uv.
     """
     import time as _time
     import gc
@@ -331,7 +339,7 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
 
     t_adj = _time.perf_counter() - t1
 
-    # Form Gram matrix G[i,j] = a_i^T a_j
+    # Form Gram matrix G[i,j] = a_i^T a_j (full state-space dot product)
     G = np.zeros((n_obs, n_obs))
     for i in range(n_obs):
         for j in range(i, n_obs):
@@ -347,6 +355,52 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
     # Eq 38: σ_b² ≥ γ / λ_min(G)  (J_wme absorbs R^{-1/2} and 1/√N)
     sigma_b_sq = predictability_gamma / lambda_min_G
 
+    # ------------------------------------------------------------------
+    # Optional: per-component Grams (h-only, uv-only) from the SAME
+    # adjoint vectors. No extra PDE work — just slice getArray() by
+    # component DOF indices and take local dots, then MPI Allreduce.
+    # ------------------------------------------------------------------
+    component_result = {}
+    if component_indices is not None:
+        from mpi4py import MPI as _MPI
+        h_idx  = np.asarray(component_indices["h"], dtype=np.int64)
+        uv_idx = np.asarray(component_indices["uv"], dtype=np.int64)
+
+        # Cache local arrays to avoid per-(i,j) reallocation
+        local_h  = [v.getArray()[h_idx]  for v in adjoint_vectors]
+        local_uv = [v.getArray()[uv_idx] for v in adjoint_vectors]
+
+        G_h  = np.zeros((n_obs, n_obs))
+        G_uv = np.zeros((n_obs, n_obs))
+        for i in range(n_obs):
+            for j in range(i, n_obs):
+                vh  = float(np.dot(local_h[i],  local_h[j]))
+                vuv = float(np.dot(local_uv[i], local_uv[j]))
+                if comm is not None and comm.Get_size() > 1:
+                    vh  = comm.allreduce(vh,  op=_MPI.SUM)
+                    vuv = comm.allreduce(vuv, op=_MPI.SUM)
+                G_h[i, j]  = G_h[j, i]  = vh
+                G_uv[i, j] = G_uv[j, i] = vuv
+
+        # Extract each spectrum. Per-component Grams can be near-rank-deficient
+        # (esp. G_h for h-only obs). Floor λ_min with an adaptive γ × λ_max
+        # lower bound — same pattern the kernel path uses for its G (line 1701).
+        eigs_h  = np.linalg.eigvalsh(G_h)
+        eigs_uv = np.linalg.eigvalsh(G_uv)
+        lmin_h  = max(eigs_h.min(),  predictability_gamma * eigs_h.max(),  1e-30)
+        lmin_uv = max(eigs_uv.min(), predictability_gamma * eigs_uv.max(), 1e-30)
+        sigma_b_sq_h  = predictability_gamma / lmin_h
+        sigma_b_sq_uv = predictability_gamma / lmin_uv
+
+        component_result = {
+            "sigma_b_sq_h":  float(sigma_b_sq_h),
+            "sigma_b_sq_uv": float(sigma_b_sq_uv),
+            "lambda_min_G_h":  float(lmin_h),
+            "lambda_max_G_h":  float(eigs_h.max()),
+            "lambda_min_G_uv": float(lmin_uv),
+            "lambda_max_G_uv": float(eigs_uv.max()),
+        }
+
     if rank == 0:
         print(f"  [Eq 38 TLM] Adjoint solves: {t_adj:.1f}s")
         print(f"  [Eq 38 TLM] Gram matrix G ({n_obs}×{n_obs}):")
@@ -357,6 +411,14 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
         print(f"    rank (>1e-10) = {np.sum(gram_eigvals > 1e-10)}/{n_obs}")
         print(f"  [Eq 38 TLM] σ_b² = γ / λ_min(G) = {predictability_gamma} / {lambda_min_G:.6e}")
         print(f"  [Eq 38 TLM] σ_b² = {sigma_b_sq:.6e}  (σ_b = {np.sqrt(sigma_b_sq):.6e})")
+        if component_result:
+            print(f"  [Eq 38 TLM] Per-component Grams:")
+            print(f"    h:  λ_min(G_h)  = {component_result['lambda_min_G_h']:.6e}  "
+                  f"λ_max = {component_result['lambda_max_G_h']:.6e}  "
+                  f"→ σ_b²_h  = {component_result['sigma_b_sq_h']:.6e}")
+            print(f"    uv: λ_min(G_uv) = {component_result['lambda_min_G_uv']:.6e}  "
+                  f"λ_max = {component_result['lambda_max_G_uv']:.6e}  "
+                  f"→ σ_b²_uv = {component_result['sigma_b_sq_uv']:.6e}")
         print(f"  [Eq 38 TLM] Total time: {_time.perf_counter() - t0:.1f}s")
 
     # Cleanup adjoint vectors (don't destroy trajectory — caller owns it)
@@ -365,7 +427,7 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
     del adjoint_vectors, G
     gc.collect()
 
-    return {
+    result = {
         "sigma_b_sq": sigma_b_sq,
         "lambda_min_G": float(lambda_min_G),
         "lambda_max_G": float(lambda_max_G),
@@ -374,9 +436,11 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
         "predictability_gamma": predictability_gamma,
         "gram_spectrum": _summarize_eigenvalues(gram_eigvals),
     }
+    result.update(component_result)
+    return result
 
 
-def _apply_eq38_to_B(B, eq38_result, rank=0):
+def _apply_eq38_to_B(B, eq38_result, rank=0, component_indices=None):
     """Inflate B per-component so that every diagonal entry ≥ σ_b² from Eq 38.
 
     Unlike uniform scaling (which over-inflates components already above the
@@ -388,15 +452,34 @@ def _apply_eq38_to_B(B, eq38_result, rank=0):
     B : DiagonalCovariance
         Background covariance (modified in place).
     eq38_result : dict
-        Output from _compute_eq38_from_tlm. Must contain 'sigma_b_sq'.
+        Output from _compute_eq38_from_tlm. Must contain 'sigma_b_sq'. When it
+        also contains 'sigma_b_sq_h' and 'sigma_b_sq_uv' AND component_indices
+        is provided, per-component bounds are applied block-wise instead of the
+        single scalar.
     rank : int
         MPI rank for print control.
+    component_indices : dict, optional
+        Maps 'h' and 'uv' to local-owned DOF indices (aligned with
+        B.diagonal.getArray()). Required to activate the per-component path.
 
     Returns
     -------
     float
         Maximum scale factor applied to any single DOF.
     """
+    # Component-aware branch: honor per-component bounds when both the Eq 38
+    # result carries them AND the caller passed DOF indices. Otherwise fall
+    # through to the historical scalar path.
+    component_mode = (
+        component_indices is not None
+        and "sigma_b_sq_h" in eq38_result
+        and "sigma_b_sq_uv" in eq38_result
+    )
+    if component_mode:
+        return _apply_eq38_to_B_components(
+            B, eq38_result, component_indices, rank=rank
+        )
+
     sigma_b_sq = eq38_result["sigma_b_sq"]
 
     diag_arr = B.diagonal.getArray()
@@ -442,6 +525,63 @@ def _apply_eq38_to_B(B, eq38_result, rank=0):
         max_scale = 1.0
         if rank == 0:
             print(f"  [Eq 38] All DOFs already satisfy Eq 38 (no inflation needed)")
+
+    return max_scale
+
+
+def _apply_eq38_to_B_components(B, eq38_result, component_indices, rank=0):
+    """Component-wise counterpart of :func:`_apply_eq38_to_B`.
+
+    Applies σ_b²_h to h DOFs and σ_b²_uv to u,v DOFs independently. A DOF
+    within a component is inflated only when its current variance is below
+    the bound for that component.
+
+    Returns the maximum per-DOF scale factor actually applied, across all
+    components (for logging consistency with the scalar path).
+    """
+    sig_h  = float(eq38_result["sigma_b_sq_h"])
+    sig_uv = float(eq38_result["sigma_b_sq_uv"])
+
+    h_idx  = np.asarray(component_indices["h"],  dtype=np.int64)
+    uv_idx = np.asarray(component_indices["uv"], dtype=np.int64)
+
+    diag_arr     = B.diagonal.getArray()
+    inv_diag_arr = B.inv_diagonal.getArray()
+
+    diag_h  = diag_arr[h_idx]
+    diag_uv = diag_arr[uv_idx]
+
+    below_h_local  = h_idx[diag_h < sig_h]
+    below_uv_local = uv_idx[diag_uv < sig_uv]
+
+    n_below_h  = int(below_h_local.size)
+    n_below_uv = int(below_uv_local.size)
+
+    max_scale = 1.0
+    if n_below_h > 0:
+        max_scale = max(max_scale, sig_h / max(diag_arr[below_h_local].min(), 1e-300))
+        diag_arr[below_h_local]     = sig_h
+        inv_diag_arr[below_h_local] = 1.0 / sig_h
+    if n_below_uv > 0:
+        max_scale = max(max_scale, sig_uv / max(diag_arr[below_uv_local].min(), 1e-300))
+        diag_arr[below_uv_local]     = sig_uv
+        inv_diag_arr[below_uv_local] = 1.0 / sig_uv
+
+    if n_below_h > 0 or n_below_uv > 0:
+        B.diagonal.setArray(diag_arr)
+        B.diagonal.assemble()
+        B.inv_diagonal.setArray(inv_diag_arr)
+        B.inv_diagonal.assemble()
+
+    # Collective for correct global reporting at np>=2
+    min_B = B.min_eigenvalue()
+
+    if rank == 0:
+        print(f"  [Eq 38/components] h:  bound σ_b²_h  = {sig_h:.6e}  "
+              f"inflated {n_below_h}/{h_idx.size} DOFs", flush=True)
+        print(f"  [Eq 38/components] uv: bound σ_b²_uv = {sig_uv:.6e}  "
+              f"inflated {n_below_uv}/{uv_idx.size} DOFs", flush=True)
+        print(f"  [Eq 38/components] min(B) = {min_B:.6e}", flush=True)
 
     return max_scale
 
