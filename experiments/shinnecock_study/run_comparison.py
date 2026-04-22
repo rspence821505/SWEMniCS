@@ -1626,9 +1626,18 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
     from petsc4py import PETSc
     from mpi4py import MPI
     from swe4dvar.data_assimilation.covariance import DenseCovariance
+    import time as _time, sys as _sys
 
+    def _tlog(msg):
+        if rank == 0:
+            print(f"  [L_wme.t={_time.time() - _t0:.1f}s] {msg}", flush=True)
+
+    _t0 = _time.time()
+    _tlog("entered _compute_static_L_wme")
     d_obs = obs_operator.get_num_observations()
+    _tlog(f"got d_obs={d_obs}")
     n_state = m_template.getSize()
+    _tlog(f"got n_state={n_state}")
 
     # Branch: obs-space Gaussian kernel path (for correlated-B experiments)
     # ---------------------------------------------------------------------
@@ -1751,13 +1760,13 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
         # Extract H matrix via adjoint: H^T e_i gives row i of H
         # This is O(d_obs) applications instead of O(n_state) — much faster
         # (306 vs 52020 for Shinnecock)
-        if rank == 0:
-            print(f"  Extracting H matrix ({d_obs} × {n_state}) via {d_obs} adjoint applications...")
+        _tlog(f"else-branch: extracting H matrix ({d_obs} x {n_state}) via {d_obs} adjoint applications")
 
         H = np.zeros((d_obs, n_state))
 
         # Create observation-space unit vector
         obs_vec = obs_operator.forward(m_template)  # get correctly sized obs vector
+        _tlog("obs_operator.forward(m_template) done")
         obs_vec.zeroEntries()
 
         for i in range(d_obs):
@@ -1779,20 +1788,23 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
             HT_ei.destroy()
         obs_vec.destroy()
 
-        if rank == 0:
-            print(f"  H extracted: {np.count_nonzero(H)} nonzeros out of {d_obs * n_state}")
+        _tlog(f"H extracted: {np.count_nonzero(H)} nonzeros out of {d_obs * n_state}")
 
         # Get B diagonal
         B_diag = B.diagonal.getArray().copy()
+        _tlog(f"got local B.diagonal (size={len(B_diag)})")
         # Gather full diagonal (for MPI)
         if comm is not None and comm.Get_size() > 1:
+            _tlog(f"np>1: allreducing B_diag to full n_state={n_state}")
             B_diag_full = np.zeros(n_state)
             start, end = B.diagonal.getOwnershipRange()
             B_diag_full[start:end] = B_diag
             comm.Allreduce(B_diag_full.copy(), B_diag_full)
             B_diag = B_diag_full
+            _tlog("allreduce B_diag done")
 
         current_min_var = B_diag.min()
+        _tlog(f"current_min_var={current_min_var:.4e}")
 
         # Step 1: B inflation for Eq 38 predictability bound
         if skip_eq38_inflation:
@@ -1832,20 +1844,25 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
                     print(f"  [Eq 38] Static: no B inflation needed")
 
         B_diag_inflated = B_diag * alpha if alpha > 1.0 else B_diag
+        _tlog(f"B_diag_inflated ready (alpha={alpha:.4e})")
 
         # Step 2: Form L_static = I + (N/σ²_obs) · H B_inflated Hᵀ
         # The +I term arises from the observation noise contribution to the
         # WME predicted covariance: (1/N) Σ_k R^{-1/2} Cov(ε_k) R^{-1/2} = I.
         # This matches the dynamic L_wme computation in cost_functions.py:1695.
         HB = H * B_diag_inflated[np.newaxis, :]
+        _tlog(f"HB formed (shape {HB.shape})")
         L_dense = np.eye(d_obs) + (n_obs_times / obs_variance) * (HB @ H.T)
+        _tlog(f"L_dense formed (shape {L_dense.shape})")
 
         # Free large intermediate arrays
         del H, HB, B_diag_inflated
         import gc; gc.collect()
 
     # Step 3: Eigenvalue regularization (same as dynamic Layer 2)
+    _tlog(f"entering np.linalg.eigh(L_dense) shape={L_dense.shape}")
     eigvals, eigvecs = np.linalg.eigh(L_dense)
+    _tlog("eigh done")
 
     if adaptive_gamma:
         gamma_floor = predictability_gamma * eigvals.max()
@@ -1903,6 +1920,7 @@ def _compute_static_L_wme(obs_operator, B, n_obs_times, obs_variance,
     mat.assemblyEnd()
 
     L_wme_cov = DenseCovariance(PETSc.COMM_SELF, mat, inverse_method="cholesky")
+    _tlog(f"DenseCovariance built; exiting _compute_static_L_wme")
 
     return L_wme_cov, diagnostics
 
