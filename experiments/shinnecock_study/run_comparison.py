@@ -429,10 +429,15 @@ def _apply_eq38_to_B(B, eq38_result, rank=0):
         B.inv_diagonal.setArray(inv_diag_arr)
         B.inv_diagonal.assemble()
 
+        # B.min_eigenvalue() is a COLLECTIVE (comm.allreduce on line 362 of
+        # covariance.py). Must be called by every rank, NOT inside the
+        # rank==0 guard — that deadlocks at np>=2 (LS6 Step 7b hang,
+        # run 3098388 / 3099557 / 3099697).
+        min_B = B.min_eigenvalue()
         if rank == 0:
             print(f"  [Eq 38] Inflated {n_below} DOFs to σ_b²={sigma_b_sq:.6e} "
-                  f"(max scale: {max_scale:.2f}x)")
-            print(f"  [Eq 38] min(B) = {B.min_eigenvalue():.6e}")
+                  f"(max scale: {max_scale:.2f}x)", flush=True)
+            print(f"  [Eq 38] min(B) = {min_B:.6e}", flush=True)
     else:
         max_scale = 1.0
         if rank == 0:
