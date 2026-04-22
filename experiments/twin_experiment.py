@@ -462,11 +462,11 @@ class TwinExperiment:
         # Using createWithArray(full_array, comm=COMM_WORLD) would include ghost DOFs
         # in the global size, causing size mismatches with vectors created during
         # the forward model solve (which use la.create_petsc_vector).
-        from dolfinx import la
+        from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm_
         u_owned_size = self.solver.V.dofmap.index_map.size_local * self.solver.V.dofmap.index_map_bs
         self.truth_trajectory = []
         for state_array in self.solver.storage.saved_states:
-            vec = la.create_petsc_vector(
+            vec = _cvm_(
                 self.solver.V.dofmap.index_map,
                 self.solver.V.dofmap.index_map_bs,
             )

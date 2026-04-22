@@ -248,8 +248,9 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     # misfit between forward model trajectory and observations.
     m_true_arr = ramp_end_state
     truth_trajectory = []
+    from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm_
     for s in solver_truth.storage.saved_states:
-        vec = la.create_petsc_vector(solver_truth.V.dofmap.index_map, solver_truth.V.dofmap.index_map_bs)
+        vec = _cvm_(solver_truth.V.dofmap.index_map, solver_truth.V.dofmap.index_map_bs)
         vec.setArray(s[:state_size])
         vec.assemble()
         truth_trajectory.append(vec)
@@ -331,7 +332,7 @@ def run_single_method(args, method, l_wme_mode, output_dir):
 
     # Inject truth (bypass _generate_truth which would run with DA wind)
     exp.truth_trajectory = truth_trajectory
-    m_true = la.create_petsc_vector(solver_da.V.dofmap.index_map, solver_da.V.dofmap.index_map_bs)
+    m_true = _cvm_(solver_da.V.dofmap.index_map, solver_da.V.dofmap.index_map_bs)
     m_true.setArray(m_true_arr)
     m_true.assemble()
     exp.m_true = m_true
