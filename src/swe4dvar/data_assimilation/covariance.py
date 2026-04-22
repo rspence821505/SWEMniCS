@@ -63,15 +63,19 @@ class CovarianceMatrix(ABC):
             will use the same MPI partitioning as this vector. If None, PETSc
             will automatically determine partitioning (may not match FEM vectors).
         """
-        self.comm = comm
         self.size = size
 
-        # Determine local size for this rank
+        # Determine comm + local size for this rank.
+        # When a template vec is provided the covariance MUST live on the same
+        # communicator (COMM_SELF obs vectors vs. COMM_WORLD covariance was the
+        # np=2 bug at covariance.py:193). Template's getComm() wins over the
+        # `comm` argument.
         if template_vec is not None:
-            # Use partitioning from template vector
+            self.comm = template_vec.getComm()
             self.local_size = template_vec.getLocalSize()
             self.ownership_range = template_vec.getOwnershipRange()
         else:
+            self.comm = comm
             # Let PETSc decide partitioning automatically
             ownership_range = PETSc.Vec().create(comm=comm)
             ownership_range.setSizes((PETSc.DECIDE, size))
