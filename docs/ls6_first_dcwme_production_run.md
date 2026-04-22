@@ -15,6 +15,85 @@
 
 ---
 
+
+---
+
+## **0. Execution Protocol Update (Critical Addition)**
+
+### Phase-Split Execution Strategy
+
+The original plan is scientifically sound, but the first production run must prioritize **numerical authority over throughput**.
+
+#### Phase 1 — Authoritative Run (REQUIRED)
+- MPI: **2 ranks**
+- Threads: **64 per rank**
+- Purpose: Establish a **scientifically authoritative baseline**
+- Reason:
+  - Matches fully validated MPI parity regime
+  - Eliminates risk of subtle multi-rank reduction or threading artifacts
+  - Ensures immediate interpretability of results
+
+#### Phase 2 — Scaled Run (CONDITIONAL)
+- MPI: **8 ranks**
+- Threads: **16 per rank**
+- Run only after Phase 1 succeeds
+- Purpose: Performance + scaling validation
+- Requirement:
+  - Must reproduce Phase 1 trajectory within tolerance
+
+---
+
+## **0.1 Decision Tree After Phase 1**
+
+### Case A — DC-WME Wins
+- Rerun Phase 1 with different seeds
+- Then run Phase 2 (scaling confirmation)
+- Then proceed to Cat-3 experiment
+
+### Case B — DC-WME Competitive
+- Run Phase 2 to confirm stability
+- Evaluate whether further tuning is justified
+
+### Case C — DC-WME Loses
+- Do NOT prioritize scaling
+- Treat as negative result for this configuration
+- Move to next problem class
+
+---
+
+## **0.2 Why This Change Matters**
+
+The original plan mixes:
+- First scientific measurement
+- First large-scale MPI configuration
+
+Separating them ensures:
+- Clean attribution of results
+- Immediate interpretability
+- Faster debugging if anything is off
+
+---
+
+## **0.3 What Remains Unchanged**
+
+All scientific components of the original plan remain intact:
+- Sparse observation regime
+- Correlated L_wme kernel
+- Dynamic TLM Eq. 38
+- Matched 4D-Var baseline
+- Strict success criteria
+
+---
+
+## **0.4 Final Instruction**
+
+**Run Phase 1 first. Do not skip to 8-rank configuration.**
+
+Speed is irrelevant if the first result cannot be trusted without qualification.
+
+---
+
+
 ## 1. Executive Summary
 
 **Hypothesis being tested:**
@@ -532,3 +611,105 @@ The primary run tests a **methodology hypothesis** (does combined TLM-Eq38 + cor
 6. **np=8 MPI parity dry run** (§8.1) — 10 min in `development` queue. If pass, submit.
 7. Submit 4D-Var → wait for first `[iter 0]` → submit DC-WME.
 8. Two jobs, ~2 h each, ~4 SU total.
+
+
+---
+
+## **0.5 MPI Configuration (Hardened for Two-Phase Execution)**
+
+### Phase 1 (Authoritative)
+- `mpirun -np 2`
+- OMP threads: 64
+- Binding:
+  ```
+  export OMP_NUM_THREADS=64
+  export OMP_PROC_BIND=spread
+  export OMP_PLACES=cores
+  ```
+- PETSc:
+  ```
+  -ksp_type preonly
+  -pc_type lu
+  -pc_factor_mat_solver_type mumps
+  ```
+
+### Phase 2 (Scaled)
+- `mpirun -np 8`
+- OMP threads: 16
+- Binding:
+  ```
+  export OMP_NUM_THREADS=16
+  export OMP_PROC_BIND=spread
+  export OMP_PLACES=cores
+  ```
+
+### Non-negotiable invariants
+- Same seed
+- Same mesh partitioning order
+- Same solver tolerances
+- Same TAO parameters
+
+Deviation from these invalidates comparison.
+
+---
+
+## **0.6 Pre-Flight Parity Check (MANDATORY BEFORE EVERY RUN)**
+
+Run this before submitting ANY production job:
+
+```bash
+# Ensure deterministic environment
+export PYTHONHASHSEED=0
+export OMP_NUM_THREADS=1
+
+# 1. MPI collective sanity
+mpirun -np 2 python hpc/lonestar6/parity/parity_test_mpi.py
+
+# 2. PETSc direct solve parity
+python hpc/lonestar6/parity/parity_test_petsc.py
+
+# 3. dolfinx solve sanity
+python hpc/lonestar6/parity/parity_test_dolfinx_solve.py
+
+# 4. Reduced 4D-Var parity (critical)
+mpirun -np 2 python hpc/lonestar6/parity/parity_4dvar_reduced.py
+
+# 5. Reduced DC-WME parity (critical)
+mpirun -np 2 python hpc/lonestar6/parity/parity_dcwme_reduced.py
+```
+
+### Acceptance Criteria (HARD FAIL IF VIOLATED)
+- Cost relative diff ≤ 1e-6
+- Gradient L2 relative diff ≤ 1e-8
+- Gradient cosine similarity ≥ 0.999999
+
+If ANY check fails:
+→ DO NOT RUN PRODUCTION  
+→ Investigate immediately
+
+---
+
+## **0.7 Submission Guardrail**
+
+Add this check to your SLURM script BEFORE launching:
+
+```bash
+echo "Running pre-flight parity checks..."
+mpirun -np 2 python hpc/lonestar6/parity/parity_4dvar_reduced.py || exit 1
+mpirun -np 2 python hpc/lonestar6/parity/parity_dcwme_reduced.py || exit 1
+echo "Parity checks passed."
+```
+
+This prevents wasting node-hours on invalid runs.
+
+---
+
+## **0.8 Interpretation Rule**
+
+If Phase 2 (8-rank) deviates from Phase 1:
+- Trust Phase 1
+- Treat Phase 2 as performance-only
+- Investigate scaling-induced numerical drift
+
+---
+
