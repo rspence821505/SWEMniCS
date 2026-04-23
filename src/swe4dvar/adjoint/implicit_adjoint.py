@@ -914,9 +914,26 @@ class ImplicitAdjointSolver:
         # Dry nodes produce zero rows in J, making J^T singular.
         # We regularize by using a shifted operator J + εI for the solve,
         # then zero out the adjoint at dry-node DOFs afterward.
+        #
+        # Threshold is RELATIVE to the largest diagonal magnitude of J, with
+        # an absolute floor. The original absolute-only threshold (1e-20) was
+        # mis-calibrated for DG-mixed-element problems whose natural diagonal
+        # scale is small (idealized inlet showed every DOF < 1e-20), which
+        # caused the safeguard to annihilate the entire adjoint vector.
+        # See docs/idealized_inlet_tlm_uv_bisector.md.
         diag = J.getDiagonal()
         diag_arr = diag.getArray()
-        tiny_mask = np.abs(diag_arr) < 1e-20
+
+        # Collective MAX of |diag| across ranks so all ranks agree on scale.
+        from mpi4py import MPI as _MPI
+        local_max = float(np.max(np.abs(diag_arr))) if diag_arr.size > 0 else 0.0
+        comm_j = J.getComm().tompi4py()
+        diag_max = comm_j.allreduce(local_max, op=_MPI.MAX)
+
+        abs_floor = 1e-20
+        rel_floor = 1e-12 * diag_max if diag_max > 0.0 else 0.0
+        tiny_thresh = max(abs_floor, rel_floor)
+        tiny_mask = np.abs(diag_arr) < tiny_thresh
         n_regularized = int(np.sum(tiny_mask))
         diag.destroy()
 
@@ -930,7 +947,9 @@ class ImplicitAdjointSolver:
                 forcing.getArray(),
                 extras={"tiny_h": f"{tiny_h_count}/{len(_ci['h'])}",
                         "tiny_uv": f"{tiny_uv_count}/{len(_ci['uv'])}",
-                        "n_tiny_total": n_regularized},
+                        "n_tiny_total": n_regularized,
+                        "diag_max": f"{diag_max:.3e}",
+                        "tiny_thresh": f"{tiny_thresh:.3e}"},
             )
 
         # Two regularizations combined into one shifted copy of J:
