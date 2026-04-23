@@ -151,8 +151,9 @@ ibrun python -u experiments/idealized_inlet_da.py \
 | **R1 (3103715)** | 0.005 | DCWME | OFF (`--no-eq38-inflation`) | 0.148444 | **0.147456** | **0.7%** | 0.147518 (eval #13) | 15 | USER (max_funcs) | DONE. 10 BLMVM iters, 15 func evals, 3836s. |
 | **R-A' (3103790)** | 0.005 | 4DVAR | ON (fixed σ_b²_h=0.01073, σ_b²_uv=0.1731, matching Anchor B) | 0.148444 | TBD | TBD | TBD | TBD | TBD | **NEW — Pair I 4D-Var leg**. PD (submit-limit). |
 | **R2 (3103716)** | 0.02 | 4DVAR | OFF (no flags) | 0.148444 | **0.140620** | **5.3%** | 0.140620 | 15 | USER (max_funcs) | DONE. 12 BLMVM iters, 15 func evals. Pair IV 4D-Var leg. |
-| R3 (CANCELLED) | 0.02 | DCWME | ON (TLM component-aware) | — | — | — | — | — | — | Cancelled to fit QOS limit; pending np=8 parity verdict. |
-| R4 (CANCELLED) | 0.02 | DCWME | OFF (`--no-eq38-inflation`) | — | — | — | — | — | — | Cancelled for parity check priority; resubmit at np=8 or np=2 after verdict. |
+| R3 (CANCELLED → 3104105) | 0.02 | DCWME | ON (TLM component-aware) | TBD | TBD | TBD | TBD | TBD | TBD | Resubmitted at np=8 on dev queue (was normal). |
+| R4 (CANCELLED → 3104104) | 0.02 | DCWME | OFF (`--no-eq38-inflation`) | TBD | TBD | TBD | TBD | TBD | TBD | Resubmitted at np=8. |
+| **R-A' (CANCELLED → 3104103)** | 0.005 | 4DVAR | ON (fixed σ_b² matching Anchor B) | TBD | TBD | TBD | TBD | TBD | TBD | Resubmitted at np=8. PD `(Resources)`. |
 | **R-2b (TBD)** | 0.02 | 4DVAR | ON (matching R3) | TBD | TBD | TBD | TBD | TBD | TBD | **NEW — Pair III 4D-Var leg**. Blocked on R3's σ_b². |
 
 *Anchor B per-component Eq 38 diagnostics (for provenance): `λ_min(G_h) = 9.32`, `σ_b²_h = 0.01073`, `λ_min(G_uv) = 0.578`, `σ_b²_uv = 0.1731`, condition 2.67, rank 58/58.*
@@ -236,7 +237,11 @@ Parity sbatch: [hpc/lonestar6/parity/parity_np8_check.slurm](../hpc/lonestar6/pa
 
 ### np=8 parity verdict
 
-*(Pending.)*
+The dedicated parity harness `parity_4dvar_reduced.py` has a pre-existing `VecSetSizes` "argument #3 inconsistent across ranks" bug that surfaces at np≥2 — it failed during its own np=2 baseline, never reaching np=8. Not a regression: that script has apparently never been exercised at np>=2 in its current state.
+
+**Pivot: direct sanity run on the production experiment** (job 3103981, commit `cc815ee`): ran `experiments/idealized_inlet_da.py --method 4dvar --nt-ramp 4 --nt-da 4 --max-funcs 1 --max-iterations 1` at np=8 × 16 threads. Completed cleanly in 27s optimization wall (~2 min total). 8 MPI ranks, 8 per-rank "Saved" prints, no MPI errors, no VecSetSizes faults. **PASS.**
+
+Promoted R-A', R4, R3 to np=8. Jobs 3104103, 3104104, 3104105 submitted on dev queue (commit `70d31a4`). R3 specifically promoted from `-p normal -t 04:00:00` (2.5-day backlog) to `-p development -t 02:00:00` because np=8 drops its estimated wall from ~155 min to ~30 min — now fits dev's 2h cap.
 
 ---
 
