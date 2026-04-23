@@ -343,18 +343,44 @@ class CustomNewtonProblem:
             #
             # The adjoint solver applies homogeneous Dirichlet BCs to the adjoint
             # solution (λ = 0 at BC DOFs) separately after solving J^T λ = rhs.
+            # R1 reassembly trace (one-shot): localize at what exact stage the
+            # stored Jacobian becomes the zero operator. See
+            # docs/idealized_inlet_jacobian_reassembly_trace.md.
+            _R1 = not getattr(CustomNewtonProblem, "_R1_FIRED", False)
+            if _R1:
+                CustomNewtonProblem._R1_FIRED = True
+
             if converged:
                 if self.verbose:
                     self.log("Reassembling Jacobian at converged solution for adjoint (unmodified)")
+                if _R1:
+                    pre_zero_norm = A.norm(PETSc.NormType.NORM_FROBENIUS)
+                    pre_nz = int(A.getInfo().get("nz_used", -1))
                 A.zeroEntries()
+                if _R1:
+                    mid_norm = A.norm(PETSc.NormType.NORM_FROBENIUS)
                 # Assemble WITHOUT bcs - this gives the true physics Jacobian
                 # The BC-modified version was used for Newton iterations,
                 # but the unmodified version is needed for correct adjoint gradients
                 petsc.assemble_matrix(A, self.jacobian)  # No bcs parameter!
                 A.assemble()
+                if _R1:
+                    post_assembly_norm = A.norm(PETSc.NormType.NORM_FROBENIUS)
+                    post_nz = int(A.getInfo().get("nz_used", -1))
 
             # Return a copy to avoid issues with A being modified in subsequent timesteps
             J_final = A.copy()
+            if _R1:
+                copy_norm = J_final.norm(PETSc.NormType.NORM_FROBENIUS)
+                copy_nz = int(J_final.getInfo().get("nz_used", -1))
+                if self.comm.rank == 0:
+                    print(f"[jac-reassembly] converged={converged} "
+                          f"pre_zero={pre_zero_norm:.3e} "
+                          f"mid={mid_norm:.3e} "
+                          f"post={post_assembly_norm:.3e} "
+                          f"copy={copy_norm:.3e} "
+                          f"nz(pre/post/copy)={pre_nz}/{post_nz}/{copy_nz}",
+                          flush=True)
             return None, J_final
         else:
             return None
