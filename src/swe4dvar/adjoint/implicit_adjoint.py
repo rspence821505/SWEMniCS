@@ -40,11 +40,19 @@ from swe4dvar.forward.variational_forms import BDF2TimeCoefficients
 # ---------------------------------------------------------------------------
 _UV_BISECTOR_CTX = {"comp_idx": None}
 
+# One-shot flag: stored-Jacobian structural diagnostic fires on the FIRST
+# backward solve it sees while armed, then disables itself for the rest of the
+# sweep (avoids dumping 58×4 redundant reports). See
+# docs/idealized_inlet_stored_jacobian_diagnostic.md.
+_STORED_JAC_DIAG_FIRED = [False]
+
 def _bisector_set_component_indices(comp_idx):
     _UV_BISECTOR_CTX["comp_idx"] = comp_idx
+    _STORED_JAC_DIAG_FIRED[0] = False
 
 def _bisector_clear():
     _UV_BISECTOR_CTX["comp_idx"] = None
+    _STORED_JAC_DIAG_FIRED[0] = False
 
 def _bisector_log(step_label: str, vec_arr: np.ndarray,
                   extras: Optional[dict] = None) -> None:
@@ -90,6 +98,217 @@ def _bisector_log(step_label: str, vec_arr: np.ndarray,
         print(per_rank, flush=True)
     except Exception as _e:
         print(f"[uv-bisector] log failed at {step_label}: {_e}", flush=True)
+
+
+def _stored_jacobian_structural_diag(J, n: int) -> None:
+    """
+    One-shot structural diagnostic on a stored Jacobian.
+
+    Answers: is this matrix (a) real with zero diagonal, (b) empty, or
+    (c) being mis-read? Emits metadata, magnitude histogram, diag/off-diag
+    stats, and operator-action tests. Uses `_UV_BISECTOR_CTX["comp_idx"]`
+    to do h/uv component analysis in operator-action tests.
+
+    See docs/idealized_inlet_stored_jacobian_diagnostic.md.
+    """
+    from mpi4py import MPI as _MPI
+    comm = _MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    tag = "[jac-diag]"
+
+    ci = _UV_BISECTOR_CTX["comp_idx"]
+
+    # --- 1. Metadata ---
+    gsize = J.getSize()
+    lsize = J.getLocalSize()
+    try:
+        bsize = J.getBlockSize()
+    except Exception:
+        bsize = -1
+    info = J.getInfo()
+    nz_used = int(info.get("nz_used", -1))
+    nz_allocated = int(info.get("nz_allocated", -1))
+    try:
+        fro = J.norm(PETSc.NormType.NORM_FROBENIUS)
+    except Exception:
+        fro = float("nan")
+    try:
+        inf_norm = J.norm(PETSc.NormType.NORM_INFINITY)
+    except Exception:
+        inf_norm = float("nan")
+
+    # --- 2. Diagonal stats (allreduce across ranks) ---
+    diag = J.getDiagonal()
+    d = diag.getArray()
+    n_diag_local = d.size
+    abs_d = np.abs(d)
+    # Local reductions
+    if n_diag_local > 0:
+        l_max = float(abs_d.max()); l_min = float(abs_d.min())
+        l_sum = float(abs_d.sum()); l_nz = int(np.sum(abs_d > 0.0))
+    else:
+        l_max = 0.0; l_min = float("inf"); l_sum = 0.0; l_nz = 0
+    g_max_diag = comm.allreduce(l_max, op=_MPI.MAX)
+    g_min_diag = comm.allreduce(l_min, op=_MPI.MIN)
+    g_sum_diag = comm.allreduce(l_sum, op=_MPI.SUM)
+    g_count_diag = comm.allreduce(n_diag_local, op=_MPI.SUM)
+    g_nz_diag = comm.allreduce(l_nz, op=_MPI.SUM)
+    g_mean_diag = g_sum_diag / max(g_count_diag, 1)
+    diag.destroy()
+
+    # --- 3. Row-wise traversal: off-diag stats + magnitude histogram ---
+    # Buckets: [0, 1e-20), [1e-20, 1e-10), [1e-10, 1e-5), [1e-5, ∞)
+    # Tracked separately for diagonal vs off-diagonal entries.
+    buckets_diag = np.zeros(4, dtype=np.int64)
+    buckets_off = np.zeros(4, dtype=np.int64)
+
+    row_start, row_end = J.getOwnershipRange()
+    n_off_local = 0
+    sum_off = 0.0
+    max_off = 0.0
+    min_off_nz = float("inf")  # min of NONZERO |off-diag|
+    n_total_entries_local = 0
+
+    def _bucket_counts(abs_vals):
+        b = np.zeros(4, dtype=np.int64)
+        b[0] = int(np.sum(abs_vals < 1e-20))
+        b[1] = int(np.sum((abs_vals >= 1e-20) & (abs_vals < 1e-10)))
+        b[2] = int(np.sum((abs_vals >= 1e-10) & (abs_vals < 1e-5)))
+        b[3] = int(np.sum(abs_vals >= 1e-5))
+        return b
+
+    for i in range(row_start, row_end):
+        cols, vals = J.getRow(i)
+        abs_vals = np.abs(vals)
+        n_total_entries_local += abs_vals.size
+        diag_mask = (cols == i)
+        off_mask = ~diag_mask
+        if np.any(diag_mask):
+            buckets_diag += _bucket_counts(abs_vals[diag_mask])
+        if np.any(off_mask):
+            off_vals = abs_vals[off_mask]
+            buckets_off += _bucket_counts(off_vals)
+            n_off_local += off_vals.size
+            sum_off += float(off_vals.sum())
+            if off_vals.size > 0:
+                max_off = max(max_off, float(off_vals.max()))
+                nz_off = off_vals[off_vals > 0.0]
+                if nz_off.size > 0:
+                    min_off_nz = min(min_off_nz, float(nz_off.min()))
+
+    # Allreduce
+    b_diag_g = np.zeros(4, dtype=np.int64)
+    b_off_g  = np.zeros(4, dtype=np.int64)
+    comm.Allreduce(buckets_diag, b_diag_g, op=_MPI.SUM)
+    comm.Allreduce(buckets_off,  b_off_g,  op=_MPI.SUM)
+    g_n_off   = comm.allreduce(n_off_local, op=_MPI.SUM)
+    g_sum_off = comm.allreduce(sum_off, op=_MPI.SUM)
+    g_max_off = comm.allreduce(max_off, op=_MPI.MAX)
+    g_min_off = comm.allreduce(min_off_nz, op=_MPI.MIN)
+    g_mean_off = (g_sum_off / max(g_n_off, 1))
+    g_total_entries = comm.allreduce(n_total_entries_local, op=_MPI.SUM)
+
+    # --- 4. Small dense snapshot (upper-left 3x3 via rank 0 only) ---
+    snapshot = None
+    if rank == 0:
+        try:
+            # rank 0 owns rows starting at 0, so rows 0,1,2 are local if lsize>=3
+            if row_start == 0 and row_end >= 3:
+                snapshot = J.getValues([0, 1, 2], [0, 1, 2])
+        except Exception as _e:
+            snapshot = f"(snapshot failed: {_e})"
+
+    # --- 5. Operator-action tests ---
+    # Build three test vectors with the same layout as J's domain
+    def _op_test(label, setup_fn):
+        x = J.createVecRight()
+        setup_fn(x)
+        x.assemble()
+        y = J.createVecLeft()
+        J.mult(x, y)
+        arr = y.getArray()
+        # Global L2
+        l_norm2 = float(np.sum(arr * arr))
+        g_norm2 = comm.allreduce(l_norm2, op=_MPI.SUM)
+        g_norm = np.sqrt(g_norm2)
+        # Component norms (use ci if available)
+        if ci is not None:
+            h_l = float(np.sum(arr[ci["h"]] ** 2))
+            uv_l = float(np.sum(arr[ci["uv"]] ** 2))
+            h_g = np.sqrt(comm.allreduce(h_l, op=_MPI.SUM))
+            uv_g = np.sqrt(comm.allreduce(uv_l, op=_MPI.SUM))
+        else:
+            h_g = uv_g = float("nan")
+        x.destroy(); y.destroy()
+        return g_norm, h_g, uv_g
+
+    def _set_ones(v): v.set(1.0)
+
+    def _set_h_impulse(v):
+        v.set(0.0)
+        if ci is not None and len(ci["h"]) > 0:
+            local_h = ci["h"]
+            arr = v.getArray(readonly=False)
+            arr[local_h[0]] = 1.0  # first h-DOF on each rank
+            # getArray(readonly=False) returns the underlying buffer;
+            # modifications persist. x.assemble() is called by the caller.
+
+    def _set_uv_impulse(v):
+        v.set(0.0)
+        if ci is not None and len(ci["uv"]) > 0:
+            local_uv = ci["uv"]
+            arr = v.getArray(readonly=False)
+            arr[local_uv[0]] = 1.0  # first uv-DOF on each rank
+            # getArray(readonly=False) returns the underlying buffer;
+            # modifications persist. x.assemble() is called by the caller.
+
+    def _set_rand(v):
+        arr = v.getArray(readonly=False)
+        rng = np.random.RandomState(42 + rank)
+        arr[:] = rng.randn(arr.size) * 1e-3
+        v.restoreArray(arr)
+
+    act_ones = _op_test("ones", _set_ones)
+    act_himp = _op_test("h-impulse", _set_h_impulse)
+    act_uvimp = _op_test("uv-impulse", _set_uv_impulse)
+    act_rand = _op_test("rand(1e-3)", _set_rand)
+
+    # --- 6. Rank-0 emit ---
+    if rank == 0:
+        print(f"\n{tag} ============================================================")
+        print(f"{tag} Stored Jacobian structural diagnostic — n={n} (first fire only)")
+        print(f"{tag} ============================================================")
+        print(f"{tag} [metadata]")
+        print(f"{tag}   global size        = {gsize}")
+        print(f"{tag}   block size         = {bsize}")
+        print(f"{tag}   nz_used            = {nz_used}")
+        print(f"{tag}   nz_allocated       = {nz_allocated}")
+        print(f"{tag}   total entries seen = {g_total_entries}")
+        print(f"{tag}   Frobenius norm     = {fro:.6e}")
+        print(f"{tag}   Infinity   norm    = {inf_norm:.6e}")
+        print(f"{tag} [diagonal stats]")
+        print(f"{tag}   # diag rows (global)      = {g_count_diag}")
+        print(f"{tag}   # nonzero |diag| entries  = {g_nz_diag}")
+        print(f"{tag}   max |diag|                = {g_max_diag:.6e}")
+        print(f"{tag}   min |diag|                = {g_min_diag:.6e}")
+        print(f"{tag}   mean |diag|               = {g_mean_diag:.6e}")
+        print(f"{tag} [off-diagonal stats]")
+        print(f"{tag}   # off-diag entries total  = {g_n_off}")
+        print(f"{tag}   max |off-diag|            = {g_max_off:.6e}")
+        print(f"{tag}   min |off-diag_nonzero|    = {g_min_off:.6e}")
+        print(f"{tag}   mean |off-diag|           = {g_mean_off:.6e}")
+        print(f"{tag} [magnitude histogram]   bucket           diag       off-diag")
+        bucket_labels = ["[0, 1e-20)", "[1e-20, 1e-10)", "[1e-10, 1e-5)", "[1e-5, inf)"]
+        for lab, bd, bo in zip(bucket_labels, b_diag_g, b_off_g):
+            print(f"{tag}                   {lab:<15s}  {int(bd):>10d}  {int(bo):>10d}")
+        print(f"{tag} [3x3 upper-left snapshot (rank 0, rows 0..2, cols 0..2)]")
+        print(f"{tag}   {snapshot}")
+        print(f"{tag} [operator-action tests: ||J·x||_total / ||J·x||_h / ||J·x||_uv]")
+        print(f"{tag}   ones        = {act_ones[0]:.3e}  /  h={act_ones[1]:.3e}  /  uv={act_ones[2]:.3e}")
+        print(f"{tag}   h-impulse   = {act_himp[0]:.3e}  /  h={act_himp[1]:.3e}  /  uv={act_himp[2]:.3e}")
+        print(f"{tag}   uv-impulse  = {act_uvimp[0]:.3e}  /  h={act_uvimp[1]:.3e}  /  uv={act_uvimp[2]:.3e}")
+        print(f"{tag}   rand(1e-3)  = {act_rand[0]:.3e}  /  h={act_rand[1]:.3e}  /  uv={act_rand[2]:.3e}")
+        print(f"{tag} ============================================================\n", flush=True)
 
 
 class ImplicitAdjointSolver:
@@ -909,6 +1128,19 @@ class ImplicitAdjointSolver:
         # To solve for λ^n, we need J_n = ∂R^n/∂u^n
         # This is stored in jacobians[n-1]
         J = self.jacobians[n - 1]
+
+        # Stored-Jacobian structural diagnostic: one-shot, fires on the FIRST
+        # J consumed while the bisector is armed. See
+        # docs/idealized_inlet_stored_jacobian_diagnostic.md.
+        if (_UV_BISECTOR_CTX["comp_idx"] is not None
+                and not _STORED_JAC_DIAG_FIRED[0]):
+            _STORED_JAC_DIAG_FIRED[0] = True
+            try:
+                _stored_jacobian_structural_diag(J, n)
+            except Exception as _e:
+                from mpi4py import MPI as _MPI
+                if _MPI.COMM_WORLD.Get_rank() == 0:
+                    print(f"[jac-diag] diagnostic raised: {_e}", flush=True)
 
         # Check for near-zero diagonal entries (dry nodes in wetting/drying).
         # Dry nodes produce zero rows in J, making J^T singular.
