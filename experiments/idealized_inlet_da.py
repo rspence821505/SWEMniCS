@@ -230,8 +230,17 @@ def run_single_method(args, method, l_wme_mode, output_dir):
 
     # Truth trajectory (DA window). Store Jacobians ONLY for DC-WME (needed
     # for TLM Eq 38 inflation). Pure 4D-Var doesn't use them — skipping saves
-    # ~1 GB on a 208K-DOF mesh (12 sparse Jacobians + duplicates).
-    need_jacobians = (method == "dcwme")
+    # ~1 GB on a 208K-DOF mesh (12 sparse Jacobians + duplicates). But since
+    # the refactored Step 7a can apply Eq 38 inflation to 4D-Var too (for
+    # matched-σ_b² comparisons), we also need them when 4D-Var asks for it
+    # via --eq38-component-aware.
+    _wants_tlm_gram = (
+        (method == "dcwme" or getattr(args, "eq38_component_aware", False))
+        and args.fixed_sigma_b_sq_h is None
+        and not args.no_eq38_inflation
+        and not args.skip_tlm_eq38
+    )
+    need_jacobians = _wants_tlm_gram
     traj_bytes = (nt_da + 1) * state_size * 8
     _estimate_and_guard(f"truth trajectory ({nt_da+1} x {state_size} DOFs)", traj_bytes)
     print(f"\n--- Step 3: Truth trajectory ({nt_da} steps, "
@@ -447,90 +456,87 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         solver_params=solver_params, t_start=t_da_start,
     )
 
-    if method == "dcwme" and l_wme_mode == "static":
-        from experiments.shinnecock_study.run_comparison import (
-            _compute_eq38_from_tlm,
-            _apply_eq38_to_B,
-            _compute_static_L_wme,
-        )
+    # ----------------------------------------------------------------
+    # Step 7a: Background covariance B inflation (method-INDEPENDENT).
+    # The same B inflation is applied whether the cost function is
+    # 4D-Var or DC-WME. This lets us do apples-to-apples comparisons
+    # where both methods see the same prior. See
+    # docs/idealized_inlet_dcwme_exact_run_first_win_search.md.
+    # ----------------------------------------------------------------
+    from experiments.shinnecock_study.run_comparison import (
+        _compute_eq38_from_tlm,
+        _apply_eq38_to_B,
+        _compute_static_L_wme,
+    )
 
-        # Step 7a: TLM-based Eq 38 inflation
-        # Uses the truth trajectory + Jacobians to compute the Gram matrix
-        # G = J_wme^T J_wme over the full DA window, then derives
-        # σ_b² ≥ γ / λ_min(G) and inflates B per-component.
-        # Cost: 1 adjoint solve per observation point. For 1163 obs at
-        # ~25 s/adjoint = ~8 hours. Skip with --skip-tlm-eq38 for fast
-        # comparisons; falls back to default σ_b² without inflation.
-        eq38_result = None
-        # Fixed-sigma bypass: skip TLM Eq 38 and apply user-provided per-component
-        # bounds directly via _apply_eq38_to_B. Useful for isolating the effect of
-        # the predictability bound magnitude without re-running the 20-min Gram.
-        if args.fixed_sigma_b_sq_h is not None and args.fixed_sigma_b_sq_uv is not None:
+    eq38_result = None
+    obs_variance = float(obs_noise_stds.mean() ** 2)
+
+    if args.fixed_sigma_b_sq_h is not None and args.fixed_sigma_b_sq_uv is not None:
+        # Fixed σ_b² bypass (TLM Gram skipped).
+        import numpy as _np
+        uv_owned = _np.concatenate([u_indices, v_indices])
+        uv_owned.sort()
+        component_indices = {"h": h_indices, "uv": uv_owned}
+        eq38_result = {
+            "sigma_b_sq": float(args.fixed_sigma_b_sq_h),
+            "sigma_b_sq_h": float(args.fixed_sigma_b_sq_h),
+            "sigma_b_sq_uv": float(args.fixed_sigma_b_sq_uv),
+        }
+        print(f"  Step 7a: fixed-σ_b² bypass — σ_b²_h={args.fixed_sigma_b_sq_h:.4e}, "
+              f"σ_b²_uv={args.fixed_sigma_b_sq_uv:.4e} (TLM Gram SKIPPED) "
+              f"[method={method.upper()}]",
+              flush=True)
+        _apply_eq38_to_B(B, eq38_result, rank=rank,
+                         component_indices=component_indices)
+        _check_memory("after fixed-σ_b² B inflation")
+    elif args.no_eq38_inflation:
+        print(f"  Step 7a: --no-eq38-inflation set — B is NOT inflated "
+              f"[method={method.upper()}]")
+    elif args.skip_tlm_eq38:
+        print(f"  Step 7a: --skip-tlm-eq38 set — skipping TLM Gram "
+              f"(H·H^T fallback active for DC-WME only) [method={method.upper()}]")
+    elif truth_jacobians is not None:
+        print(f"  Step 7a: Computing σ_b² from Eq 38 via TLM... [method={method.upper()}]")
+        gram_fwd = ForwardModelWrapper(
+            solver=solver_da, problem=prob_da,
+            solver_params=solver_params, t_start=t_da_start,
+        )
+        component_indices = None
+        if getattr(args, "eq38_component_aware", False):
             import numpy as _np
             uv_owned = _np.concatenate([u_indices, v_indices])
             uv_owned.sort()
             component_indices = {"h": h_indices, "uv": uv_owned}
-            eq38_result = {
-                "sigma_b_sq": float(args.fixed_sigma_b_sq_h),
-                "sigma_b_sq_h": float(args.fixed_sigma_b_sq_h),
-                "sigma_b_sq_uv": float(args.fixed_sigma_b_sq_uv),
-            }
-            print(f"  Step 7a: fixed-σ_b² bypass — σ_b²_h={args.fixed_sigma_b_sq_h:.4e}, "
-                  f"σ_b²_uv={args.fixed_sigma_b_sq_uv:.4e} (TLM Gram SKIPPED)",
+            print(f"  Step 7a: component-aware Eq 38 enabled "
+                  f"(h DOFs={len(h_indices)}, uv DOFs={len(uv_owned)})",
                   flush=True)
-            _apply_eq38_to_B(B, eq38_result, rank=rank,
-                             component_indices=component_indices)
-            obs_variance = float(obs_noise_stds.mean() ** 2)
-            _check_memory("after fixed-σ_b² B inflation")
-        elif args.skip_tlm_eq38:
-            print("  Step 7a: --skip-tlm-eq38 set — skipping TLM Eq 38 (using default σ_b²)")
-            obs_variance = float(obs_noise_stds.mean() ** 2)
-        elif truth_jacobians is not None:
-            print("  Step 7a: Computing σ_b² from Eq 38 via TLM...")
-            # Need a forward model wrapper for the WME QoI constructor
-            gram_fwd = ForwardModelWrapper(
-                solver=solver_da, problem=prob_da,
-                solver_params=solver_params, t_start=t_da_start,
-            )
-            obs_variance = float(obs_noise_stds.mean() ** 2)
+        eq38_result = _compute_eq38_from_tlm(
+            forward_model=gram_fwd,
+            obs_operator=obs_operator,
+            obs_cov=R,
+            m_linearize=m_true,
+            observations=exp.observations,
+            obs_times=obs_times,
+            truth_trajectory=truth_trajectory,
+            truth_jacobians=truth_jacobians,
+            predictability_gamma=0.1,
+            comm=comm, rank=rank,
+            component_indices=component_indices,
+        )
+        _apply_eq38_to_B(B, eq38_result, rank=rank,
+                         component_indices=component_indices)
+        _check_memory("after TLM Eq 38")
+    else:
+        print(f"  Step 7a: No truth Jacobians — skipping TLM Eq 38 "
+              f"[method={method.upper()}]")
 
-            # Optional: component-aware Eq 38 (separate h / uv Grams). Reuses
-            # the same adjoint vectors; adds O(n_obs²) dot products and two
-            # small eigen-decompositions — trivial vs the adjoint cost.
-            component_indices = None
-            if getattr(args, "eq38_component_aware", False):
-                import numpy as _np
-                uv_owned = _np.concatenate([u_indices, v_indices])
-                uv_owned.sort()
-                component_indices = {"h": h_indices, "uv": uv_owned}
-                print(f"  Step 7a: component-aware Eq 38 enabled "
-                      f"(h DOFs={len(h_indices)}, uv DOFs={len(uv_owned)})",
-                      flush=True)
-
-            eq38_result = _compute_eq38_from_tlm(
-                forward_model=gram_fwd,
-                obs_operator=obs_operator,
-                obs_cov=R,
-                m_linearize=m_true,
-                observations=exp.observations,
-                obs_times=obs_times,
-                truth_trajectory=truth_trajectory,
-                truth_jacobians=truth_jacobians,
-                predictability_gamma=0.1,
-                comm=comm, rank=rank,
-                component_indices=component_indices,
-            )
-            _apply_eq38_to_B(B, eq38_result, rank=rank,
-                             component_indices=component_indices)
-            _check_memory("after TLM Eq 38")
-        else:
-            print("  Step 7a: No truth Jacobians — skipping TLM Eq 38")
-            obs_variance = float(obs_noise_stds.mean() ** 2)
-
-        # Step 7b: Static L_wme
-        # skip_eq38_inflation=True if:
-        #   (a) TLM/fixed already inflated B in Step 7a (avoid double-inflation), OR
-        #   (b) user asked --no-eq38-inflation (explicit: no inflation anywhere)
+    # ----------------------------------------------------------------
+    # Step 7b: Cost function construction.
+    # DC-WME additionally builds a static L_wme term; 4D-Var just uses
+    # the (possibly-inflated) B directly.
+    # ----------------------------------------------------------------
+    if method == "dcwme" and l_wme_mode == "static":
         skip_7b_inflation = (eq38_result is not None) or args.no_eq38_inflation
         _reason = ("B already inflated in Step 7a" if eq38_result is not None
                    else ("--no-eq38-inflation set" if args.no_eq38_inflation
