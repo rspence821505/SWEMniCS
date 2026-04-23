@@ -527,16 +527,22 @@ def run_single_method(args, method, l_wme_mode, output_dir):
             print("  Step 7a: No truth Jacobians — skipping TLM Eq 38")
             obs_variance = float(obs_noise_stds.mean() ** 2)
 
-        # Step 7b: Static L_wme (skip internal inflation since TLM already inflated B)
-        already_inflated = eq38_result is not None
-        print(f"  Step 7b: Computing static L_wme (skip_eq38_inflation={already_inflated}, "
-              f"obs_correlation_length={args.obs_correlation_length:.0f} m, "
+        # Step 7b: Static L_wme
+        # skip_eq38_inflation=True if:
+        #   (a) TLM/fixed already inflated B in Step 7a (avoid double-inflation), OR
+        #   (b) user asked --no-eq38-inflation (explicit: no inflation anywhere)
+        skip_7b_inflation = (eq38_result is not None) or args.no_eq38_inflation
+        _reason = ("B already inflated in Step 7a" if eq38_result is not None
+                   else ("--no-eq38-inflation set" if args.no_eq38_inflation
+                         else "default H·H^T-based inflation active"))
+        print(f"  Step 7b: Computing static L_wme (skip_eq38_inflation={skip_7b_inflation} "
+              f"[{_reason}], obs_correlation_length={args.obs_correlation_length:.0f} m, "
               f"predictability_gamma={args.predictability_gamma})...")
         static_lwme, lwme_diag = _compute_static_L_wme(
             obs_operator, B, len(obs_times), obs_variance,
             m_true, predictability_gamma=args.predictability_gamma,
             adaptive_gamma=True, comm=comm, rank=rank,
-            skip_eq38_inflation=already_inflated,
+            skip_eq38_inflation=skip_7b_inflation,
             obs_correlation_length=args.obs_correlation_length,
         )
         _check_memory("after static L_wme")
@@ -816,6 +822,13 @@ def main():
                              "built from the same adjoint vectors. See "
                              "experiments/shinnecock_study/run_comparison.py:"
                              "_compute_eq38_from_tlm.")
+    parser.add_argument("--no-eq38-inflation", action="store_true",
+                        help="Disable ALL Eq 38 inflation (Step 7a TLM Gram AND "
+                             "Step 7b H·H^T static fallback). DC-WME cost "
+                             "structure is preserved: static L_wme is still "
+                             "computed but without prior B inflation. For "
+                             "mechanism isolation studies — see docs/"
+                             "idealized_inlet_dcwme_exact_run_first_win_search.md.")
     parser.add_argument("--fixed-sigma-b-sq-h", type=float, default=None,
                         help="Skip TLM Eq 38 for the h block and directly apply "
                              "this per-DOF σ_b²_h bound via _apply_eq38_to_B. "
@@ -835,6 +848,14 @@ def main():
                      "set together, or neither.")
     if _fs_h is not None:
         args.skip_tlm_eq38 = True  # bypass the expensive Gram path
+
+    # --no-eq38-inflation also bypasses TLM Gram in Step 7a; Step 7b skip
+    # is handled below when already_inflated is computed.
+    if args.no_eq38_inflation:
+        args.skip_tlm_eq38 = True
+        if _fs_h is not None:
+            parser.error("--no-eq38-inflation is mutually exclusive with "
+                         "--fixed-sigma-b-sq-h/uv.")
 
     global MEM_LIMIT_MB
     MEM_LIMIT_MB = args.mem_limit_gb * 1024
