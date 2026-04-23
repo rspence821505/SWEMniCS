@@ -484,6 +484,16 @@ class CGImplicit(BaseSolver):
     def save_jacobians(self, J):
         """Save Jacobian matrix for 4D-Var adjoint computation."""
         if J is not None:
+            # R2 handoff entry probe (one-shot).
+            try:
+                from swe4dvar.utils.solver_storage import (
+                    _HANDOFF, _jac_handoff_log,
+                )
+                if not _HANDOFF["cg_entry_fired"]:
+                    _jac_handoff_log("cg_implicit_entry", J)
+                    _HANDOFF["cg_entry_fired"] = True
+            except Exception:
+                pass
             self.storage.save_jacobian(J)
 
     def save_parameter_derivatives(self):

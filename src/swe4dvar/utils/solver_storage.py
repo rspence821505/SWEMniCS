@@ -9,6 +9,41 @@ import numpy as np
 from petsc4py import PETSc
 
 
+# ---------------------------------------------------------------------------
+# R2 Jacobian-handoff one-shot diagnostic state. See
+# docs/idealized_inlet_jacobian_handoff_trace.md.
+# ---------------------------------------------------------------------------
+_HANDOFF = {
+    "last_saved": None,
+    "cg_entry_fired": False,
+    "storage_fired": False,
+    "postzero_fired": False,
+    "adjoint_fired": False,
+}
+
+
+def _jac_handoff_log(stage: str, mat, extras: Optional[dict] = None) -> None:
+    """Rank-0 one-line handoff log. Guarded against exceptions — never blocks
+    the hot path. No-op when mat is None (just prints stage with that fact)."""
+    try:
+        from mpi4py import MPI as _MPI
+        rank = _MPI.COMM_WORLD.Get_rank()
+        if rank != 0:
+            return
+        if mat is None:
+            print(f"[jac-handoff] stage={stage} mat=None", flush=True)
+            return
+        norm = mat.norm(PETSc.NormType.NORM_FROBENIUS)
+        nz = int(mat.getInfo().get("nz_used", -1))
+        msg = f"[jac-handoff] stage={stage} norm={norm:.3e} nz={nz} id={id(mat)}"
+        if extras:
+            for k, v in extras.items():
+                msg += f" {k}={v}"
+        print(msg, flush=True)
+    except Exception as _e:
+        print(f"[jac-handoff] log failed at {stage}: {_e}", flush=True)
+
+
 class SolverStateStorage:
     """Centralized storage for solver states, Jacobians, and adjoint data.
 
@@ -98,11 +133,24 @@ class SolverStateStorage:
         Args:
             jacobian: Jacobian matrix to save (will be copied)
         """
+        # R2 handoff pre-copy check (one-shot, first call only)
+        _first = not _HANDOFF["storage_fired"]
+        if _first and hasattr(jacobian, "copy"):
+            _jac_handoff_log("storage_pre_copy", jacobian)
+
         if hasattr(jacobian, 'copy'):
             self.saved_jacobians.append(jacobian.copy())
         else:
             # For testing purposes, allow non-PETSc objects
             self.saved_jacobians.append(jacobian)
+
+        if _first:
+            stored = self.saved_jacobians[-1] if self.saved_jacobians else None
+            aliased = (id(stored) == id(jacobian)) if stored is not None else False
+            _jac_handoff_log("storage_post_copy", stored,
+                             extras={"aliased_input": aliased})
+            _HANDOFF["last_saved"] = stored
+            _HANDOFF["storage_fired"] = True
 
     def save_adjoint(self, adjoint: PETSc.Mat):
         """Save an adjoint Jacobian matrix.

@@ -181,6 +181,23 @@ class CustomNewtonProblem:
                 loc_L.set(0)
 
             A.zeroEntries()
+
+            # R2 handoff: one-shot — immediately after the FIRST A.zeroEntries()
+            # that fires AFTER a Jacobian was saved to storage, check whether
+            # the previously saved matrix still has its norm. If it collapses
+            # here, the stored "copy" is aliasing A's value buffer.
+            try:
+                from swe4dvar.utils.solver_storage import (
+                    _HANDOFF, _jac_handoff_log,
+                )
+                if (_HANDOFF.get("storage_fired", False)
+                        and not _HANDOFF.get("postzero_fired", False)
+                        and _HANDOFF.get("last_saved") is not None):
+                    _jac_handoff_log("after_next_zeroEntries",
+                                     _HANDOFF["last_saved"])
+                    _HANDOFF["postzero_fired"] = True
+            except Exception:
+                pass
             petsc.assemble_matrix(A, self.jacobian, bcs=self.bcs)
             A.assemble()
 

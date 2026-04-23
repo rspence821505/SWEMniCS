@@ -480,6 +480,18 @@ class ImplicitAdjointSolver:
         self.jacobians = jacobians
         self.dt = dt
 
+        # R2 handoff probe at adjoint init (one-shot, rank 0).
+        try:
+            from swe4dvar.utils.solver_storage import (
+                _HANDOFF, _jac_handoff_log,
+            )
+            if not _HANDOFF.get("adjoint_fired", False) and jacobians:
+                for idx in range(min(2, len(jacobians))):
+                    _jac_handoff_log(f"adjoint_init_idx{idx}", jacobians[idx])
+                _HANDOFF["adjoint_fired"] = True
+        except Exception:
+            pass
+
         self.num_steps = len(trajectory) - 1
 
         # Validate inputs
