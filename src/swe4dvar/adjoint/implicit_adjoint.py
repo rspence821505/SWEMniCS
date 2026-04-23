@@ -266,7 +266,7 @@ def _stored_jacobian_structural_diag(J, n: int) -> None:
         arr = v.getArray(readonly=False)
         rng = np.random.RandomState(42 + rank)
         arr[:] = rng.randn(arr.size) * 1e-3
-        v.restoreArray(arr)
+        # getArray returns the underlying buffer; assemble() by caller syncs.
 
     act_ones = _op_test("ones", _set_ones)
     act_himp = _op_test("h-impulse", _set_h_impulse)
