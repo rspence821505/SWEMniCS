@@ -1278,7 +1278,22 @@ class ImplicitAdjointSolver:
 
             ksp.solveTranspose(forcing, lambda_n)
             reason = ksp.getConvergedReason()
+
+            # Aggressive cleanup: distributed LU factor-solver packages
+            # (MUMPS, SuperLU_DIST) allocate large internal workspace that
+            # the default ksp.destroy() path sometimes fails to release in
+            # a per-iteration Gram-matrix loop (observed: ~9 GB/solve leak
+            # with SuperLU_DIST at np=8 on 207K-DOF mesh, commit 9fef6b0).
+            # Explicitly destroy the factor matrix, then force Python GC.
+            try:
+                _factor = pc.getFactorMatrix()
+                if _factor is not None:
+                    _factor.destroy()
+            except Exception:
+                pass  # not all PC configs expose a factor matrix
             ksp.destroy()
+            import gc as _gc
+            _gc.collect()
 
         # --- Strategy 2: GMRES + ILU fallback if LU failed ---
         if reason < 0:
@@ -1299,7 +1314,16 @@ class ImplicitAdjointSolver:
             ksp2.solveTranspose(forcing, lambda_n)
             reason2 = ksp2.getConvergedReason()
             iters2 = ksp2.getIterationNumber()
+            # ILU PC also holds a factor matrix; same cleanup as LU path.
+            try:
+                _factor2 = ksp2.getPC().getFactorMatrix()
+                if _factor2 is not None:
+                    _factor2.destroy()
+            except Exception:
+                pass
             ksp2.destroy()
+            import gc as _gc
+            _gc.collect()
 
             if reason2 < 0:
                 # --- Strategy 3: GMRES with no preconditioning (last resort) ---
