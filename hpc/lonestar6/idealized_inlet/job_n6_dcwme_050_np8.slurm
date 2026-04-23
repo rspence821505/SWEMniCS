@@ -6,7 +6,7 @@
 #SBATCH -p development
 #SBATCH -N 1
 #SBATCH -n 8
-#SBATCH -t 01:30:00
+#SBATCH -t 02:00:00
 #SBATCH -o inlet_n6_dcwme_050.%j.out
 #SBATCH -e inlet_n6_dcwme_050.%j.err
 
