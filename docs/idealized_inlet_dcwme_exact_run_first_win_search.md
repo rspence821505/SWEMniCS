@@ -152,7 +152,7 @@ ibrun python -u experiments/idealized_inlet_da.py \
 | **R-A' (3103790)** | 0.005 | 4DVAR | ON (fixed σ_b²_h=0.01073, σ_b²_uv=0.1731, matching Anchor B) | 0.148444 | TBD | TBD | TBD | TBD | TBD | **NEW — Pair I 4D-Var leg**. PD (submit-limit). |
 | **R2 (3103716)** | 0.02 | 4DVAR | OFF (no flags) | 0.148444 | **0.140620** | **5.3%** | 0.140620 | 15 | USER (max_funcs) | DONE. 12 BLMVM iters, 15 func evals. Pair IV 4D-Var leg. |
 | R3 (CANCELLED → 3104105) | 0.02 | DCWME | ON (TLM component-aware) | TBD | TBD | TBD | TBD | TBD | TBD | Resubmitted at np=8 on dev queue (was normal). |
-| R4 (CANCELLED → 3104104) | 0.02 | DCWME | OFF (`--no-eq38-inflation`) | TBD | TBD | TBD | TBD | TBD | TBD | Resubmitted at np=8. |
+| **R4 (3104104, np=8)** | 0.02 | DCWME | OFF (`--no-eq38-inflation`) | **0.152765** | **0.144955** | **5.1%** | 0.144955 | 15 | USER (max_funcs) | **DONE.** Ties R2's 5.3% at matched prior. |
 | **R-A' (3104103, np=8)** | 0.005 | 4DVAR | ON (fixed σ_b²_h=0.01073, σ_b²_uv=0.1731 matching Anchor B) | **0.152765** | **0.152397** | **0.2%** | 0.152397 | 15 | USER (max_funcs) | **DONE.** 13 BLMVM iters. *Note: bg differs from Anchor A's 0.148444 because of np-dependent perturbation seed.* |
 | **R-2b (TBD)** | 0.02 | 4DVAR | ON (matching R3) | TBD | TBD | TBD | TBD | TBD | TBD | **NEW — Pair III 4D-Var leg**. Blocked on R3's σ_b². |
 
@@ -240,7 +240,27 @@ Pair I result (the primary Pair I comparison — same inflated σ_b² for both m
 
 **Caveat on np mismatch:** R-A' ran at np=8 with bg RMSE 0.152765, while Anchor A ran at np=2 with bg 0.148444 — the background perturbation has a np-dependent component (rank-seeded PRNG or partition-ordered accumulation). The % improvement metric is invariant to this, but a strictly matched-np Anchor A would need a rerun at np=8. Not re-run yet; noting for rigor.
 
-### R3, R4 — cancelled for np=8 re-submit and DC-WME sanity (see §8).
+### R4 (DONE) — DC-WME 0.02 no-inflation (np=8)
+
+**Final:** 0.152765 → **0.144955** → **5.1% improvement**. 15 function evals (max_funcs cap).
+
+Pair IV result (obs=0.02, no inflation):
+
+| | Method | Improvement |
+|---|---|---:|
+| R2 (np=2) | 4D-Var | **5.3%** |
+| **R4 (np=8)** | **DC-WME** | **5.1%** |
+
+**The methods are essentially tied at obs=0.02 with no inflation.** DC-WME's L_wme correction term neither helps nor hurts materially. This is a meaningful contrast with obs=0.005:
+
+| obs | 4D-Var | DC-WME | Gap |
+|---:|---:|---:|---|
+| 0.005 no-infl | 2.5% | 0.7% | DC-WME loses 3.6× |
+| **0.02 no-infl** | **5.3%** | **5.1%** | **DC-WME ties** |
+
+**Observation density critically affects the gap.** Sparse WSE obs leave DC-WME's L_wme correction under-constrained; moderate density closes the gap to ~neutral.
+
+### R3 — cancelled pending DC-WME np=8 sanity verdict.
 
 ---
 
