@@ -31,6 +31,43 @@ import numpy as np
 from swe4dvar.forward.variational_forms import BDF2TimeCoefficients
 
 
+# ---------------------------------------------------------------------------
+# Bisector diagnostic switch (set by _compute_eq38_from_tlm for 1 call only).
+# When set to {"h": np.ndarray, "uv": np.ndarray}, _solve_transpose_system and
+# _compute_initial_gradient emit component-resolved norms at every stage so
+# we can see which line is killing u/v content. See
+# docs/idealized_inlet_tlm_uv_bisector.md.
+# ---------------------------------------------------------------------------
+_UV_BISECTOR_CTX = {"comp_idx": None}
+
+def _bisector_set_component_indices(comp_idx):
+    _UV_BISECTOR_CTX["comp_idx"] = comp_idx
+
+def _bisector_clear():
+    _UV_BISECTOR_CTX["comp_idx"] = None
+
+def _bisector_log(step_label: str, vec_arr: np.ndarray,
+                  extras: Optional[dict] = None) -> None:
+    ci = _UV_BISECTOR_CTX["comp_idx"]
+    if ci is None:
+        return
+    try:
+        h  = vec_arr[ci["h"]]
+        uv = vec_arr[ci["uv"]]
+        tol = 1e-15
+        msg = (f"[uv-bisector] {step_label:<48s}  "
+               f"||h||={np.linalg.norm(h):.3e}  "
+               f"||uv||={np.linalg.norm(uv):.3e}  "
+               f"nz_h={int(np.sum(np.abs(h) > tol))}/{len(h)}  "
+               f"nz_uv={int(np.sum(np.abs(uv) > tol))}/{len(uv)}")
+        if extras:
+            for k, v in extras.items():
+                msg += f"  {k}={v}"
+        print(msg, flush=True)
+    except Exception as _e:
+        print(f"[uv-bisector] log failed at {step_label}: {_e}", flush=True)
+
+
 class ImplicitAdjointSolver:
     """
     Adjoint solver for implicit BDF2 time discretization.
@@ -859,6 +896,19 @@ class ImplicitAdjointSolver:
         n_regularized = int(np.sum(tiny_mask))
         diag.destroy()
 
+        # UV bisector: per-component breakdown of tiny_mask + forcing norms
+        _ci = _UV_BISECTOR_CTX["comp_idx"]
+        if _ci is not None:
+            tiny_h_count  = int(np.sum(tiny_mask[_ci["h"]]))
+            tiny_uv_count = int(np.sum(tiny_mask[_ci["uv"]]))
+            _bisector_log(
+                f"n={n}  BEFORE solve (forcing)",
+                forcing.getArray(),
+                extras={"tiny_h": f"{tiny_h_count}/{len(_ci['h'])}",
+                        "tiny_uv": f"{tiny_uv_count}/{len(_ci['uv'])}",
+                        "n_tiny_total": n_regularized},
+            )
+
         # Two regularizations combined into one shifted copy of J:
         # 1. Dry-node regularization: set J[i,i] = 1 for near-zero diagonals
         # 2. Global adjoint regularization: add εI to J (damps near-null directions
@@ -978,6 +1028,12 @@ class ImplicitAdjointSolver:
         if J_reg is not None:
             J_reg.destroy()
 
+        # UV bisector: state right after solve, before tiny-mask zeroing
+        _ci = _UV_BISECTOR_CTX["comp_idx"]
+        if _ci is not None:
+            _bisector_log(f"n={n}  AFTER solveTranspose (pre tiny-mask)",
+                          lambda_n.getArray())
+
         # Zero out adjoint at dry-node DOFs — these are numerically meaningless
         # after solving with the regularized Jacobian.
         if n_regularized > 0:
@@ -985,6 +1041,10 @@ class ImplicitAdjointSolver:
             arr[tiny_mask] = 0.0
             lambda_n.setArray(arr)
             lambda_n.assemble()
+
+        if _ci is not None:
+            _bisector_log(f"n={n}  AFTER tiny-mask zeroing",
+                          lambda_n.getArray())
 
         return lambda_n
 
@@ -1077,15 +1137,36 @@ class ImplicitAdjointSolver:
         if obs_forcing is not None:
             result.axpy(+1.0, obs_forcing)
 
+        # UV bisector: gradient at n=0 BEFORE BC zeroing
+        _ci = _UV_BISECTOR_CTX["comp_idx"]
+        if _ci is not None:
+            _bisector_log("n=0 (gradient_u0) BEFORE BC zeroing",
+                          result.getArray())
+
         # Apply homogeneous Dirichlet BCs to the gradient
         # BC DOFs in the initial condition are fixed (not part of control space),
         # so their gradient should be zero to prevent optimizer from changing them.
         if self.bc_dof_indices is not None and len(self.bc_dof_indices) > 0:
             result_arr = result.getArray()
+            # UV bisector: count BC DOFs landing on each component
+            if _ci is not None:
+                bc_arr = np.fromiter(self.bc_dof_indices, dtype=np.int64)
+                bc_arr = bc_arr[bc_arr < len(result_arr)]
+                h_set  = set(_ci["h"].tolist())
+                uv_set = set(_ci["uv"].tolist())
+                bc_in_h  = int(sum(1 for d in bc_arr if d in h_set))
+                bc_in_uv = int(sum(1 for d in bc_arr if d in uv_set))
+                print(f"[uv-bisector] BC mask: total={len(bc_arr)}  "
+                      f"bc∩h={bc_in_h}/{len(_ci['h'])}  "
+                      f"bc∩uv={bc_in_uv}/{len(_ci['uv'])}", flush=True)
             for dof in self.bc_dof_indices:
                 if dof < len(result_arr):
                     result_arr[dof] = 0.0
             result.setArray(result_arr)
+
+        if _ci is not None:
+            _bisector_log("n=0 (gradient_u0) AFTER BC zeroing",
+                          result.getArray())
 
         return result
 

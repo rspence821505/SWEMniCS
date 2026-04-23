@@ -324,12 +324,38 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
     from petsc4py import PETSc as _PETSc
     e_i = _PETSc.Vec().createSeq(n_obs)
     e_i.setUp()
+
+    # UV bisector: if component_indices is given, arm the adjoint-sweep
+    # diagnostic for EXACTLY the first adjoint call (i=0). We get one
+    # complete trace through the backward sweep per-step, then clear so
+    # the remaining 57 solves run without log spam.
+    from swe4dvar.adjoint.implicit_adjoint import (
+        _bisector_set_component_indices as _bis_arm,
+        _bisector_clear as _bis_clear,
+    )
+
     for i in range(n_obs):
         e_i.zeroEntries()
         e_i.setValue(i, 1.0)
         e_i.assemblyBegin()
         e_i.assemblyEnd()
+        if component_indices is not None and i == 0 and rank == 0:
+            print("  [uv-bisector] arming adjoint-sweep diagnostic for i=0 only",
+                  flush=True)
+            _bis_arm(component_indices)
         a_i = linearized_wme.apply_adjoint(e_i)
+        if component_indices is not None and i == 0:
+            # One-shot trace of the full backward sweep completed. Dump the
+            # final per-component norm of the returned adjoint vector and
+            # clear the switch.
+            _a = a_i.getArray()
+            if rank == 0:
+                hi  = component_indices["h"]
+                uvi = component_indices["uv"]
+                print(f"  [uv-bisector] RETURN a_0  "
+                      f"||a_0_h||={np.linalg.norm(_a[hi]):.3e}  "
+                      f"||a_0_uv||={np.linalg.norm(_a[uvi]):.3e}", flush=True)
+            _bis_clear()
         adjoint_vectors.append(a_i)
         if (i + 1) % 50 == 0 or i == 0:
             elapsed = _time.perf_counter() - t1
