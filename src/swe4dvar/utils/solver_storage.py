@@ -23,25 +23,32 @@ _HANDOFF = {
 
 
 def _jac_handoff_log(stage: str, mat, extras: Optional[dict] = None) -> None:
-    """Rank-0 one-line handoff log. Guarded against exceptions — never blocks
-    the hot path. No-op when mat is None (just prints stage with that fact)."""
+    """One-line handoff log emitted on rank 0. PETSc `.norm()` and `.getInfo()`
+    are COLLECTIVE, so all ranks must enter — only the print is rank-gated.
+    Guarded against exceptions; no-op when mat is None."""
     try:
         from mpi4py import MPI as _MPI
         rank = _MPI.COMM_WORLD.Get_rank()
-        if rank != 0:
-            return
         if mat is None:
-            print(f"[jac-handoff] stage={stage} mat=None", flush=True)
+            if rank == 0:
+                print(f"[jac-handoff] stage={stage} mat=None", flush=True)
             return
+        # Collective on all ranks:
         norm = mat.norm(PETSc.NormType.NORM_FROBENIUS)
         nz = int(mat.getInfo().get("nz_used", -1))
-        msg = f"[jac-handoff] stage={stage} norm={norm:.3e} nz={nz} id={id(mat)}"
-        if extras:
-            for k, v in extras.items():
-                msg += f" {k}={v}"
-        print(msg, flush=True)
+        if rank == 0:
+            msg = f"[jac-handoff] stage={stage} norm={norm:.3e} nz={nz} id={id(mat)}"
+            if extras:
+                for k, v in extras.items():
+                    msg += f" {k}={v}"
+            print(msg, flush=True)
     except Exception as _e:
-        print(f"[jac-handoff] log failed at {stage}: {_e}", flush=True)
+        try:
+            from mpi4py import MPI as _MPI
+            if _MPI.COMM_WORLD.Get_rank() == 0:
+                print(f"[jac-handoff] log failed at {stage}: {_e}", flush=True)
+        except Exception:
+            print(f"[jac-handoff] log failed at {stage}: {_e}", flush=True)
 
 
 class SolverStateStorage:
