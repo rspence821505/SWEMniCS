@@ -1252,10 +1252,28 @@ class ImplicitAdjointSolver:
             ksp.destroy()
         else:
             # --- Strategy 1: Direct LU (fast, exact when it works) ---
+            # Env var SWE4DVAR_ADJOINT_LU_SOLVER selects the factor-solver package:
+            #   "mumps" (PETSc default at np>1 on LS6 — unstable on DG blocks
+            #            with ~25K DOFs/rank at np=8 in this repo as of 2026-04-23)
+            #   "superlu_dist" (alternate distributed LU; different pivoting)
+            #   unset  = PETSc's own default
+            import os as _os
+            _lu_solver = _os.environ.get("SWE4DVAR_ADJOINT_LU_SOLVER", "").strip().lower()
+
             ksp = PETSc.KSP().create(J_solve.getComm())
             ksp.setOperators(J_solve)
             ksp.setType(PETSc.KSP.Type.PREONLY)
-            ksp.getPC().setType(PETSc.PC.Type.LU)
+            pc = ksp.getPC()
+            pc.setType(PETSc.PC.Type.LU)
+            if _lu_solver:
+                try:
+                    pc.setFactorSolverType(_lu_solver)
+                except Exception as _e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"setFactorSolverType('{_lu_solver}') failed: {_e}. "
+                        f"Falling back to PETSc default."
+                    )
             ksp.setErrorIfNotConverged(False)
 
             ksp.solveTranspose(forcing, lambda_n)
