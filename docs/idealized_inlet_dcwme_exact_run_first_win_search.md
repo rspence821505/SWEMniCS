@@ -150,9 +150,9 @@ ibrun python -u experiments/idealized_inlet_da.py \
 | **Anchor B** (3102561) | 0.005 | DCWME | ON (TLM component-aware) | 0.148444 | 0.148305 | 0.1% | 0.148076 (eval #4) | 15 | USER (max_funcs) | Post-fix revalidation |
 | **R1 (3103715)** | 0.005 | DCWME | OFF (`--no-eq38-inflation`) | 0.148444 | **0.147456** | **0.7%** | 0.147518 (eval #13) | 15 | USER (max_funcs) | DONE. 10 BLMVM iters, 15 func evals, 3836s. |
 | **R-A' (3103790)** | 0.005 | 4DVAR | ON (fixed σ_b²_h=0.01073, σ_b²_uv=0.1731, matching Anchor B) | 0.148444 | TBD | TBD | TBD | TBD | TBD | **NEW — Pair I 4D-Var leg**. PD (submit-limit). |
-| R2 (3103716) | 0.02 | 4DVAR | OFF (no flags) | TBD | TBD | TBD | TBD | TBD | TBD | **R** on c303-006, just started (Pair IV 4D-Var leg) |
-| R3 (3103718) | 0.02 | DCWME | ON (TLM component-aware) | TBD | TBD | TBD | TBD | TBD | TBD | queued on NORMAL (Pair III DC-WME leg) |
-| R4 (3103717) | 0.02 | DCWME | OFF (`--no-eq38-inflation`) | TBD | TBD | TBD | TBD | TBD | TBD | queued, PD (Pair IV DC-WME leg) |
+| **R2 (3103716)** | 0.02 | 4DVAR | OFF (no flags) | 0.148444 | **0.140620** | **5.3%** | 0.140620 | 15 | USER (max_funcs) | DONE. 12 BLMVM iters, 15 func evals. Pair IV 4D-Var leg. |
+| R3 (CANCELLED) | 0.02 | DCWME | ON (TLM component-aware) | — | — | — | — | — | — | Cancelled to fit QOS limit; pending np=8 parity verdict. |
+| R4 (CANCELLED) | 0.02 | DCWME | OFF (`--no-eq38-inflation`) | — | — | — | — | — | — | Cancelled for parity check priority; resubmit at np=8 or np=2 after verdict. |
 | **R-2b (TBD)** | 0.02 | 4DVAR | ON (matching R3) | TBD | TBD | TBD | TBD | TBD | TBD | **NEW — Pair III 4D-Var leg**. Blocked on R3's σ_b². |
 
 *Anchor B per-component Eq 38 diagnostics (for provenance): `λ_min(G_h) = 9.32`, `σ_b²_h = 0.01073`, `λ_min(G_uv) = 0.578`, `σ_b²_uv = 0.1731`, condition 2.67, rank 58/58.*
@@ -202,9 +202,41 @@ Submitted 3103790 right after R1 completed and submit slot opened. Config:
 ```
 Reuses Anchor B's σ_b² values so no Gram needed. Expected wall ~55 min. This is the **primary Pair I 4D-Var leg** — matched to Anchor B's B. Will answer: *does the Eq 38 inflation hurt 4D-Var too, or just DC-WME?*
 
-### R2 (just started on c303-006) — pending RESULTS.
+### R2 (DONE) — 4D-Var 0.02 no-inflation
 
-### R3, R4 — still queued.
+**Final:** 0.148444 → **0.140620** → **5.3% improvement**. 12 BLMVM iterations, 15 function evals.
+
+Trajectory highlights (for comparison against R4 when it runs):
+
+| eval | cost | RMSE_truth |
+|---:|---:|---:|
+| — | — | 0.148444 (initial) |
+| 6 | 2267.7 | 0.141742 |
+| 9 | 2266.4 | 0.141191 |
+| 10 | 2259.1 | 0.141152 |
+| (final) | — | **0.140620** |
+
+**Key implication for the obs=0.02 regime:** 4D-Var at obs=0.02 doubles its Anchor A win at obs=0.005 (5.3% vs 2.5%). Denser observations help 4D-Var a lot more than they help DC-WME is still to be determined. R4's job is now to answer: **does DC-WME at obs=0.02 scale similarly?** Or does its cost-RMSE decoupling get worse?
+
+**Updated stop-rule target:** for DC-WME to "win" at obs=0.02, it must beat **5.3%**, not the original 2.5%.
+
+### R3, R4 — cancelled to make room for the np=8 parity check (see §8 below).
+
+---
+
+## 8. np=8 MPI parity check (mid-search decision)
+
+LS6 dev-queue QOS enforces max 3 submitted jobs. With R2 already running and R-A', R3, R4 queued, we couldn't add the parity check. Cancelled R-A', R3, R4 to free space.
+
+**Decision point:** if `parity_4dvar_reduced.py` at np=8 matches np=2 to rel_err ≤ 1e-10, resubmit R-A', R3, R4, R-2b at np=8 × 16 threads. Expected speedup: 5-8× per run (each run's Gram scales with n_obs × adjoint_time; the adjoint transpose solve itself parallelizes on distributed MUMPS). Biggest win: R3 at obs=0.02 drops from ~155 min (normal-queue only, 2.5-day backlog) to ~30 min (dev-queue eligible).
+
+**If parity fails:** stay at np=2, resubmit R3 to normal queue with 2.5-day wait, accept R-2b also blocked. The current R1 + R2 data still answers whether the Eq 38 inflation hurts DC-WME (Pair II tells us yes, at sparse obs).
+
+Parity sbatch: [hpc/lonestar6/parity/parity_np8_check.slurm](../hpc/lonestar6/parity/parity_np8_check.slurm), commit `da15e51`. 15 min dev-queue wall, no scientific cost.
+
+### np=8 parity verdict
+
+*(Pending.)*
 
 ---
 
