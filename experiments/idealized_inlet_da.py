@@ -462,7 +462,27 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         # ~25 s/adjoint = ~8 hours. Skip with --skip-tlm-eq38 for fast
         # comparisons; falls back to default σ_b² without inflation.
         eq38_result = None
-        if args.skip_tlm_eq38:
+        # Fixed-sigma bypass: skip TLM Eq 38 and apply user-provided per-component
+        # bounds directly via _apply_eq38_to_B. Useful for isolating the effect of
+        # the predictability bound magnitude without re-running the 20-min Gram.
+        if args.fixed_sigma_b_sq_h is not None and args.fixed_sigma_b_sq_uv is not None:
+            import numpy as _np
+            uv_owned = _np.concatenate([u_indices, v_indices])
+            uv_owned.sort()
+            component_indices = {"h": h_indices, "uv": uv_owned}
+            eq38_result = {
+                "sigma_b_sq": float(args.fixed_sigma_b_sq_h),
+                "sigma_b_sq_h": float(args.fixed_sigma_b_sq_h),
+                "sigma_b_sq_uv": float(args.fixed_sigma_b_sq_uv),
+            }
+            print(f"  Step 7a: fixed-σ_b² bypass — σ_b²_h={args.fixed_sigma_b_sq_h:.4e}, "
+                  f"σ_b²_uv={args.fixed_sigma_b_sq_uv:.4e} (TLM Gram SKIPPED)",
+                  flush=True)
+            _apply_eq38_to_B(B, eq38_result, rank=rank,
+                             component_indices=component_indices)
+            obs_variance = float(obs_noise_stds.mean() ** 2)
+            _check_memory("after fixed-σ_b² B inflation")
+        elif args.skip_tlm_eq38:
             print("  Step 7a: --skip-tlm-eq38 set — skipping TLM Eq 38 (using default σ_b²)")
             obs_variance = float(obs_noise_stds.mean() ** 2)
         elif truth_jacobians is not None:
@@ -796,8 +816,25 @@ def main():
                              "built from the same adjoint vectors. See "
                              "experiments/shinnecock_study/run_comparison.py:"
                              "_compute_eq38_from_tlm.")
+    parser.add_argument("--fixed-sigma-b-sq-h", type=float, default=None,
+                        help="Skip TLM Eq 38 for the h block and directly apply "
+                             "this per-DOF σ_b²_h bound via _apply_eq38_to_B. "
+                             "Must be paired with --fixed-sigma-b-sq-uv.")
+    parser.add_argument("--fixed-sigma-b-sq-uv", type=float, default=None,
+                        help="Skip TLM Eq 38 for the uv block and directly apply "
+                             "this per-DOF σ_b²_uv bound via _apply_eq38_to_B. "
+                             "Must be paired with --fixed-sigma-b-sq-h.")
     parser.add_argument("--mem-limit-gb", type=float, default=8.0)
     args = parser.parse_args()
+
+    # Fixed-sigma mode: if either flag is provided, require both and skip TLM Eq 38.
+    _fs_h = args.fixed_sigma_b_sq_h
+    _fs_uv = args.fixed_sigma_b_sq_uv
+    if (_fs_h is None) != (_fs_uv is None):
+        parser.error("--fixed-sigma-b-sq-h and --fixed-sigma-b-sq-uv must be "
+                     "set together, or neither.")
+    if _fs_h is not None:
+        args.skip_tlm_eq38 = True  # bypass the expensive Gram path
 
     global MEM_LIMIT_MB
     MEM_LIMIT_MB = args.mem_limit_gb * 1024
