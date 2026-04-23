@@ -886,7 +886,32 @@ class LinearizedWMEQoI(LinearizedQoI):
         # Cache trajectory - use pre-computed if provided
         self._trajectory: Optional[List[PETSc.Vec]] = trajectory
         self._jacobians: Optional[List[PETSc.Mat]] = jacobians
+        # Shared adjoint solver across repeated apply_adjoint() calls (e.g.
+        # the n_obs-wide Eq 38 Gram loop). Built lazily on first call with
+        # the transpose-solver cache enabled so per-timestep factorizations
+        # are reused across observation basis vectors. See
+        # docs/idealized_inlet_dcwme_vs_4dvar_mpi8_study.md (in progress).
+        self._adjoint_solver = None
         self._ensure_linearization()
+
+    def release_adjoint_solver(self) -> Optional[dict]:
+        """Drop the shared ImplicitAdjointSolver and its transpose-solver cache.
+
+        Returns the cache statistics (builds / hits) from the solver's last
+        life-cycle, or None if no solver was built.
+
+        Intended for the Gram-loop caller to explicitly release factorizations
+        after all `apply_adjoint()` calls are done, rather than waiting for
+        Python garbage collection.
+        """
+        stats = None
+        if self._adjoint_solver is not None:
+            try:
+                stats = self._adjoint_solver.clear_transpose_solver_cache()
+            except Exception:
+                pass
+            self._adjoint_solver = None
+        return stats
 
     def _ensure_linearization(self):
         """Ensure trajectory is computed."""
@@ -1042,35 +1067,43 @@ class LinearizedWMEQoI(LinearizedQoI):
             # Apply adjoint observation operator: H_j^T · R_j^{-1/2} · δq
             forcings[t_j] = self.obs_op.adjoint(scaled)
 
-        # Get boundary DOFs and variational form for proper adjoint BCs
-        variational_form = getattr(self.forward_model, 'var_form', None)
-        if variational_form is None and hasattr(self.forward_model, 'solver'):
-            variational_form = getattr(self.forward_model.solver, 'var_form', None)
+        # Build the adjoint solver ONCE per LinearizedWMEQoI instance. The
+        # trajectory, Jacobians, boundary DOFs, and adjoint regularization
+        # are all fixed at this linearization point, so the solver's
+        # per-timestep transpose factorizations are valid for every Gram
+        # basis-vector call. This is the fix for the SuperLU_DIST leak that
+        # accumulated ~9 GB/solve × n_obs × num_steps at np=8. See
+        # src/swe4dvar/adjoint/implicit_adjoint.py::clear_transpose_solver_cache
+        if self._adjoint_solver is None:
+            variational_form = getattr(self.forward_model, 'var_form', None)
+            if variational_form is None and hasattr(self.forward_model, 'solver'):
+                variational_form = getattr(self.forward_model.solver, 'var_form', None)
 
-        bc_dof_indices = None
-        if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model, 'problem'):
-            V = self.forward_model.solver.V
-            mesh = self.forward_model.problem.mesh
-            boundary_dofs = get_boundary_dofs(V, mesh)
-            bc_dof_indices = set(boundary_dofs.tolist())
-        elif hasattr(self.forward_model, 'V') and hasattr(self.forward_model, 'mesh'):
-            V = self.forward_model.V
-            mesh = self.forward_model.mesh
-            boundary_dofs = get_boundary_dofs(V, mesh)
-            bc_dof_indices = set(boundary_dofs.tolist())
+            bc_dof_indices = None
+            if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model, 'problem'):
+                V = self.forward_model.solver.V
+                mesh = self.forward_model.problem.mesh
+                boundary_dofs = get_boundary_dofs(V, mesh)
+                bc_dof_indices = set(boundary_dofs.tolist())
+            elif hasattr(self.forward_model, 'V') and hasattr(self.forward_model, 'mesh'):
+                V = self.forward_model.V
+                mesh = self.forward_model.mesh
+                boundary_dofs = get_boundary_dofs(V, mesh)
+                bc_dof_indices = set(boundary_dofs.tolist())
 
-        adjoint_solver = ImplicitAdjointSolver(
-            self.forward_model,
-            self._trajectory,
-            self._jacobians,
-            self.forward_model.dt,
-            variational_form=variational_form,
-            bc_dof_indices=bc_dof_indices,
-        )
+            self._adjoint_solver = ImplicitAdjointSolver(
+                self.forward_model,
+                self._trajectory,
+                self._jacobians,
+                self.forward_model.dt,
+                variational_form=variational_form,
+                bc_dof_indices=bc_dof_indices,
+                enable_transpose_solver_cache=True,
+            )
 
         terminal = self._trajectory[-1].duplicate()
         terminal.zeroEntries()
-        state_grad = adjoint_solver.solve(terminal, forcings)
+        state_grad = self._adjoint_solver.solve(terminal, forcings)
 
         control_layout = getattr(self.forward_model, "control_layout", None)
         is_augmented = control_layout is not None and control_layout.theta_size > 0

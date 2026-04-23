@@ -334,6 +334,11 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
         _bisector_clear as _bis_clear,
     )
 
+    # Snapshot cache-reuse stats at the end: the persistent adjoint solver's
+    # per-timestep transpose factorizations should be built once per n and
+    # reused across all n_obs basis vectors. Expected: builds = num_steps-1,
+    # hits = (n_obs-1) * (num_steps-1). See
+    # src/swe4dvar/data_assimilation/qoi_maps.py::LinearizedWMEQoI.
     for i in range(n_obs):
         e_i.zeroEntries()
         e_i.setValue(i, 1.0)
@@ -366,6 +371,23 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
             if rank == 0:
                 print(f"    Adjoint {i+1}/{n_obs} ({elapsed:.1f}s)")
     e_i.destroy()
+
+    # Release the persistent adjoint solver and its per-timestep transpose
+    # factorizations. Returns a dict with "builds" and "hits" so the Gram
+    # loop can report cache-effectiveness as a one-line diagnostic.
+    _cache_stats = None
+    try:
+        _cache_stats = linearized_wme.release_adjoint_solver()
+    except Exception:
+        pass
+    if rank == 0 and _cache_stats:
+        _builds = _cache_stats.get("builds", 0)
+        _hits = _cache_stats.get("hits", 0)
+        _total = _builds + _hits
+        _pct = (100.0 * _hits / _total) if _total > 0 else 0.0
+        print(f"    [ksp-cache] transpose-solve reuse: "
+              f"{_hits} hits / {_builds} builds / {_total} total "
+              f"({_pct:.1f}% reuse)")
 
     t_adj = _time.perf_counter() - t1
 

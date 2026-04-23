@@ -397,6 +397,7 @@ class ImplicitAdjointSolver:
         bc_dof_indices: Optional[set] = None,  # NEW: Indices of Dirichlet BC DOFs
         theta: Optional[float] = None,  # NEW: Theta blending parameter for BDF2/BE
         adjoint_regularization: float = 0.0,  # NEW: shift εI on transpose solve for stability
+        enable_transpose_solver_cache: bool = False,  # NEW: reuse factorizations across repeated backward sweeps
     ):
         """
         Initialize implicit adjoint solver.
@@ -540,6 +541,31 @@ class ImplicitAdjointSolver:
             except ValueError:
                 pass
         self.adjoint_regularization = float(adjoint_regularization)
+
+        # Transpose-solver cache state (opt-in).
+        # When enabled, the first _solve_transpose_system(n, ...) call for
+        # each timestep n builds the regularized J_reg and the direct-LU KSP,
+        # factorizes, and stores them keyed by n. Subsequent calls with the
+        # same n reuse the cached objects (only the RHS changes). This
+        # collapses `n_obs × num_steps` factorizations to `num_steps` for
+        # the Eq 38 TLM Gram loop, which is the PRIMARY source of the
+        # SuperLU_DIST memory leak observed in 3104437 / 3106226.
+        #
+        # Env var SWE4DVAR_ADJOINT_TRANSPOSE_CACHE=1 overrides the default
+        # for ad-hoc testing.
+        _env_cache = os.environ.get("SWE4DVAR_ADJOINT_TRANSPOSE_CACHE")
+        if _env_cache is not None:
+            enable_transpose_solver_cache = _env_cache.strip() == "1"
+        self._transpose_solver_cache_enabled = bool(enable_transpose_solver_cache)
+        # dict[int, dict] keyed by timestep n. Each entry holds:
+        #   "J_reg":       PETSc.Mat (None if no regularization was applied)
+        #   "ksp":         PETSc.KSP (PREONLY + LU, factorized)
+        #   "tiny_mask":   np.ndarray[bool] for post-solve zeroing
+        #   "n_regularized": int
+        self._transpose_solver_cache: dict = {}
+        # Diagnostic counters — reset each time the cache is cleared.
+        self._ksp_cache_builds = 0
+        self._ksp_cache_hits = 0
 
         # Flux formulation handling
         self.flux_formulation = flux_formulation
@@ -1100,6 +1126,50 @@ class ImplicitAdjointSolver:
             return gradient_u0, lambda_history
         return gradient_u0
 
+    def clear_transpose_solver_cache(self) -> dict:
+        """Release all cached per-timestep transpose-solver state.
+
+        Destroys any cached `J_reg` matrices and KSPs built during repeated
+        backward sweeps (used by the Eq 38 Gram loop). Safe to call whether
+        caching was enabled or not — empties the dict and returns diagnostics.
+
+        Returns
+        -------
+        dict with keys:
+            "builds": int, total KSP setups performed (one per distinct n)
+            "hits":   int, cache reuses (total solves − builds)
+        """
+        for _n, entry in list(self._transpose_solver_cache.items()):
+            try:
+                ksp = entry.get("ksp")
+                if ksp is not None:
+                    # Explicit factor-matrix destroy before ksp.destroy() to
+                    # free SuperLU_DIST / MUMPS internal workspace.
+                    try:
+                        pc = ksp.getPC()
+                        _factor = pc.getFactorMatrix()
+                        if _factor is not None:
+                            _factor.destroy()
+                    except Exception:
+                        pass
+                    ksp.destroy()
+            except Exception:
+                pass
+            try:
+                J_reg = entry.get("J_reg")
+                if J_reg is not None:
+                    J_reg.destroy()
+            except Exception:
+                pass
+        stats = {
+            "builds": int(self._ksp_cache_builds),
+            "hits": int(self._ksp_cache_hits),
+        }
+        self._transpose_solver_cache.clear()
+        self._ksp_cache_builds = 0
+        self._ksp_cache_hits = 0
+        return stats
+
     def _solve_transpose_system(self, n: int, forcing: PETSc.Vec) -> PETSc.Vec:
         """
         Solve J^T·λ = rhs using the DISTRIBUTED Jacobian.
@@ -1153,6 +1223,32 @@ class ImplicitAdjointSolver:
                 from mpi4py import MPI as _MPI
                 if _MPI.COMM_WORLD.Get_rank() == 0:
                     print(f"[jac-diag] diagnostic raised: {_e}", flush=True)
+
+        # ---------- Transpose-solver cache fast path ----------
+        # When caching is enabled (opt-in via enable_transpose_solver_cache
+        # in the constructor, or SWE4DVAR_ADJOINT_TRANSPOSE_CACHE=1), reuse
+        # the previously-factorized J_reg + KSP for this timestep. Only the
+        # RHS changes across Gram iterations; factorization state is stable
+        # at fixed trajectory/jacobians/regularization. The bisector is
+        # only armed on i=0 (first Gram call), which is necessarily a cache
+        # MISS for every n — so bisector logging never runs on this fast
+        # path.
+        if self._transpose_solver_cache_enabled:
+            _entry = self._transpose_solver_cache.get(n)
+            if _entry is not None:
+                self._ksp_cache_hits += 1
+                cached_ksp = _entry["ksp"]
+                cached_tiny_mask = _entry["tiny_mask"]
+                cached_n_regularized = _entry["n_regularized"]
+                lambda_n = forcing.duplicate()
+                cached_ksp.solveTranspose(forcing, lambda_n)
+                # Post-solve dry-node zeroing (unchanged from primary path).
+                if cached_n_regularized > 0:
+                    arr = lambda_n.getArray()
+                    arr[cached_tiny_mask] = 0.0
+                    lambda_n.setArray(arr)
+                    lambda_n.assemble()
+                return lambda_n
 
         # Check for near-zero diagonal entries (dry nodes in wetting/drying).
         # Dry nodes produce zero rows in J, making J^T singular.
@@ -1220,6 +1316,7 @@ class ImplicitAdjointSolver:
             J_reg = None
 
         lambda_n = forcing.duplicate()
+        _cached_this_call = False  # set True only when we hand J_reg/KSP to the cache
 
         # Iterative-solve override: env var SWE4DVAR_ADJOINT_ITERATIVE=1 forces
         # GMRES+ILU with tight tolerance instead of LU. Iterative Krylov methods
@@ -1279,21 +1376,36 @@ class ImplicitAdjointSolver:
             ksp.solveTranspose(forcing, lambda_n)
             reason = ksp.getConvergedReason()
 
-            # Aggressive cleanup: distributed LU factor-solver packages
-            # (MUMPS, SuperLU_DIST) allocate large internal workspace that
-            # the default ksp.destroy() path sometimes fails to release in
-            # a per-iteration Gram-matrix loop (observed: ~9 GB/solve leak
-            # with SuperLU_DIST at np=8 on 207K-DOF mesh, commit 9fef6b0).
-            # Explicitly destroy the factor matrix, then force Python GC.
-            try:
-                _factor = pc.getFactorMatrix()
-                if _factor is not None:
-                    _factor.destroy()
-            except Exception:
-                pass  # not all PC configs expose a factor matrix
-            ksp.destroy()
-            import gc as _gc
-            _gc.collect()
+            # If caching is enabled AND LU succeeded, store the KSP (and its
+            # factorization state) plus J_reg for reuse on subsequent solves
+            # at this timestep. This is the primary leak fix for the Eq 38
+            # Gram loop — it collapses n_obs × num_steps factorizations down
+            # to num_steps.
+            if self._transpose_solver_cache_enabled and reason >= 0:
+                self._transpose_solver_cache[n] = {
+                    "J_reg": J_reg,           # may be None if no regularization was applied
+                    "ksp": ksp,
+                    "tiny_mask": tiny_mask.copy() if tiny_mask is not None else None,
+                    "n_regularized": int(n_regularized),
+                }
+                self._ksp_cache_builds += 1
+                _cached_this_call = True
+            else:
+                # Aggressive cleanup: distributed LU factor-solver packages
+                # (MUMPS, SuperLU_DIST) allocate large internal workspace that
+                # the default ksp.destroy() path sometimes fails to release in
+                # a per-iteration Gram-matrix loop (observed: ~9 GB/solve leak
+                # with SuperLU_DIST at np=8 on 207K-DOF mesh, commit 9fef6b0).
+                # Explicitly destroy the factor matrix, then force Python GC.
+                try:
+                    _factor = pc.getFactorMatrix()
+                    if _factor is not None:
+                        _factor.destroy()
+                except Exception:
+                    pass  # not all PC configs expose a factor matrix
+                ksp.destroy()
+                import gc as _gc
+                _gc.collect()
 
         # --- Strategy 2: GMRES + ILU fallback if LU failed ---
         if reason < 0:
@@ -1306,7 +1418,14 @@ class ImplicitAdjointSolver:
             ksp2 = PETSc.KSP().create(J_solve.getComm())
             ksp2.setOperators(J_solve)
             ksp2.setType(PETSc.KSP.Type.GMRES)
-            ksp2.getPC().setType(PETSc.PC.Type.ILU)
+            # MPI correctness: PC.ILU works only on serial matrices. On
+            # mpiaij matrices (np>1) use BJACOBI with ILU sub-blocks,
+            # matching the iterative override path above.
+            _comm_size = J_solve.getComm().getSize()
+            if _comm_size > 1:
+                ksp2.getPC().setType(PETSc.PC.Type.BJACOBI)
+            else:
+                ksp2.getPC().setType(PETSc.PC.Type.ILU)
             ksp2.setTolerances(rtol=1e-8, atol=1e-10, max_it=2000)
             ksp2.setErrorIfNotConverged(False)
 
@@ -1353,8 +1472,9 @@ class ImplicitAdjointSolver:
                         f"iters={iters2}), GMRES(reason={reason3}, iters={iters3})"
                     )
 
-        # Clean up regularized copy
-        if J_reg is not None:
+        # Clean up regularized copy — EXCEPT when we cached it for reuse
+        # (then clear_transpose_solver_cache() is responsible for destroying).
+        if J_reg is not None and not _cached_this_call:
             J_reg.destroy()
 
         # UV bisector: state right after solve, before tiny-mask zeroing
