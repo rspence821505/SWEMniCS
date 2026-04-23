@@ -4320,11 +4320,16 @@ def _run_sub_experiment_wind(args, sub_label, method, wind_truth_file, wind_pert
         truth_trajectory.append(vec)
 
     # Deep-copy Jacobians before truth solver is deleted (needed for Eq 38 TLM).
-    # Must duplicate each PETSc Mat — a shallow list copy would leave dangling references
-    # after solver_truth is destroyed.
+    # Must use copy=True — bare PETSc.Mat.duplicate() preserves the sparsity
+    # pattern but leaves values UNSET (zero). The next `del solver_truth` at
+    # line ~4345 then destroys the real originals, leaving the TLM adjoint with
+    # a list of zero-valued matrices. This is the same bug documented in
+    # docs/idealized_inlet_jacobian_handoff_trace.md — the Shinnecock Phase
+    # 3/5 "all eigenvalues identical" DC-WME degeneracy is very likely an
+    # artifact of this same missing flag rather than a tidal-linearity finding.
     truth_jacobians = None
     if len(solver_truth.storage.saved_jacobians) > 0:
-        truth_jacobians = [J.duplicate() for J in solver_truth.storage.saved_jacobians]
+        truth_jacobians = [J.duplicate(copy=True) for J in solver_truth.storage.saved_jacobians]
         if rank == 0:
             print(f"  Jacobians deep-copied: {len(truth_jacobians)} matrices")
 
