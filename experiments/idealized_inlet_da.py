@@ -255,10 +255,14 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         vec.assemble()
         truth_trajectory.append(vec)
 
-    # Deep-copy Jacobians for TLM Eq 38 (before truth solver is freed)
+    # Deep-copy Jacobians for TLM Eq 38 (before truth solver is freed).
+    # Must use copy=True — bare .duplicate() allocates a new AIJ with the same
+    # sparsity pattern but ZERO values, and solver_truth.storage.clear() below
+    # destroys the originals, leaving the adjoint with a zero operator.
+    # See docs/idealized_inlet_jacobian_handoff_trace.md.
     truth_jacobians = None
     if need_jacobians and solver_truth.storage.saved_jacobians:
-        truth_jacobians = [J.duplicate() for J in solver_truth.storage.saved_jacobians]
+        truth_jacobians = [J.duplicate(copy=True) for J in solver_truth.storage.saved_jacobians]
         print(f"  Truth: {len(truth_trajectory)} states, {len(truth_jacobians)} Jacobians")
     else:
         print(f"  Truth: {len(truth_trajectory)} states, no Jacobians")
