@@ -339,9 +339,13 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
         e_i.setValue(i, 1.0)
         e_i.assemblyBegin()
         e_i.assemblyEnd()
-        if component_indices is not None and i == 0 and rank == 0:
-            print("  [uv-bisector] arming adjoint-sweep diagnostic for i=0 only",
-                  flush=True)
+        if component_indices is not None and i == 0:
+            # Arm on EVERY rank — the diagnostic uses collective MPI allreduce
+            # to report global norms AND per-rank local norms. Without arming
+            # on every rank, the collective inside _bisector_log deadlocks.
+            if rank == 0:
+                print("  [uv-bisector] arming adjoint-sweep diagnostic for i=0 only (all ranks)",
+                      flush=True)
             _bis_arm(component_indices)
         a_i = linearized_wme.apply_adjoint(e_i)
         if component_indices is not None and i == 0:

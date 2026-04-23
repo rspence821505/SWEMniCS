@@ -52,18 +52,42 @@ def _bisector_log(step_label: str, vec_arr: np.ndarray,
     if ci is None:
         return
     try:
+        from mpi4py import MPI as _MPI
+        comm = _MPI.COMM_WORLD
+        rank = comm.Get_rank()
         h  = vec_arr[ci["h"]]
         uv = vec_arr[ci["uv"]]
         tol = 1e-15
-        msg = (f"[uv-bisector] {step_label:<48s}  "
-               f"||h||={np.linalg.norm(h):.3e}  "
-               f"||uv||={np.linalg.norm(uv):.3e}  "
-               f"nz_h={int(np.sum(np.abs(h) > tol))}/{len(h)}  "
-               f"nz_uv={int(np.sum(np.abs(uv) > tol))}/{len(uv)}")
+        # Collective: take global L2 norm across ranks
+        h_sq_local  = float(np.sum(h * h))
+        uv_sq_local = float(np.sum(uv * uv))
+        h_nz_local  = int(np.sum(np.abs(h) > tol))
+        uv_nz_local = int(np.sum(np.abs(uv) > tol))
+        h_sq  = comm.allreduce(h_sq_local,  op=_MPI.SUM)
+        uv_sq = comm.allreduce(uv_sq_local, op=_MPI.SUM)
+        h_nz  = comm.allreduce(h_nz_local,  op=_MPI.SUM)
+        uv_nz = comm.allreduce(uv_nz_local, op=_MPI.SUM)
+        h_total  = comm.allreduce(len(h),  op=_MPI.SUM)
+        uv_total = comm.allreduce(len(uv), op=_MPI.SUM)
+        if rank == 0:
+            msg = (f"[uv-bisector][GLOBAL] {step_label:<48s}  "
+                   f"||h||={np.sqrt(h_sq):.3e}  "
+                   f"||uv||={np.sqrt(uv_sq):.3e}  "
+                   f"nz_h={h_nz}/{h_total}  nz_uv={uv_nz}/{uv_total}")
+            if extras:
+                for k, v in extras.items():
+                    msg += f"  {k}={v}"
+            print(msg, flush=True)
+        # Also dump per-rank local view so we can see partition-asymmetry
+        per_rank = (f"[uv-bisector][r{rank}] {step_label:<48s}  "
+                    f"||h||_loc={np.sqrt(h_sq_local):.3e}  "
+                    f"||uv||_loc={np.sqrt(uv_sq_local):.3e}  "
+                    f"nz_h_loc={h_nz_local}/{len(h)}  "
+                    f"nz_uv_loc={uv_nz_local}/{len(uv)}")
         if extras:
             for k, v in extras.items():
-                msg += f"  {k}={v}"
-        print(msg, flush=True)
+                per_rank += f"  {k}={v}"
+        print(per_rank, flush=True)
     except Exception as _e:
         print(f"[uv-bisector] log failed at {step_label}: {_e}", flush=True)
 
