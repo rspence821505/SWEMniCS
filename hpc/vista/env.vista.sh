@@ -43,6 +43,14 @@ if [[ "$(basename "${CONDA_PREFIX:-/none}")" != "fenics-vista" ]]; then
   return 1 2>/dev/null || exit 1
 fi
 
+# Override $CC / $CXX so FFCX JIT compiles its generated C code with the
+# conda-bundled gcc. Vista's login modules default $CC to NVIDIA's `nvc`,
+# which cannot compile FFCX's C output (uses gcc-specific builtins).
+if [[ -x "${CONDA_PREFIX:-}/bin/gcc" ]]; then
+  export CC="$CONDA_PREFIX/bin/gcc"
+  export CXX="$CONDA_PREFIX/bin/g++"
+fi
+
 # Thread pinning reasonable for single-node multi-rank runs on 144-core Grace
 export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
 export OMP_PLACES=${OMP_PLACES:-cores}
