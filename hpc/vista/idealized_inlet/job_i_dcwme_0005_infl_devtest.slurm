@@ -18,7 +18,7 @@ source $WORK/SWEMniCS/hpc/vista/env.vista.sh
 cd $WORK/SWEMniCS
 git rev-parse HEAD
 
-mpirun -n 8 python -u experiments/idealized_inlet_da.py \
+mpirun -n 8 --bind-to core --map-by socket --timeout 3600 python -u experiments/idealized_inlet_da.py \
   --method dcwme_static \
   --vmax 20 --track-shift 10 \
   --nt-ramp 24 --nt-da 12 \

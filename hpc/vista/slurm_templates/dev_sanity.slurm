@@ -19,7 +19,7 @@ git rev-parse HEAD
 
 # Conda OpenMPI uses `mpirun`, not `ibrun`. For multi-node later, swap to ibrun
 # + system OpenMPI (see VISTA_PLAYBOOK §5).
-mpirun -n 2 python -c "
+mpirun -n 2 --bind-to core --map-by socket --timeout 3600 python -c "
 from mpi4py import MPI
 from dolfinx import mesh, fem
 import swe4dvar

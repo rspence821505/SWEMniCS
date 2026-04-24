@@ -24,7 +24,7 @@ cd $WORK/SWEMniCS
 git rev-parse HEAD
 echo "SIGMA_H_SQ=$SIGMA_H_SQ   SIGMA_UV_SQ=$SIGMA_UV_SQ"
 
-mpirun -n 8 python -u experiments/idealized_inlet_da.py \
+mpirun -n 8 --bind-to core --map-by socket --timeout 3600 python -u experiments/idealized_inlet_da.py \
   --method 4dvar \
   --vmax 20 --track-shift 10 \
   --nt-ramp 24 --nt-da 12 \
