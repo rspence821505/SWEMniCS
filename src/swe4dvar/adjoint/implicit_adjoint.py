@@ -1212,9 +1212,14 @@ class ImplicitAdjointSolver:
         J = self.jacobians[n - 1]
 
         # Stored-Jacobian structural diagnostic: one-shot, fires on the FIRST
-        # J consumed while the bisector is armed. See
+        # J consumed while the bisector is armed. Opt-in via env var —
+        # defaults OFF because the diagnostic's J.createVecRight() call
+        # triggers MPI_ERR_COMM on Vista's conda PETSc 3.25 and corrupts
+        # downstream comm state. See
         # docs/idealized_inlet_stored_jacobian_diagnostic.md.
-        if (_UV_BISECTOR_CTX["comp_idx"] is not None
+        import os as _os_jd
+        if (_os_jd.environ.get("SWE4DVAR_JAC_STRUCT_DIAG", "0") == "1"
+                and _UV_BISECTOR_CTX["comp_idx"] is not None
                 and not _STORED_JAC_DIAG_FIRED[0]):
             _STORED_JAC_DIAG_FIRED[0] = True
             try:
