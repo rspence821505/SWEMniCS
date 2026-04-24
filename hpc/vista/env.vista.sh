@@ -17,13 +17,13 @@
 # swap to a system-MPI-linked mpi4py (see VISTA_PLAYBOOK §Multi-node).
 # -----------------------------------------------------------------------------
 
-# Guard against double-loading
-if [[ -n "$SWEMNICS_VISTA_ENV_LOADED" ]]; then
+# Guard against double-loading (set -u safe via :-)
+if [[ -n "${SWEMNICS_VISTA_ENV_LOADED:-}" ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
 # Conda initialization (miniforge3 installed at $WORK/miniforge3)
-if [[ -z "$WORK" ]]; then
+if [[ -z "${WORK:-}" ]]; then
   echo "ERROR: \$WORK is unset. Are you on Vista?" >&2
   return 1 2>/dev/null || exit 1
 fi
@@ -37,9 +37,9 @@ fi
 source "$WORK/miniforge3/etc/profile.d/conda.sh"
 conda activate fenics-vista
 
-# Sanity: confirm the env is really active
-if [[ "$(basename "$CONDA_PREFIX")" != "fenics-vista" ]]; then
-  echo "ERROR: fenics-vista env did not activate (CONDA_PREFIX=$CONDA_PREFIX)" >&2
+# Sanity: confirm the env is really active (set -u safe via :-)
+if [[ "$(basename "${CONDA_PREFIX:-/none}")" != "fenics-vista" ]]; then
+  echo "ERROR: fenics-vista env did not activate (CONDA_PREFIX=${CONDA_PREFIX:-unset})" >&2
   return 1 2>/dev/null || exit 1
 fi
 
