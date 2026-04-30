@@ -608,6 +608,17 @@ class FourDVarCost(CostFunction):
         )
         if _recompute_on:
             _os_recompute.environ["SWE4DVAR_CAPTURE_REPLAY_META"] = "1"
+            # The persistent sweep-KSP and the transpose-cache both hold
+            # PETSc operator handles bound to a single Mat across backward
+            # steps. In recompute mode each backward step receives a fresh
+            # Mat from JacobianReplayContext.reassemble(copy=True), so the
+            # cached KSP/transpose either reuses a stale operator or gets
+            # its factor torn out — the bisector saw production grad=0
+            # while a fresh-KSP solve of the same J produced sensible λ.
+            # Force these off whenever recompute is on; per-step KSPs
+            # cost almost nothing for the LU-direct path used here.
+            _os_recompute.environ["SWE4DVAR_ADJOINT_SWEEP_KSP"] = "0"
+            _os_recompute.environ["SWE4DVAR_ADJOINT_TRANSPOSE_CACHE"] = "0"
         _store_J = not _recompute_on
         try:
             trajectory, jacobians = self._run_forward_model(m, store_jacobians=_store_J)

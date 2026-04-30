@@ -106,6 +106,15 @@ class JacobianReplayContext:
                 self.problem.u_bc.x.array[:] = snap["u_bc"]
             except Exception:
                 pass
+        # Re-evaluate time-dependent forcing (wind/pressure) at the
+        # snapshot t so the form's source term is consistent with the
+        # restored state. The forward's source UFL references
+        # self.problem.forcing.{windx, windy, pressure} as Functions,
+        # and those Functions are mutated in-place by evaluate(t).
+        # Without this, after a replay call the live wind state stays
+        # at the t of the most recent _load, contaminating any
+        # downstream production solve.
+        self._evaluate_forcing_at(snap["t"])
 
     def _load(self, meta: dict) -> None:
         """Write the replay metadata into the live solver state.
@@ -130,6 +139,32 @@ class JacobianReplayContext:
                 self.problem.u_bc.x.array[:] = meta["u_bc"]
             except Exception:
                 pass
+        # Re-evaluate time-dependent forcing at meta["t"]. The form's
+        # source term reads self.problem.forcing.{windx, windy, pressure}
+        # — Functions populated by forcing.evaluate(t). The forward
+        # advances these via problem.advance_time(); the replay context
+        # must do the same so the assembled J reflects the wind state
+        # at the saved timestep, not at the live solver's last t.
+        # Without this, the J error grows linearly with backward distance
+        # (bisector observed: rel_F=0 at first replay step, ~1e-04 by step 1).
+        self._evaluate_forcing_at(meta["t"])
+
+    def _evaluate_forcing_at(self, t: float) -> None:
+        """Refresh self.problem.forcing's wind/pressure Functions at ``t``.
+
+        No-op if the problem has no forcing or if evaluate fails — this
+        is observational (snapshot/restore) code and must not throw.
+        """
+        forcing = getattr(self.problem, "forcing", None)
+        if forcing is None:
+            return
+        evaluator = getattr(forcing, "evaluate", None)
+        if evaluator is None:
+            return
+        try:
+            evaluator(float(t))
+        except Exception:
+            pass
 
     # ---- public API ----------------------------------------------------
 
