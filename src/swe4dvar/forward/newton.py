@@ -140,6 +140,41 @@ class CustomNewtonProblem:
         if self.comm.rank == 0:
             print(*msg)
 
+    def destroy(self):
+        """Release PETSc objects held by this Newton problem.
+
+        Why: solve_init in cg_implicit.py creates a fresh CustomNewtonProblem
+        every time_loop() call. Without explicit destroy of A, L, and the KSP
+        (with its LU factorization), each cost-function eval leaks ~240 MB of
+        C-level memory — observed as ~1.5 GB/eval RSS growth across cycling DA.
+        """
+        for attr in ("solver", "A", "L"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.destroy()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        # Cached Newton update Function (Phase C-7) — backing Vec needs
+        # explicit destroy.
+        _dx = getattr(self, "_dx_cache", None)
+        if _dx is not None:
+            try:
+                _dx.x.petsc_vec.destroy()
+            except Exception:
+                pass
+            self._dx_cache = None
+        # ElementBlockPreconditioner has internal PETSc objects too
+        if getattr(self, "pc_type", None) == "element_block":
+            pc_obj = getattr(self, "pc", None)
+            if pc_obj is not None and hasattr(pc_obj, "destroy"):
+                try:
+                    pc_obj.destroy()
+                except Exception:
+                    pass
+                self.pc = None
+
     def solve(self, u, max_it=5, return_jacobian=False, timestep=None, time=None):
         """Solve the nonlinear problem at u
 
@@ -168,7 +203,25 @@ class CustomNewtonProblem:
             self._solve_counter += 1
         self.diagnostics.start_timestep(timestep, time)
 
-        dx = fe.Function(u._V)
+        # Cache the Newton update Function across solves (Phase C-7).
+        # Without caching, every Newton solve allocates a fresh
+        # ``fem.Function(u._V)`` whose backing PETSc Vec (~1.6 MB at 207K
+        # DOFs) leaks at C level when Python drops the ref. With nt_da=6
+        # timesteps × ~13 Newton iters × N cost evals, this churn pools
+        # ~10 MB / eval. Caching by FunctionSpace identity keeps one Vec
+        # for the lifetime of the Newton problem (now persistent across
+        # cost evals via Phase C-1).
+        _cached_dx = getattr(self, "_dx_cache", None)
+        if _cached_dx is None or _cached_dx.function_space is not u._V:
+            if _cached_dx is not None:
+                try:
+                    _cached_dx.x.petsc_vec.destroy()
+                except Exception:
+                    pass
+            self._dx_cache = fe.Function(u._V)
+        dx = self._dx_cache
+        # Zero the cached Newton update at the start of each solve.
+        dx.x.array[:] = 0.0
         i = 0
         converged = False
         rank = self.comm.rank
@@ -333,6 +386,19 @@ class CustomNewtonProblem:
 
         # End diagnostics tracking for this timestep
         self.diagnostics.end_timestep(converged, i)
+
+        # Expose per-timestep diagnostics for the forward-diag CSV reader
+        # in cg_implicit.solve_timestep. Cheap public attributes.
+        self.last_n_iters = int(i)
+        self.last_converged = bool(converged)
+        try:
+            self.last_correction_norm = float(correction_norm) if i > 0 else float("nan")
+        except Exception:
+            self.last_correction_norm = float("nan")
+        try:
+            self.last_residual_norm = float(residual_norm)
+        except Exception:
+            self.last_residual_norm = float("nan")
 
         # Handle Newton solver failure
         if not converged:

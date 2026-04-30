@@ -87,6 +87,18 @@ class PETScTAOWrapper(Optimizer):
         self._max_funcs = self.options.get("max_funcs", None)
         self._last_grad = None
 
+        # Failure tracking. `_failures_since_accept` is reset ONLY when the TAO
+        # monitor fires (true iteration boundary), not on a backtracked line-
+        # search eval that happens to converge Newton. This prevents the
+        # silent-hang pattern where Newton flips between fail/pass during
+        # Armijo backtracking and the counter never reaches the bailout.
+        self._failures_since_accept = 0
+        self._abort_after_n_failures = int(
+            self.options.get("abort_after_n_failures", 6)
+        )
+        # Δm diagnostics: store last accepted-iterate array for norm reporting.
+        self._last_accepted_x_arr = None
+
     def solve(self, x0: PETSc.Vec) -> PETSc.Vec:
         """
         Minimize cost function using TAO.
@@ -147,6 +159,15 @@ class PETScTAOWrapper(Optimizer):
         ls_type = self.options.get("line_search_type", "armijo")
         ls_max_funcs = self.options.get("line_search_max_funcs", 30)
         ls_initial_step = self.options.get("line_search_initial_step", None)
+        # Hard cap on TAO line-search step length, plumbed to PETSc option
+        # `-tao_ls_stepmax`. Useful for globalizing quasi-Newton methods
+        # (BLMVM) when the 2nd+ iteration extrapolates into regions that
+        # crash the forward Newton solver — specifically, the eval-3 failure
+        # pattern observed on idealized-inlet 4D-Var at obs ≥ 0.02. Setting
+        # it conservatively lets Armijo backtrack FROM a bounded starting
+        # length instead of from the unrestricted quasi-Newton proposal.
+        ls_step_max = self.options.get("line_search_step_max", None)
+        ls_step_min = self.options.get("line_search_step_min", None)
         try:
             ls = self.tao.getLineSearch()
             if ls is not None:
@@ -154,8 +175,27 @@ class PETScTAOWrapper(Optimizer):
                 ls.setMaximumFunctionEvaluations(ls_max_funcs)
                 if ls_initial_step is not None:
                     ls.setInitialStepLength(ls_initial_step)
+                if ls_step_max is not None:
+                    # Route through the PETSc options database because
+                    # petsc4py's TaoLineSearch does not expose a direct
+                    # setStepMax() wrapper across versions.
+                    PETSc.Options().setValue("-tao_ls_stepmax", str(float(ls_step_max)))
+                if ls_step_min is not None:
+                    PETSc.Options().setValue("-tao_ls_stepmin", str(float(ls_step_min)))
         except Exception:
             pass  # Line search config not supported for all TAO types
+
+        # Concise line-search activation log so run output records exactly
+        # what globalization settings are active.
+        if self.comm.rank == 0:
+            parts = [f"type={ls_type}", f"max_funcs={ls_max_funcs}"]
+            if ls_initial_step is not None:
+                parts.append(f"init_step={ls_initial_step}")
+            if ls_step_max is not None:
+                parts.append(f"stepmax={ls_step_max}")
+            if ls_step_min is not None:
+                parts.append(f"stepmin={ls_step_min}")
+            print(f"  [TAO line-search] {'  '.join(parts)}", flush=True)
 
         # Apply additional TAO-specific options (calls setFromOptions())
         self._apply_tao_options()
@@ -270,43 +310,65 @@ class PETScTAOWrapper(Optimizer):
                 self.n_func_evals += 1
                 self.n_grad_evals += 1
 
+                # Δm diagnostic: norm of step from last ACCEPTED iterate (monitor).
+                # Tells us whether TAO is backtracking hard (Δm shrinking) or
+                # still trying aggressive steps (Δm stable).
+                dm_norm_str = ""
+                if self._last_accepted_x_arr is not None:
+                    try:
+                        dx = x.getArray(readonly=True) - self._last_accepted_x_arr
+                        local_sq = float(np.dot(dx, dx))
+                        global_sq = self.comm.allreduce(local_sq)
+                        dm_norm_str = f"  ||Δm from last accept||={float(global_sq)**0.5:.3e}"
+                    except Exception:
+                        pass
+
                 # Check for infinity (forward model failure)
                 if not np.isfinite(f):
-                    self._consec_failures = getattr(self, '_consec_failures', 0) + 1
+                    self._failures_since_accept += 1
+                    fail_msg = getattr(
+                        self.cost_function, "_last_forward_failure_msg", None
+                    )
+                    fail_str = f"  [fwd: {fail_msg}]" if fail_msg else ""
                     if self.verbose and self.comm.rank == 0:
                         print(f"  [TAO callback] eval #{self.n_func_evals}: cost=inf "
-                              f"(forward model failure, consec={self._consec_failures})",
+                              f"(forward model failure, "
+                              f"since_accept={self._failures_since_accept}/"
+                              f"{self._abort_after_n_failures}){dm_norm_str}{fail_str}",
                               flush=True)
                     # CRITICAL FIX: Don't set gradient to zero! TAO will think it converged.
                     # Instead, return background penalty gradient to push back toward m_b
                     if hasattr(self.cost_function, 'compute_background_gradient'):
-                        if self.verbose and self.comm.rank == 0:
-                            print(f"  [TAO callback] computing background gradient...",
-                                  flush=True)
                         grad_b = self.cost_function.compute_background_gradient(x)
                         grad_b.copy(g)
                         grad_b.destroy()
-                        if self.verbose and self.comm.rank == 0:
-                            print(f"  [TAO callback] returning 1e20 for eval #{self.n_func_evals}",
-                                  flush=True)
                     else:
                         # Fallback: set small non-zero gradient to prevent TAO from thinking it converged
                         g.set(1e-10)
-                    # Bail out if too many consecutive forward failures — TAO
-                    # BLMVM can silently stall on repeated inf returns; set
-                    # DIVERGED_USER so the solver exits cleanly.
-                    if self._consec_failures >= 3:
-                        if self.verbose and self.comm.rank == 0:
-                            print(f"  [TAO callback] {self._consec_failures} consecutive "
-                                  f"forward failures — requesting TAO termination",
+                    # Hard-abort after N failures since last accepted iterate.
+                    # Sending DIVERGED_USER first lets TAO unwind its line search,
+                    # but BLMVM has been observed to ignore it mid-Armijo. After
+                    # 2 more calls with no acceptance, hard-abort the MPI job so
+                    # the best-iterate checkpoint saved by the driver is used.
+                    if self._failures_since_accept >= self._abort_after_n_failures:
+                        if self.comm.rank == 0:
+                            print(f"  [TAO callback] {self._failures_since_accept} "
+                                  f"forward failures since last accepted iterate — "
+                                  f"hard-aborting to preserve best-iterate checkpoint",
                                   flush=True)
+                        # Give caller a chance to save best iterate via exit
+                        # handler; then MPI_Abort to terminate cleanly.
+                        self.comm.Abort(42)
+                    elif self._failures_since_accept >= max(3, self._abort_after_n_failures - 2):
+                        if self.verbose and self.comm.rank == 0:
+                            print(f"  [TAO callback] requesting TAO termination "
+                                  f"(DIVERGED_USER)", flush=True)
                         tao.setConvergedReason(
                             PETSc.TAO.ConvergedReason.DIVERGED_USER
                         )
                     return 1e20
-                else:
-                    # Reset consecutive-failure counter on any successful eval.
-                    self._consec_failures = 0
+                # Finite cost — DO NOT reset _failures_since_accept here. That
+                # happens only when the TAO monitor fires (true acceptance).
 
                 self._last_cost = f
                 self._last_grad = grad.copy()
@@ -430,6 +492,15 @@ class PETScTAOWrapper(Optimizer):
             grad = grad[0]
         gnorm = grad.norm() if grad is not None else 0.0
         x = tao.getSolution() if hasattr(tao, "getSolution") else None
+
+        # True iteration boundary — TAO has accepted this iterate. Reset the
+        # since-last-accept failure counter and snapshot x for Δm diagnostics.
+        self._failures_since_accept = 0
+        if x is not None:
+            try:
+                self._last_accepted_x_arr = x.getArray(readonly=True).copy()
+            except Exception:
+                pass
 
         # Record for convergence history before any rank-0-only printing.
         self.record_iteration(x, f, gnorm)

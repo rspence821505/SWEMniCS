@@ -69,7 +69,11 @@ def _get_process_memory_mb():
         return None
 
 
-def _check_memory(context="", limit_mb=MEM_LIMIT_MB):
+def _check_memory(context="", limit_mb=None):
+    # Resolve limit at call-time — MEM_LIMIT_MB is rebound in main() after
+    # CLI parsing. Using a default arg would freeze the module-load value.
+    if limit_mb is None:
+        limit_mb = MEM_LIMIT_MB
     rss = _get_process_memory_mb()
     if rss is not None:
         print(f"  [mem] {context}: {rss:.0f} MB", flush=True)
@@ -77,7 +81,9 @@ def _check_memory(context="", limit_mb=MEM_LIMIT_MB):
             raise MemoryError(f"RSS {rss:.0f} MB > limit {limit_mb:.0f} MB at '{context}'")
 
 
-def _estimate_and_guard(description, bytes_needed, limit_mb=MEM_LIMIT_MB):
+def _estimate_and_guard(description, bytes_needed, limit_mb=None):
+    if limit_mb is None:
+        limit_mb = MEM_LIMIT_MB
     mb_needed = bytes_needed / 1e6
     current = _get_process_memory_mb() or 0
     projected = current + mb_needed
@@ -108,8 +114,33 @@ from experiments.idealized_inlet_twin import (
 )
 
 
-def run_single_method(args, method, l_wme_mode, output_dir):
-    """Run a single DA method (4dvar or dcwme) on the idealized inlet."""
+def run_single_method(args, method, l_wme_mode, output_dir,
+                      *, initial_bg_arr=None, truth_offset_steps=0,
+                      window_tag="", advance_steps=0):
+    """Run a single DA method (4dvar or dcwme) on the idealized inlet.
+
+    Parameters
+    ----------
+    args, method, l_wme_mode, output_dir : standard
+    initial_bg_arr : np.ndarray or None
+        If provided, overrides the perturbed-truth background. Used by
+        cycling DA to chain analysis from the previous window into the
+        next window's background.
+    truth_offset_steps : int
+        Extra timesteps to march the truth (and DA) solvers BEFORE the
+        DA window starts. Used by cycling DA so each window's truth
+        starts at the correct cumulative time. Window N: offset = N*nt_da.
+    window_tag : str
+        Appended to result filenames. For cycling, distinguishes windows.
+    advance_steps : int
+        After Step 9 finishes, forward-evolve `m_analysis` through this
+        many timesteps using the (still-alive) DA solver. The advanced
+        state is returned as `_m_analysis_advanced_arr` for use as the
+        next cycling window's background. Required for textbook cycling
+        DA semantics — the analysis at this window's start time gets
+        propagated through the dynamics to estimate the IC at the next
+        window's start time. Default 0 (no advance).
+    """
     from mpi4py import MPI
     from petsc4py import PETSc
     from dolfinx import la
@@ -134,24 +165,50 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     dt = args.dt
     nt_ramp = args.nt_ramp
     nt_da = args.nt_da
-    nt_total = nt_ramp + nt_da
-    times = np.arange(0, (nt_total + 1) * dt, dt)
+    n_windows = max(1, int(getattr(args, 'n_windows', 1)))
+    # Total simulation time covers ramp + all DA windows so wind files
+    # can be generated once for the whole cycling run. truth_offset_steps
+    # is the cumulative offset for the CURRENT window (0 for window 0).
+    nt_total_full = nt_ramp + n_windows * nt_da
+    # The TRUTH solver in this single-window invocation runs:
+    #   ramp (nt_ramp) → offset (truth_offset_steps) → DA window (nt_da)
+    # Window 0: truth_offset_steps = 0
+    # Window N: truth_offset_steps = N * nt_da (passed by main()'s cycling loop)
+    nt_truth_pre_da = nt_ramp + int(truth_offset_steps)
+    nt_total = nt_truth_pre_da + nt_da
+    times = np.arange(0, (nt_total_full + 1) * dt, dt)
 
     print(f"\n{'='*60}")
     print(f"  Method: {method.upper()} ({l_wme_mode})")
     print(f"  Vmax={args.vmax}, track_shift={args.track_shift}km")
     print(f"  Ramp={nt_ramp}×{dt}s = {nt_ramp*dt/3600:.1f}h")
     print(f"  DA window={nt_da}×{dt}s = {nt_da*dt/3600:.1f}h")
+    if n_windows > 1:
+        print(f"  Cycling: n_windows={n_windows} "
+              f"(total DA = {n_windows*nt_da*dt/3600:.1f}h)")
     print(f"  Smoother L={args.smooth_length:.0f}m, bounds=BLMVM(h>=0.01)")
     print(f"{'='*60}")
 
     # ================================================================
     # Step 1: Generate wind files
     # ================================================================
+    # track_duration_s is set EXPLICITLY (not left as the legacy "spans
+    # times array" default) so the storm has the same absolute trajectory
+    # regardless of n_windows / nt_total. Without this, longer simulations
+    # silently slow the storm down → different truth wind at the same
+    # physical t → bg differs and (at certain n_windows) the truth Newton
+    # diverges at the first DA-window timestep.
+    #
+    # Default chosen to match the validated 4-window cycling case
+    # (nt_ramp=24, nt_da=6, n_windows=4 → 48 timesteps × dt=600s = 28800 s).
+    # Override via --track-duration-s when running studies that need a
+    # different storm passage speed.
+    track_duration_s = float(getattr(args, "track_duration_s", 0.0)) or 28800.0
     vortex_cfg = CartesianVortexConfig(
         Vmax=args.vmax,
         Rmax=args.rmax_km * 1000,
         ramp_time_s=nt_ramp * dt,
+        track_duration_s=track_duration_s,
     )
 
     wind_dir = output_dir / "wind"
@@ -159,20 +216,37 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         wind_dir.mkdir(parents=True, exist_ok=True)
     comm.Barrier()
 
-    truth_file = wind_dir / "truth.h5"
-    pert_file = wind_dir / "perturbed.h5"
+    # Wind files are keyed by the parameters that affect their content:
+    # vmax, track-shift, ramp duration, total simulation time. This
+    # prevents the silent reuse-with-stale-parameters bug previously seen
+    # when --track-shift was changed but cached wind from a prior run was
+    # reused (e.g. cycling tests run with track-shift=0 read a cached
+    # track-shift=10 file, masking model-error-free behavior).
+    _ts_tag = f"ts{int(round(args.track_shift * 10)):03d}"  # e.g. "ts100" for 10km, "ts000" for 0km
+    _v_tag = f"v{int(round(args.vmax))}"
+    _t_tag = f"r{nt_ramp}n{n_windows*nt_da}"
+    # Storm-track absolute duration tag — included so cached wind files from
+    # the pre-fix "track scales with simulation length" code (which had no
+    # _td tag) cannot be silently reused. After the fix, wind values for the
+    # SAME physical t are independent of n_windows; the file name reflects
+    # that by including the track-duration explicitly.
+    _td_tag = f"td{int(round(track_duration_s))}"
+    _wind_tag = f"_{_v_tag}_{_ts_tag}_{_t_tag}_{_td_tag}"
+    truth_file = wind_dir / f"truth{_wind_tag}.h5"
+    pert_file = wind_dir / f"perturbed{_wind_tag}.h5"
 
     x_grid = np.linspace(-10000, 60000, 71)
     y_grid = np.linspace(-30000, 50000, 81)
 
     if not truth_file.exists() and rank == 0:
-        print("  Generating truth wind...")
+        print(f"  Generating truth wind  → {truth_file.name}")
         wx, wy, p = generate_cartesian_vortex(vortex_cfg, x_grid, y_grid, times)
         write_cartesian_wind_hdf5(str(truth_file), x_grid, y_grid, times, wx, wy, p)
 
     pert_cfg = create_perturbed_config(vortex_cfg, args.track_shift)
     if not pert_file.exists() and rank == 0:
-        print(f"  Generating perturbed wind ({args.track_shift}km shift)...")
+        print(f"  Generating perturbed wind ({args.track_shift}km shift)  → "
+              f"{pert_file.name}")
         wx, wy, p = generate_cartesian_vortex(pert_cfg, x_grid, y_grid, times)
         write_cartesian_wind_hdf5(str(pert_file), x_grid, y_grid, times, wx, wy, p)
     comm.Barrier()
@@ -183,7 +257,7 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     print("\n--- Step 1: Truth problem ---")
     forcing_truth = GriddedForcing(str(truth_file), cartesian=True)
     prob_truth = IdealizedInlet(
-        dt=dt, nt=nt_total,
+        dt=dt, nt=nt_total_full,
         xdmf_file="data/Ideal_Inlet/Ideal_Inlet.xdmf",
         friction_law="mannings", solution_var="h",
         dramp=nt_ramp * dt / 86400.0,
@@ -212,15 +286,20 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     print(f"  State size: {state_size} DOFs")
     _check_memory("after truth problem construction")
 
-    # Warm-up (ramp)
-    print(f"\n--- Step 2: Warm-up ({nt_ramp} steps) ---")
-    prob_truth.nt = nt_ramp
+    # Warm-up (ramp + cycling offset). The offset advances the truth state
+    # past previous windows so that this window's DA starts at the correct
+    # cumulative time. truth_offset_steps = window_idx * nt_da (set by main).
+    pre_da_label = (f"ramp+offset ({nt_ramp}+{int(truth_offset_steps)})"
+                    if truth_offset_steps > 0 else f"ramp ({nt_ramp})")
+    print(f"\n--- Step 2: Warm-up [{pre_da_label} steps] ---")
+    prob_truth.nt = nt_truth_pre_da
     solver_truth.time_loop(
         solver_parameters=solver_params, stations=[], plot_every=9999,
         save_state=False, store_jacobians=False, enable_video=False,
     )
     t_da_start = prob_truth.t
-    print(f"  Warm-up done, t={t_da_start:.0f}s")
+    print(f"  Warm-up done, t={t_da_start:.0f}s "
+          f"(window_tag={window_tag or 'single'})")
 
     # CRITICAL: Save ramp-end state BEFORE running DA window.
     # This is the initial condition for the DA window — both truth and DA
@@ -264,24 +343,27 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         vec.assemble()
         truth_trajectory.append(vec)
 
-    # Deep-copy Jacobians for TLM Eq 38 (before truth solver is freed).
-    # Must use copy=True — bare .duplicate() allocates a new AIJ with the same
-    # sparsity pattern but ZERO values, and solver_truth.storage.clear() below
-    # destroys the originals, leaving the adjoint with a zero operator.
+    # Reference Jacobians directly from truth storage.
+    # PETSc 3.25 (Vista conda) has an MPI_ERR_COMM bug where both .copy() and
+    # .duplicate(copy=True) produce matrices whose communicator becomes invalid
+    # after the source solver is freed — subsequent MatCreateVecs() calls fail.
+    # Workaround: keep truth solver alive until after TLM Gram is computed.
+    # Memory cost: ~1-2 GB retained through TLM phase (acceptable).
     # See docs/idealized_inlet_jacobian_handoff_trace.md.
     truth_jacobians = None
     if need_jacobians and solver_truth.storage.saved_jacobians:
-        truth_jacobians = [J.duplicate(copy=True) for J in solver_truth.storage.saved_jacobians]
-        print(f"  Truth: {len(truth_trajectory)} states, {len(truth_jacobians)} Jacobians")
+        truth_jacobians = list(solver_truth.storage.saved_jacobians)
+        print(f"  Truth: {len(truth_trajectory)} states, {len(truth_jacobians)} Jacobians (aliased)")
+        # Truth solver retained until after Step 7a (TLM Gram) to preserve
+        # Jacobian MPI comms. Freed explicitly at end of Step 7a.
+        _cleanup()
+        _check_memory("after truth trajectory (truth solver retained for TLM)")
     else:
         print(f"  Truth: {len(truth_trajectory)} states, no Jacobians")
-
-    # Free the truth solver and its problem — we've extracted the trajectory.
-    # This releases the truth mesh, sparse matrices, and storage (~1-2 GB).
-    solver_truth.storage.clear()
-    del solver_truth, prob_truth, forcing_truth
-    _cleanup()
-    _check_memory("after truth trajectory + truth solver freed")
+        solver_truth.storage.clear()
+        del solver_truth, prob_truth, forcing_truth
+        _cleanup()
+        _check_memory("after truth trajectory + truth solver freed")
 
     # ================================================================
     # Step 4: DA problem with perturbed wind
@@ -356,13 +438,39 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     exp.observations, obs_noise_stds = exp._generate_observations(obs_operator, obs_times)
     background_error = exp._setup_background()
 
+    # Cycling override: replace the perturbed-truth bg with an externally-
+    # supplied vector (the analysis from the previous window). Computed
+    # AFTER _setup_background so that exp.m_background exists with the
+    # correct PETSc layout, then we just overwrite its values.
+    if initial_bg_arr is not None:
+        cur_arr = exp.m_background.getArray(readonly=True)
+        if cur_arr.shape != initial_bg_arr.shape:
+            raise ValueError(
+                f"initial_bg_arr shape {initial_bg_arr.shape} does not match "
+                f"exp.m_background shape {cur_arr.shape} on rank {rank}"
+            )
+        exp.m_background.setArray(np.asarray(initial_bg_arr, dtype=np.float64))
+        exp.m_background.assemble()
+        # Recompute bg_rmse against THIS window's truth
+        true_arr_local2 = exp.m_true.getArray(readonly=True).copy()
+        diff2 = np.asarray(initial_bg_arr) - true_arr_local2
+        local_sse2 = float(np.sum(diff2 ** 2))
+        local_n2 = len(diff2)
+        global_sse2 = comm.allreduce(local_sse2)
+        global_n2 = comm.allreduce(local_n2)
+        background_error = float(np.sqrt(global_sse2 / max(global_n2, 1)))
+        if rank == 0:
+            print(f"  [cycling override] bg = previous-window analysis  "
+                  f"bg_rmse vs this-window truth = {background_error:.6f}")
+
     # MPI-safe background override: _setup_background's per-rank random
     # noise + local-only smoother produces an MPI background that differs
     # from serial and can contain partition-boundary spots that break
     # Newton. Replace with a coord-based deterministic perturbation that
     # is identical on all ranks and calibrated to the same bg-RMSE
     # magnitude (~0.09) as the serial random bg.
-    if comm.size > 1:
+    # Cycling override (initial_bg_arr) takes precedence — skip MPI override.
+    if comm.size > 1 and initial_bg_arr is None:
         h_indices_bg, u_indices_bg, v_indices_bg = exp._get_component_dof_indices(owned_only=True)
         h_sub_bg = solver_da.V.sub(0)
         h_space_bg, h_map_bg = h_sub_bg.collapse()
@@ -404,6 +512,51 @@ def run_single_method(args, method, l_wme_mode, output_dir):
                   f"bg_rmse={background_error:.6f}")
 
     B, R, B_lwme = exp._setup_covariances(obs_operator, obs_noise_stds)
+
+    # Cycling diagnostics dump: when running in cycling mode, save the
+    # finalized bg vector + truth trajectory to disk so an offline forecast-
+    # sensitivity probe can re-run forward integration from the same IC
+    # without re-doing the optimization. Per-rank .npy files preserve the
+    # partitioning so the probe can reload at the same np with no gather.
+    if window_tag:
+        dump_dir = output_dir / f"cycling_dump_{window_tag}"
+        if rank == 0:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+        comm.Barrier()
+        bg_arr_dump = exp.m_background.getArray(readonly=True).copy()
+        true_arr_dump = exp.m_true.getArray(readonly=True).copy()
+        np.save(dump_dir / f"bg_rank{rank}.npy", bg_arr_dump)
+        np.save(dump_dir / f"truth_ic_rank{rank}.npy", true_arr_dump)
+        # Truth trajectory at obs times (subset of saved_states)
+        truth_states_arr = np.stack(
+            [v.getArray(readonly=True).copy() for v in truth_trajectory],
+            axis=0,
+        )
+        np.save(dump_dir / f"truth_traj_rank{rank}.npy", truth_states_arr)
+        # Save metadata once on rank 0 (obs_times, dt, sizes, t_da_start)
+        if rank == 0:
+            import json as _json
+            meta = {
+                "window_tag": window_tag,
+                "method": method,
+                "t_da_start_seconds": float(t_da_start),
+                "dt": float(dt),
+                "nt_da": int(nt_da),
+                "nt_ramp": int(nt_ramp),
+                "truth_offset_steps": int(truth_offset_steps),
+                "vmax": float(args.vmax),
+                "track_shift_km": float(args.track_shift),
+                "obs_fraction": float(args.obs_fraction),
+                "obs_frequency": int(args.obs_frequency),
+                "background_error_std": float(args.background_error_std),
+                "comm_size": int(comm.size),
+                "state_size_local_per_rank": "see truth_ic_rank{R}.npy shape",
+                "obs_times_steps": [int(t) for t in obs_times],
+            }
+            with open(dump_dir / "meta.json", "w") as f:
+                _json.dump(meta, f, indent=2)
+            print(f"  [cycling-dump] wrote bg + truth to {dump_dir} "
+                  f"(per-rank .npy)", flush=True)
 
     n_obs = obs_operator.get_num_observations()
     print(f"  Obs points: {n_obs}")
@@ -523,10 +676,36 @@ def run_single_method(args, method, l_wme_mode, output_dir):
             predictability_gamma=0.1,
             comm=comm, rank=rank,
             component_indices=component_indices,
+            component_degeneracy_policy=args.eq38_degeneracy_policy,
         )
         _apply_eq38_to_B(B, eq38_result, rank=rank,
                          component_indices=component_indices)
         _check_memory("after TLM Eq 38")
+
+        # Free truth Jacobians + solver now that TLM Gram is complete.
+        # Jacobians are the heavy retained objects (~2 GB each × 12); releasing
+        # them now drops per-rank memory before the TAO optimization loop.
+        # IMPORTANT: with Phase B's Jacobian pool, truth_jacobians ALIAS the
+        # Mats stored in solver_truth.storage._jacobian_pool. Calling
+        # _J.destroy() directly zombies the pool refs, which then deadlocks
+        # PETSc.garbage_cleanup() in _cleanup() below. Route through
+        # release_pool() (which destroys + clears the pool atomically) when
+        # available; fall back to the legacy destroy loop in pre-pool mode.
+        truth_jacobians = None
+        try:
+            if hasattr(solver_truth.storage, "release_pool"):
+                _stats = solver_truth.storage.release_pool()
+                if rank == 0:
+                    print(f"  [pool] truth: released "
+                          f"{_stats.get('jacobian_pool_destroyed', 0)} pool Jacobians",
+                          flush=True)
+            else:
+                solver_truth.storage.clear()
+        except Exception:
+            pass
+        del solver_truth, prob_truth, forcing_truth
+        _cleanup()
+        _check_memory("after truth solver freed post-TLM")
     else:
         print(f"  Step 7a: No truth Jacobians — skipping TLM Eq 38 "
               f"[method={method.upper()}]")
@@ -595,7 +774,13 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     upper = exp.m_background.duplicate()
     lower_arr = lower.getArray()
     upper_arr = upper.getArray()
-    h_min_bound = 0.01
+    # h_min_bound: lower bound on analysis h DOFs. Tighter than the
+    # forward-solver depth floor (args.min_depth) but loose enough that
+    # the optimizer has freedom. Default 0.01 was permissive enough that
+    # cycling DA (window N+1's bg = forward-evolved analysis from N) hit
+    # Newton failures because near-dry cells went negative during the
+    # integration. Raised to 1.0 to keep analysis safely wet.
+    h_min_bound = float(getattr(args, 'h_min_bound', 1.0))
     lower_arr[h_indices] = h_min_bound
     upper_arr[h_indices] = 1e10
     lower_arr[u_indices] = -1e10
@@ -611,10 +796,36 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     max_funcs = args.max_funcs if args.max_funcs is not None else 2 * args.max_iterations + 10
     print(f"  max_iterations={args.max_iterations}, max_funcs={max_funcs}")
 
+    # Best-iterate checkpoint path. Written on every cost improvement so that
+    # a hard-abort (MPI_Abort on Newton-fail hang, walltime timeout, OOM) still
+    # leaves a recoverable JSON with the latest best iterate on disk. The
+    # final result file at Step 9 supersedes this on clean exit.
+    _safe_mode_ckpt = l_wme_mode.replace("/", "_")
+    _tag_ckpt = f"_Lcorr{int(args.obs_correlation_length):d}" if args.obs_correlation_length > 0 else ""
+    if method == "dcwme" and abs(args.predictability_gamma - 0.1) > 1e-9:
+        _tag_ckpt += f"_g{args.predictability_gamma:.3f}".rstrip('0').rstrip('.')
+    checkpoint_file = output_dir / f"result_{method}_{_safe_mode_ckpt}{_tag_ckpt}.best_checkpoint.json"
+    if rank == 0:
+        print(f"  Best-iterate checkpoint: {checkpoint_file}")
+
     # Iteration history: record (cost, grad_norm, RMSE-from-truth) per iteration.
     # RMSE uses allreduce for MPI correctness.
     history = {"iter": [], "cost": [], "grad_norm": [], "rmse_from_truth": []}
     truth_arr_cached = m_true.getArray(readonly=True).copy()
+
+    # Best-iterate checkpoint: persist the best accepted iterate (minimum
+    # cost) to a separate vector. When optimization diverges (Newton-fail
+    # hang, walltime timeout, MPI_Abort from the TAO wrapper), the final
+    # analysis uses this instead of TAO's last-tried-m — which may be the
+    # failing iterate TAO was mid-backtracking from.
+    best_state = {
+        "cost": float("inf"),
+        "iter": -1,
+        "rmse": float("inf"),
+        "gnorm": float("inf"),
+    }
+    best_m = exp.m_background.duplicate()
+    exp.m_background.copy(best_m)
 
     def iteration_callback(x, iteration, f, gnorm):
         x_arr = x.getArray(readonly=True)
@@ -628,6 +839,35 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         history["grad_norm"].append(float(gnorm))
         history["rmse_from_truth"].append(rmse)
 
+        # Best-iterate checkpoint: any finite cost below current best wins.
+        if np.isfinite(f) and f < best_state["cost"]:
+            x.copy(best_m)
+            best_state["cost"] = float(f)
+            best_state["iter"] = int(iteration)
+            best_state["rmse"] = float(rmse)
+            best_state["gnorm"] = float(gnorm)
+            # Persist to disk immediately — MPI_Abort (Newton-fail hang) or
+            # walltime termination after this point still leaves the latest
+            # best-iterate metadata recoverable. Rank 0 writes; no collective
+            # operations here (would deadlock since other ranks skip the write).
+            if rank == 0:
+                try:
+                    with open(checkpoint_file, "w") as _cf:
+                        json.dump({
+                            "method": method,
+                            "l_wme_mode": l_wme_mode,
+                            "best_iterate": {
+                                "iter": int(iteration),
+                                "cost": float(f),
+                                "rmse": float(rmse),
+                                "gnorm": float(gnorm),
+                            },
+                            "iteration_history_len": len(history["iter"]),
+                            "status": "in_progress_checkpoint",
+                        }, _cf, indent=2)
+                except Exception as _ck_exc:
+                    print(f"  [checkpoint] write failed: {_ck_exc}", flush=True)
+
         # Memory safety: PETSc + Python GC between iterations to release
         # transient trajectory/Jacobian objects, then check RSS against
         # a HARD limit. If exceeded, abort cleanly instead of swap-thrashing.
@@ -636,7 +876,9 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         hard_limit = MEM_LIMIT_MB  # from env --mem-limit-gb
         if rank == 0:
             print(f"  [iter {iteration}] cost={f:.4f}  ||grad||={gnorm:.4e}  "
-                  f"RMSE_truth={rmse:.6f}  RSS={rss:.0f} MB", flush=True)
+                  f"RMSE_truth={rmse:.6f}  RSS={rss:.0f} MB  "
+                  f"[best so far: iter {best_state['iter']} cost={best_state['cost']:.4f} "
+                  f"RMSE={best_state['rmse']:.6f}]", flush=True)
         if rss is not None and rss > hard_limit:
             msg = (f"Rank {rank}: RSS {rss:.0f} MB exceeded limit "
                    f"{hard_limit:.0f} MB at iter {iteration}. Aborting to "
@@ -646,39 +888,105 @@ def run_single_method(args, method, l_wme_mode, output_dir):
             # Abort MPI cleanly rather than let the OS OOM-kill or swap-thrash
             comm.Abort(1)
 
+    _tao_options = {
+        "max_iterations": args.max_iterations,
+        "max_funcs": max_funcs,
+        "gradient_tolerance": 1e-3,
+        "cost_tolerance": 1e-4,
+        "verbose": True,
+        "iteration_callback": iteration_callback,
+        # Cap per-step backtracks. Default 30 lets TAO spend an hour+
+        # silently probing after a single forward failure (observed in
+        # DC-WME runs v1/v2/v3 before LS_FAILURE would be raised).
+        # With 5, any genuinely bad direction fails fast and control
+        # returns to our 3-consecutive-failure bailout in the wrapper.
+        "line_search_max_funcs": 5,
+        # Memory-safety: cap BLMVM's limited-memory Hessian history.
+        # Each history pair is 2 state vectors (208K × 8 B × 2 ≈ 3.3 MB
+        # × 2 ranks), and PETSc internals duplicate these. Default is
+        # 5 — we set 3 explicitly for safety on this mesh.
+        "tao_lmvm_hist_size": 3,
+        "tao_blmvm_hist_size": 3,
+    }
+    # Optional TAO globalization knobs (None → not forwarded → PETSc default).
+    # See --ls-step-max / --ls-init-step help text for the rationale.
+    if args.ls_step_max is not None:
+        _tao_options["line_search_step_max"] = float(args.ls_step_max)
+    if args.ls_init_step is not None:
+        _tao_options["line_search_initial_step"] = float(args.ls_init_step)
+
+    # Repeated-eval reproducer hook (gated). When SWE4DVAR_REPEAT_EVALS=N (N>0),
+    # skip TAO and call cost_fn.value_gradient(m_background) N times in the same
+    # process. Used together with SWE4DVAR_EVAL_MEM_DIAG=1 to classify the leak
+    # as live PETSc state vs. allocator retention. Exits early with a stub
+    # result so the cycling/aggregation code paths in main() still see a dict.
+    _n_repeat = int(os.environ.get("SWE4DVAR_REPEAT_EVALS", "0"))
+    if _n_repeat > 0:
+        if rank == 0:
+            print(f"\n[repeated-eval] SWE4DVAR_REPEAT_EVALS={_n_repeat} — skipping "
+                  f"TAO; calling cost_fn.value_gradient(m_background) {_n_repeat}x "
+                  f"in this process (same control vector each time)", flush=True)
+        t_rep = time.time()
+        bg_arr = exp.m_background.getArray(readonly=True).copy()
+        for _i in range(_n_repeat):
+            _t0 = time.time()
+            _cost, _grad = cost_fn.value_gradient(exp.m_background)
+            if rank == 0:
+                print(f"[repeated-eval] eval {_i+1}/{_n_repeat} "
+                      f"cost={float(_cost):.6e}  dt={time.time()-_t0:.1f}s",
+                      flush=True)
+            try:
+                _grad.destroy()
+            except Exception:
+                pass
+            # Keep the control vector pinned to its starting value so we measure
+            # the lifecycle cost of repeated identical evals (no parameter drift).
+            exp.m_background.setArray(bg_arr)
+            exp.m_background.assemble()
+        if rank == 0:
+            print(f"[repeated-eval] done — {_n_repeat} evals in "
+                  f"{time.time()-t_rep:.1f}s", flush=True)
+        # Return a stub result; main() expects these keys for the cycling
+        # aggregator. We mark improvement_pct = 0 because no DA was performed.
+        return {
+            "method": method, "l_wme_mode": l_wme_mode,
+            "bg_rmse": float("nan"), "analysis_rmse": float("nan"),
+            "improvement_pct": 0.0,
+            "n_func_evals": _n_repeat,
+            "opt_time_s": float(time.time() - t_rep),
+            "best_iterate": None,
+            "_m_analysis_advanced_arr": None,
+        }
+
     optimizer = PETScTAOWrapper(
         cost_fn, tao_type="blmvm",
         lower_bounds=lower,
         upper_bounds=upper,
-        options={
-            "max_iterations": args.max_iterations,
-            "max_funcs": max_funcs,
-            "gradient_tolerance": 1e-3,
-            "cost_tolerance": 1e-4,
-            "verbose": True,
-            "iteration_callback": iteration_callback,
-            # Cap per-step backtracks. Default 30 lets TAO spend an hour+
-            # silently probing after a single forward failure (observed in
-            # DC-WME runs v1/v2/v3 before LS_FAILURE would be raised).
-            # With 5, any genuinely bad direction fails fast and control
-            # returns to our 3-consecutive-failure bailout in the wrapper.
-            "line_search_max_funcs": 5,
-            # Memory-safety: cap BLMVM's limited-memory Hessian history.
-            # Each history pair is 2 state vectors (208K × 8 B × 2 ≈ 3.3 MB
-            # × 2 ranks), and PETSc internals duplicate these. Default is
-            # 5 — we set 3 explicitly for safety on this mesh.
-            "tao_lmvm_hist_size": 3,
-            "tao_blmvm_hist_size": 3,
-        },
+        options=_tao_options,
     )
 
     t_opt = time.time()
-    m_analysis = optimizer.solve(exp.m_background)
+    m_analysis_tao = optimizer.solve(exp.m_background)
     opt_time = time.time() - t_opt
 
     # ================================================================
     # Step 9: Evaluate
     # ================================================================
+    # Prefer the best-iterate checkpoint over TAO's returned iterate. TAO's
+    # final m may be the point it was mid-backtracking from when we aborted
+    # on Newton-fail hang; the best-iterate vector is always a cleanly-
+    # accepted iterate with finite cost. When optimization ran to a clean
+    # convergence on a descent path, best == TAO's final, so this is a
+    # no-op. When TAO diverged, this preserves real work.
+    if best_state["iter"] >= 0 and best_state["cost"] < float("inf"):
+        m_analysis = best_m
+        if rank == 0:
+            print(f"  [analysis] using best-iterate checkpoint "
+                  f"(iter {best_state['iter']}, cost={best_state['cost']:.4f}, "
+                  f"RMSE={best_state['rmse']:.6f}) in place of TAO's final m",
+                  flush=True)
+    else:
+        m_analysis = m_analysis_tao
     analysis_arr = m_analysis.getArray(readonly=True)
     truth_arr = m_true.getArray(readonly=True)
     bg_arr = exp.m_background.getArray(readonly=True)
@@ -744,6 +1052,16 @@ def run_single_method(args, method, l_wme_mode, output_dir):
         "opt_time_s": opt_time,
         "mpi_size": comm.size,
         "iteration_history": history,
+        "best_iterate": {
+            "iter": best_state["iter"],
+            "cost": best_state["cost"],
+            "rmse": best_state["rmse"],
+            "gnorm": best_state["gnorm"],
+            "used_as_analysis": bool(
+                best_state["iter"] >= 0
+                and best_state["cost"] < float("inf")
+            ),
+        },
         "convergence": conv_info,
         "lwme_diagnostics": lwme_diagnostics_summary,
         "config": {
@@ -755,6 +1073,9 @@ def run_single_method(args, method, l_wme_mode, output_dir):
             "background_error_std": args.background_error_std,
             "obs_correlation_length": args.obs_correlation_length,
             "predictability_gamma": args.predictability_gamma,
+            "smooth_length": args.smooth_length,
+            "ls_step_max": args.ls_step_max,
+            "ls_init_step": args.ls_init_step,
         },
     }
 
@@ -762,17 +1083,191 @@ def run_single_method(args, method, l_wme_mode, output_dir):
     tag = f"_Lcorr{int(args.obs_correlation_length):d}" if args.obs_correlation_length > 0 else ""
     if method == "dcwme" and abs(args.predictability_gamma - 0.1) > 1e-9:
         tag += f"_g{args.predictability_gamma:.3f}".rstrip('0').rstrip('.')
+    if window_tag:
+        tag += f"_{window_tag}"
     result_file = output_dir / f"result_{method}_{safe_mode}{tag}.json"
+    # Stash the analysis array on the result dict for cycling — caller
+    # (main's cycling loop) reads this to chain into the next window.
+    result["_m_analysis_arr"] = analysis_arr.copy()
+    result["_window_tag"] = window_tag
     if rank == 0:
         with open(result_file, "w") as f:
-            json.dump(result, f, indent=2)
+            json.dump({k: v for k, v in result.items() if not k.startswith("_")},
+                      f, indent=2)
     print(f"  Saved: {result_file}")
 
-    # Cleanup
+    # Textbook cycling DA: forward-evolve m_analysis through `advance_steps`
+    # using the (still-alive) DA solver. The result is the dynamics-respecting
+    # estimate of the IC at the NEXT window's start, suitable as that
+    # window's background. Without this, cycling would feed the analysis
+    # (an estimate of the state at THIS window's start) directly to the
+    # next window — biasing the bg by Δt of physical evolution.
+    if advance_steps > 0:
+        if rank == 0:
+            print(f"\n--- Cycling: forward-evolve m_analysis "
+                  f"{advance_steps} steps for next window's bg ---")
+        analysis_full = m_analysis.getArray(readonly=True).copy()
+        # Reset DA solver state to m_analysis at t_da_start
+        solver_da.u_n.x.array[:state_size] = analysis_full[:state_size]
+        solver_da.u_n_old.x.array[:state_size] = analysis_full[:state_size]
+        solver_da.u.x.array[:state_size] = analysis_full[:state_size]
+        solver_da.u_n.x.scatter_forward()
+        solver_da.u_n_old.x.scatter_forward()
+        solver_da.u.x.scatter_forward()
+        prob_da.t = t_da_start
+        prob_da.nt = advance_steps
+        # Clear any stored data from cost-eval forward solves
+        try:
+            solver_da.storage.clear()
+        except Exception:
+            pass
+        solver_da.time_loop(
+            solver_parameters=solver_params, stations=[], plot_every=9999,
+            save_state=False, store_jacobians=False, enable_video=False,
+        )
+        advanced_full = analysis_full.copy()
+        advanced_full[:state_size] = solver_da.u_n.x.array[:state_size]
+        result["_m_analysis_advanced_arr"] = advanced_full
+        if rank == 0:
+            print(f"  Forward-evolve done, t={prob_da.t:.0f}s "
+                  f"(was t={t_da_start:.0f}s)")
+    else:
+        result["_m_analysis_advanced_arr"] = None
+
+    # Cleanup — aggressive teardown to prevent memory accumulation across
+    # cycling DA windows. Each call to run_single_method creates fresh
+    # truth/DA solvers, observation operator, covariances, gradient smoother,
+    # smoothing matrix, etc. Without explicit destruction of PETSc-owned
+    # objects, the C-level memory leaks across iterations and OOM-kills
+    # the job at window 3+.
+
+    # m_analysis points at either best_m or m_analysis_tao. Destroy the one
+    # that is NOT aliased via m_analysis, then destroy m_analysis itself.
+    if m_analysis is best_m:
+        try:
+            m_analysis_tao.destroy()
+        except Exception:
+            pass
+    else:
+        try:
+            best_m.destroy()
+        except Exception:
+            pass
     m_analysis.destroy()
     lower.destroy()
     upper.destroy()
     del cost_fn, optimizer, forward_model
+
+    # Free truth-side state (large: 6+ Jacobians × ~100 MB/rank + trajectory
+    # vectors). With cycling, this is per-window, so freeing it here
+    # prevents the 30 GB/rank accumulation we saw at window 3.
+    try:
+        for v in truth_trajectory:
+            try:
+                v.destroy()
+            except Exception:
+                pass
+        truth_trajectory.clear()
+    except Exception:
+        pass
+    if truth_jacobians is not None:
+        for j in truth_jacobians:
+            try:
+                j.destroy()
+            except Exception:
+                pass
+        truth_jacobians.clear()
+    try:
+        m_true.destroy()
+    except Exception:
+        pass
+
+    # Free DA-side state. solver_da and prob_da are no longer needed after
+    # the optional forward-evolve advance step. exp (TwinExperiment) holds
+    # references to many PETSc objects (m_background, observations, etc.).
+    try:
+        if 'B' in locals() and B is not None:
+            B.destroy() if hasattr(B, 'destroy') else None
+    except Exception:
+        pass
+    try:
+        if 'R' in locals() and R is not None:
+            R.destroy() if hasattr(R, 'destroy') else None
+    except Exception:
+        pass
+    try:
+        if 'B_lwme' in locals() and B_lwme is not None:
+            B_lwme.destroy() if hasattr(B_lwme, 'destroy') else None
+    except Exception:
+        pass
+    try:
+        for v in getattr(exp, 'observations', []) or []:
+            try:
+                v.destroy()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Drop heavy attributes on exp before del
+    for _attr in ("m_true", "m_background", "truth_trajectory",
+                  "observations", "obs_operator"):
+        try:
+            setattr(exp, _attr, None)
+        except Exception:
+            pass
+
+    # Release the persistent Jacobian pool (Phase B). Without this, the
+    # ~6 stored Jacobian Mats per window survive across windows in a
+    # single-process cycling run and accumulate ~720 MB/rank/window.
+    try:
+        if hasattr(solver_da, 'storage'):
+            _stats = solver_da.storage.release_pool()
+            if rank == 0 and _stats.get("jacobian_pool_destroyed", 0) > 0:
+                print(f"  [pool] solver_da: destroyed "
+                      f"{_stats['jacobian_pool_destroyed']} pool Jacobians",
+                      flush=True)
+    except Exception:
+        pass
+    try:
+        if hasattr(solver_truth, 'storage'):
+            _stats = solver_truth.storage.release_pool()
+            if rank == 0 and _stats.get("jacobian_pool_destroyed", 0) > 0:
+                print(f"  [pool] solver_truth: destroyed "
+                      f"{_stats['jacobian_pool_destroyed']} pool Jacobians",
+                      flush=True)
+    except Exception:
+        pass
+
+    # Drop the solvers themselves and their problems. solver_da/solver_truth
+    # hold mesh + function-space + Jacobian factor matrices.
+    try: del solver_da
+    except (NameError, UnboundLocalError): pass
+    try: del solver_truth
+    except (NameError, UnboundLocalError): pass
+    try: del prob_da
+    except (NameError, UnboundLocalError): pass
+    try: del prob_truth
+    except (NameError, UnboundLocalError): pass
+    try: del forcing_da
+    except (NameError, UnboundLocalError): pass
+    try: del forcing_truth
+    except (NameError, UnboundLocalError): pass
+    try: del exp
+    except (NameError, UnboundLocalError): pass
+    try: del obs_operator
+    except (NameError, UnboundLocalError): pass
+    try: del smoothing_matrix
+    except (NameError, UnboundLocalError): pass
+    try: del gradient_smoother
+    except (NameError, UnboundLocalError): pass
+
+    # PETSc-level garbage collection (newer PETSc only)
+    try:
+        from petsc4py import PETSc
+        PETSc.garbage_cleanup()
+    except Exception:
+        pass
+
     _cleanup()
     _check_memory("after cleanup")
 
@@ -786,9 +1281,43 @@ def main():
     parser.add_argument("--vmax", type=float, default=30.0)
     parser.add_argument("--rmax-km", type=float, default=15.0)
     parser.add_argument("--track-shift", type=float, default=10.0)
+    parser.add_argument("--track-duration-s", type=float, default=0.0,
+                        help="Absolute duration (s) for the vortex track from "
+                             "start to end position. 0 (default) → use the "
+                             "in-driver fallback of 28800s, which matches the "
+                             "validated 4-window cycling case. Set explicitly "
+                             "to keep the SAME physical wind across runs with "
+                             "different n_windows / nt_total. Without this, "
+                             "the storm crossed the domain at different speeds "
+                             "for different simulation lengths, which produced "
+                             "n_windows-specific truth Newton divergence in "
+                             "single-process cycling runs.")
     parser.add_argument("--dt", type=float, default=600.0)
     parser.add_argument("--nt-ramp", type=int, default=24)
     parser.add_argument("--nt-da", type=int, default=12)
+    parser.add_argument("--n-windows", type=int, default=1,
+                        help="Number of cycling DA windows (default 1 = single window). "
+                             "Window N+1 uses the analysis from window N (advanced "
+                             "through nt_da steps via the DA solver) as its background. "
+                             "Truth solver continues marching across windows. Total "
+                             "simulation time = nt_ramp + n_windows * nt_da timesteps.")
+    parser.add_argument("--start-window", type=int, default=0,
+                        help="Index of first window in this job (0-based). Used to "
+                             "chain cycling DA across separate SLURM jobs: each job "
+                             "runs n_windows windows starting at start_window. "
+                             "truth_offset_steps = start_window * nt_da, so the truth "
+                             "solver picks up at the correct time. Combined with "
+                             "--initial-bg-file to load the previous job's analysis.")
+    parser.add_argument("--initial-bg-file", type=str, default=None,
+                        help="Path template (with '{rank}') to .npy files containing "
+                             "the chained background for window=start_window. Each "
+                             "rank loads its own slice. Generated automatically by a "
+                             "previous job at chain_bg_after_w{N}_rank{R}.npy.")
+    parser.add_argument("--chain-mode", action="store_true",
+                        help="Force the cycling-DA code path even when n_windows=1, "
+                             "so that chain_bg_after_w{N}_rank{R}.npy files are "
+                             "written for the next job in a multi-job chain. "
+                             "Implied by --start-window>0 or --initial-bg-file.")
     parser.add_argument("--obs-fraction", type=float, default=0.1)
     parser.add_argument("--obs-frequency", type=int, default=4)
     parser.add_argument("--obs-noise-level", type=float, default=0.01)
@@ -799,10 +1328,31 @@ def main():
     parser.add_argument("--min-depth", type=float, default=5.0,
                         help="Minimum bathymetric depth (m). Default 5.0 matches IdealizedInlet. "
                              "Increase to 8-10 to prevent shallow-cell instability under wind.")
+    parser.add_argument("--h-min-bound", type=float, default=1.0,
+                        help="Lower bound on analysis h DOFs in TAO box "
+                             "constraints (BLMVM projection). Default 1.0 m. "
+                             "Loose enough for the optimizer to move freely "
+                             "but tight enough to prevent near-dry cells "
+                             "that crash Newton during cycling DA forward-"
+                             "evolve. Set to 0.01 for original (looser) "
+                             "behavior on single-window runs.")
     parser.add_argument("--smooth-length", type=float, default=500.0,
                         help="Gradient smoother correlation length (m). Default 500. "
                              "Larger L blows up the sparse smoother (nnz ~ L^2): on idealized inlet, "
                              "L=500 -> ~2 GB, L=1000 -> ~8 GB, L=2000 -> ~32 GB. Stay <=700.")
+    parser.add_argument("--ls-step-max", type=float, default=None,
+                        help="Hard cap on TAO line-search step length (plumbed to "
+                             "PETSc -tao_ls_stepmax). Globalizes BLMVM when the "
+                             "2nd+ iteration extrapolates into a region that crashes "
+                             "forward Newton (idealized-inlet 4D-Var eval-3 failure "
+                             "at obs >= 0.02). Default None (no cap). Try 1.0 or 0.5 "
+                             "as a conservative starting point.")
+    parser.add_argument("--ls-init-step", type=float, default=None,
+                        help="Initial step length for TAO line search (PETSc's "
+                             "setInitialStepLength). Default None (PETSc default, "
+                             "typically 1.0). Lower values (0.25, 0.5) make each "
+                             "TAO iteration start cautious; Armijo backtracks from "
+                             "there.")
     parser.add_argument("--skip-tlm-eq38", action="store_true",
                         help="Skip TLM-based Eq 38 inflation in DC-WME setup. "
                              "Eq 38 requires 1 adjoint solve per obs point (~8h for 1163 obs). "
@@ -828,6 +1378,17 @@ def main():
                              "built from the same adjoint vectors. See "
                              "experiments/shinnecock_study/run_comparison.py:"
                              "_compute_eq38_from_tlm.")
+    parser.add_argument("--eq38-degeneracy-policy",
+                        choices=["strict", "skip_unobservable"],
+                        default="strict",
+                        help="Per-component Eq 38 policy when a component Gram "
+                             "(G_h or G_uv) is rank-deficient or structurally "
+                             "unobservable. 'strict' (default) raises with the "
+                             "raw eigenspectrum — catches e.g. h-only obs that "
+                             "cannot bound σ_b²_uv. 'skip_unobservable' leaves "
+                             "the degenerate component's block of B untouched "
+                             "and proceeds (inflation applied only to the "
+                             "well-posed component).")
     parser.add_argument("--no-eq38-inflation", action="store_true",
                         help="Disable ALL Eq 38 inflation (Step 7a TLM Gram AND "
                              "Step 7b H·H^T static fallback). DC-WME cost "
@@ -843,7 +1404,7 @@ def main():
                         help="Skip TLM Eq 38 for the uv block and directly apply "
                              "this per-DOF σ_b²_uv bound via _apply_eq38_to_B. "
                              "Must be paired with --fixed-sigma-b-sq-h.")
-    parser.add_argument("--mem-limit-gb", type=float, default=8.0)
+    parser.add_argument("--mem-limit-gb", type=float, default=64.0)
     args = parser.parse_args()
 
     # Fixed-sigma mode: if either flag is provided, require both and skip TLM Eq 38.
@@ -865,6 +1426,8 @@ def main():
 
     global MEM_LIMIT_MB
     MEM_LIMIT_MB = args.mem_limit_gb * 1024
+    print(f"[mem-limit] args.mem_limit_gb={args.mem_limit_gb}  "
+          f"MEM_LIMIT_MB={MEM_LIMIT_MB}")
 
     output_dir = PROJECT_ROOT / "results" / "idealized_inlet_da"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -879,10 +1442,107 @@ def main():
         "both": [("4dvar", "N/A"), ("dcwme", "static")],
     }
 
+    n_windows = max(1, int(getattr(args, 'n_windows', 1)))
+    start_window = int(getattr(args, 'start_window', 0))
+    initial_bg_file = getattr(args, 'initial_bg_file', None)
+    chain_mode = bool(getattr(args, 'chain_mode', False))
+    # Any of these implies chain semantics (cycling loop + chain_bg save).
+    in_chain = chain_mode or start_window > 0 or initial_bg_file is not None or n_windows > 1
+
     results = {}
     for method, l_wme_mode in METHOD_MAP[args.method]:
-        result = run_single_method(args, method, l_wme_mode, output_dir)
-        results[f"{method}_{l_wme_mode}"] = result
+        if not in_chain:
+            # Standard single-window run (preserves existing behavior).
+            result = run_single_method(args, method, l_wme_mode, output_dir)
+            results[f"{method}_{l_wme_mode}"] = result
+            continue
+
+        # Cycling DA: run N windows in sequence, chaining each window's
+        # m_analysis as the next window's background. Supports cross-job
+        # chaining via --start-window/--initial-bg-file: each SLURM job runs
+        # n_windows windows starting at global index `start_window`, exits
+        # cleanly (so the OS reclaims memory), and writes the chained bg
+        # to a per-rank .npy file for the next job to load.
+        per_window = []
+        from mpi4py import MPI as _MPI
+        rank = _MPI.COMM_WORLD.Get_rank()
+
+        # Window 0 of the chain uses the perturbed bg generated internally.
+        # Subsequent windows of THIS job pull bg from the prior window's
+        # in-memory `_m_analysis_advanced_arr`. When this job is itself a
+        # mid-chain job (start_window > 0), the first window pulls bg from
+        # the on-disk file written by the previous SLURM job.
+        bg_arr_for_next = None
+        if initial_bg_file:
+            bg_path = initial_bg_file.format(rank=rank) if "{rank}" in initial_bg_file else initial_bg_file
+            bg_arr_for_next = np.load(bg_path).astype(np.float64)
+            print(f"[chain] rank {rank} loaded initial bg from {bg_path} "
+                  f"shape={bg_arr_for_next.shape}", flush=True)
+        elif start_window > 0:
+            raise SystemExit(
+                f"--start-window={start_window} requires --initial-bg-file "
+                f"(no chained bg available for non-zero start window)")
+
+        for local_w in range(n_windows):
+            global_w = start_window + local_w
+            tag = f"w{global_w}"
+            # Always advance: this might be the last window of THIS job but
+            # not the last of the cycling chain, so the chained bg must be
+            # produced for the next job to consume.
+            advance = int(args.nt_da)
+            print(f"\n{'#'*70}\n# CYCLING WINDOW {global_w+1} (global w={global_w}, "
+                  f"local {local_w+1}/{n_windows}) ({method}/{l_wme_mode}) "
+                  f"tag={tag}\n{'#'*70}")
+            r = run_single_method(
+                args, method, l_wme_mode, output_dir,
+                initial_bg_arr=bg_arr_for_next,
+                truth_offset_steps=global_w * args.nt_da,
+                window_tag=tag,
+                advance_steps=advance,
+            )
+            per_window.append({
+                "window": global_w + 1,
+                "tag": tag,
+                "bg_rmse": r["bg_rmse"],
+                "analysis_rmse": r["analysis_rmse"],
+                "improvement_pct": r["improvement_pct"],
+                "n_func_evals": r["n_func_evals"],
+                "opt_time_s": r["opt_time_s"],
+                "best_iterate": r.get("best_iterate"),
+            })
+            # Persist the chained bg to disk (always — even on the last
+            # window of this job, in case a follow-up job extends the chain).
+            if r.get("_m_analysis_advanced_arr") is not None:
+                chain_path = output_dir / f"chain_bg_after_w{global_w}_rank{rank}.npy"
+                np.save(chain_path, np.asarray(r["_m_analysis_advanced_arr"], dtype=np.float64))
+                if rank == 0:
+                    print(f"[chain] saved chain bg after w{global_w}: "
+                          f"{chain_path.name} (per-rank, "
+                          f"{_MPI.COMM_WORLD.Get_size()} files)", flush=True)
+                bg_arr_for_next = r["_m_analysis_advanced_arr"].copy()
+            else:
+                bg_arr_for_next = None
+
+        # Aggregate JSON for the cycling run. Tag with absolute window range
+        # so multi-job chains do not clobber each other's aggregates.
+        end_window = start_window + n_windows - 1
+        agg_file = (output_dir /
+                    f"result_{method}_{l_wme_mode.replace('/', '_')}"
+                    f"_cycling_w{start_window}-{end_window}.json")
+        if _MPI.COMM_WORLD.Get_rank() == 0:
+            with open(agg_file, "w") as f:
+                json.dump({
+                    "method": method,
+                    "l_wme_mode": l_wme_mode,
+                    "start_window": start_window,
+                    "n_windows": n_windows,
+                    "windows": per_window,
+                }, f, indent=2)
+            print(f"\n  Saved cycling aggregate: {agg_file}")
+        results[f"{method}_{l_wme_mode}_cycling"] = {
+            "start_window": start_window,
+            "n_windows": n_windows, "windows": per_window
+        }
 
     # Summary
     if len(results) > 1:
@@ -890,8 +1550,13 @@ def main():
         print("COMPARISON")
         print(f"{'='*60}")
         for key, r in results.items():
-            print(f"  {key}: improvement={r['improvement_pct']:.1f}%, "
-                  f"evals={r['n_func_evals']}, time={r['opt_time_s']:.0f}s")
+            if "n_windows" in r:
+                final = r["windows"][-1]
+                print(f"  {key}: {r['n_windows']} windows, "
+                      f"final imp={final['improvement_pct']:.1f}%")
+            else:
+                print(f"  {key}: improvement={r['improvement_pct']:.1f}%, "
+                      f"evals={r['n_func_evals']}, time={r['opt_time_s']:.0f}s")
 
 
 if __name__ == "__main__":

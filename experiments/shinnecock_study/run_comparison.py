@@ -241,7 +241,8 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
                             truth_trajectory, truth_jacobians,
                             predictability_gamma=0.1,
                             comm=None, rank=0,
-                            component_indices=None):
+                            component_indices=None,
+                            component_degeneracy_policy="strict"):
     """Compute σ_b² from Eq 38 using the truth trajectory's TLM (Spence et al. 2025).
 
     Uses an already-computed trajectory + Jacobians (typically the truth trajectory)
@@ -434,23 +435,82 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
                 G_h[i, j]  = G_h[j, i]  = vh
                 G_uv[i, j] = G_uv[j, i] = vuv
 
-        # Extract each spectrum. Per-component Grams can be near-rank-deficient
-        # (esp. G_h for h-only obs). Floor λ_min with an adaptive γ × λ_max
-        # lower bound — same pattern the kernel path uses for its G (line 1701).
+        # Per-component σ_b² = γ / λ_min(G_component) — raw, NO adaptive floor.
+        #
+        # The scalar path (full G above) keeps its historical λ_min handling.
+        # The per-component path must NOT paper over genuine rank deficiency:
+        # when a component is structurally unobserved (e.g. uv under h-only
+        # observations), λ_min(G_uv) → 0 and the Eq 38 bound is undefined,
+        # not "1/λ_max". Silently returning γ/(γ·λ_max) masked this as a fake
+        # 10:1 eigenvalue ratio — see
+        # docs/idealized_inlet_eq38_component_floor_bug.md.
         eigs_h  = np.linalg.eigvalsh(G_h)
         eigs_uv = np.linalg.eigvalsh(G_uv)
-        lmin_h  = max(eigs_h.min(),  predictability_gamma * eigs_h.max(),  1e-30)
-        lmin_uv = max(eigs_uv.min(), predictability_gamma * eigs_uv.max(), 1e-30)
-        sigma_b_sq_h  = predictability_gamma / lmin_h
-        sigma_b_sq_uv = predictability_gamma / lmin_uv
+
+        def _assess(name, eigs):
+            lmax = float(eigs.max())
+            lmin = float(eigs.min())
+            tol = max(1e-12 * lmax, 1e-30)
+            rank_num = int(np.sum(eigs > tol))
+            degenerate = (lmax <= tol) or (lmin <= tol)
+            return {
+                "name": name,
+                "lambda_min_raw": lmin,
+                "lambda_max": lmax,
+                "tol": tol,
+                "rank": rank_num,
+                "n_obs": int(eigs.size),
+                "degenerate": degenerate,
+            }
+
+        info_h  = _assess("h",  eigs_h)
+        info_uv = _assess("uv", eigs_uv)
+
+        valid_policies = {"strict", "skip_unobservable"}
+        if component_degeneracy_policy not in valid_policies:
+            raise ValueError(
+                f"component_degeneracy_policy must be one of {valid_policies}, "
+                f"got {component_degeneracy_policy!r}"
+            )
+
+        def _resolve_sigma(info):
+            if not info["degenerate"]:
+                sig = predictability_gamma / info["lambda_min_raw"]
+                return float(sig), "applied"
+            if component_degeneracy_policy == "strict":
+                raise ValueError(
+                    f"[Eq 38 per-component/strict] G_{info['name']} is "
+                    f"degenerate: λ_max={info['lambda_max']:.3e}, "
+                    f"λ_min_raw={info['lambda_min_raw']:.3e}, "
+                    f"rank={info['rank']}/{info['n_obs']}, "
+                    f"tol={info['tol']:.3e}. The Eq 38 variance bound "
+                    f"σ_b²_{info['name']} = γ/λ_min is undefined for this "
+                    f"component (likely unobservable under the current "
+                    f"observation operator). Rerun with "
+                    f"--eq38-degeneracy-policy=skip_unobservable to leave "
+                    f"this component uninflated, or disable component-aware "
+                    f"Eq 38 (--no-eq38-inflation / --skip-tlm-eq38)."
+                )
+            # skip_unobservable: emit None sentinel — caller leaves B unchanged
+            return None, "skipped_unobservable"
+
+        sigma_b_sq_h,  status_h  = _resolve_sigma(info_h)
+        sigma_b_sq_uv, status_uv = _resolve_sigma(info_uv)
 
         component_result = {
-            "sigma_b_sq_h":  float(sigma_b_sq_h),
-            "sigma_b_sq_uv": float(sigma_b_sq_uv),
-            "lambda_min_G_h":  float(lmin_h),
-            "lambda_max_G_h":  float(eigs_h.max()),
-            "lambda_min_G_uv": float(lmin_uv),
-            "lambda_max_G_uv": float(eigs_uv.max()),
+            "sigma_b_sq_h":   sigma_b_sq_h,   # float or None
+            "sigma_b_sq_uv":  sigma_b_sq_uv,  # float or None
+            "lambda_min_G_h":  info_h["lambda_min_raw"],
+            "lambda_max_G_h":  info_h["lambda_max"],
+            "rank_G_h":        info_h["rank"],
+            "degenerate_h":    info_h["degenerate"],
+            "status_h":        status_h,
+            "lambda_min_G_uv": info_uv["lambda_min_raw"],
+            "lambda_max_G_uv": info_uv["lambda_max"],
+            "rank_G_uv":       info_uv["rank"],
+            "degenerate_uv":   info_uv["degenerate"],
+            "status_uv":       status_uv,
+            "component_degeneracy_policy": component_degeneracy_policy,
         }
 
     if rank == 0:
@@ -464,13 +524,17 @@ def _compute_eq38_from_tlm(forward_model, obs_operator, obs_cov,
         print(f"  [Eq 38 TLM] σ_b² = γ / λ_min(G) = {predictability_gamma} / {lambda_min_G:.6e}")
         print(f"  [Eq 38 TLM] σ_b² = {sigma_b_sq:.6e}  (σ_b = {np.sqrt(sigma_b_sq):.6e})")
         if component_result:
-            print(f"  [Eq 38 TLM] Per-component Grams:")
-            print(f"    h:  λ_min(G_h)  = {component_result['lambda_min_G_h']:.6e}  "
-                  f"λ_max = {component_result['lambda_max_G_h']:.6e}  "
-                  f"→ σ_b²_h  = {component_result['sigma_b_sq_h']:.6e}")
-            print(f"    uv: λ_min(G_uv) = {component_result['lambda_min_G_uv']:.6e}  "
-                  f"λ_max = {component_result['lambda_max_G_uv']:.6e}  "
-                  f"→ σ_b²_uv = {component_result['sigma_b_sq_uv']:.6e}")
+            print(f"  [Eq 38 TLM] Per-component Grams "
+                  f"(policy={component_result['component_degeneracy_policy']}):")
+            for tag in ("h", "uv"):
+                sig = component_result[f"sigma_b_sq_{tag}"]
+                sig_str = f"{sig:.6e}" if sig is not None else "SKIPPED (unobservable)"
+                degen = "DEGENERATE" if component_result[f"degenerate_{tag}"] else "ok"
+                print(f"    {tag}: λ_min(G_{tag}) = "
+                      f"{component_result[f'lambda_min_G_{tag}']:.6e}  "
+                      f"λ_max = {component_result[f'lambda_max_G_{tag}']:.6e}  "
+                      f"rank = {component_result[f'rank_G_{tag}']}/{n_obs}  "
+                      f"[{degen}]  → σ_b²_{tag} = {sig_str}")
         print(f"  [Eq 38 TLM] Total time: {_time.perf_counter() - t0:.1f}s")
 
     # Cleanup adjoint vectors (don't destroy trajectory — caller owns it)
@@ -522,6 +586,8 @@ def _apply_eq38_to_B(B, eq38_result, rank=0, component_indices=None):
     # Component-aware branch: honor per-component bounds when both the Eq 38
     # result carries them AND the caller passed DOF indices. Otherwise fall
     # through to the historical scalar path.
+    # A component whose sigma_b_sq_* is None (marked unobservable by the
+    # skip_unobservable degeneracy policy) is skipped, not scalar-fallen-back.
     component_mode = (
         component_indices is not None
         and "sigma_b_sq_h" in eq38_result
@@ -591,8 +657,12 @@ def _apply_eq38_to_B_components(B, eq38_result, component_indices, rank=0):
     Returns the maximum per-DOF scale factor actually applied, across all
     components (for logging consistency with the scalar path).
     """
-    sig_h  = float(eq38_result["sigma_b_sq_h"])
-    sig_uv = float(eq38_result["sigma_b_sq_uv"])
+    # Either σ_b² value can be None (component marked unobservable under the
+    # skip_unobservable degeneracy policy). A None component is left untouched.
+    sig_h_raw  = eq38_result["sigma_b_sq_h"]
+    sig_uv_raw = eq38_result["sigma_b_sq_uv"]
+    sig_h  = float(sig_h_raw)  if sig_h_raw  is not None else None
+    sig_uv = float(sig_uv_raw) if sig_uv_raw is not None else None
 
     h_idx  = np.asarray(component_indices["h"],  dtype=np.int64)
     uv_idx = np.asarray(component_indices["uv"], dtype=np.int64)
@@ -600,26 +670,32 @@ def _apply_eq38_to_B_components(B, eq38_result, component_indices, rank=0):
     diag_arr     = B.diagonal.getArray()
     inv_diag_arr = B.inv_diagonal.getArray()
 
-    diag_h  = diag_arr[h_idx]
-    diag_uv = diag_arr[uv_idx]
-
-    below_h_local  = h_idx[diag_h < sig_h]
-    below_uv_local = uv_idx[diag_uv < sig_uv]
-
-    n_below_h  = int(below_h_local.size)
-    n_below_uv = int(below_uv_local.size)
-
+    n_below_h = 0
+    n_below_uv = 0
     max_scale = 1.0
-    if n_below_h > 0:
-        max_scale = max(max_scale, sig_h / max(diag_arr[below_h_local].min(), 1e-300))
-        diag_arr[below_h_local]     = sig_h
-        inv_diag_arr[below_h_local] = 1.0 / sig_h
-    if n_below_uv > 0:
-        max_scale = max(max_scale, sig_uv / max(diag_arr[below_uv_local].min(), 1e-300))
-        diag_arr[below_uv_local]     = sig_uv
-        inv_diag_arr[below_uv_local] = 1.0 / sig_uv
+    any_write = False
 
-    if n_below_h > 0 or n_below_uv > 0:
+    if sig_h is not None:
+        diag_h = diag_arr[h_idx]
+        below_h_local = h_idx[diag_h < sig_h]
+        n_below_h = int(below_h_local.size)
+        if n_below_h > 0:
+            max_scale = max(max_scale, sig_h / max(diag_arr[below_h_local].min(), 1e-300))
+            diag_arr[below_h_local]     = sig_h
+            inv_diag_arr[below_h_local] = 1.0 / sig_h
+            any_write = True
+
+    if sig_uv is not None:
+        diag_uv = diag_arr[uv_idx]
+        below_uv_local = uv_idx[diag_uv < sig_uv]
+        n_below_uv = int(below_uv_local.size)
+        if n_below_uv > 0:
+            max_scale = max(max_scale, sig_uv / max(diag_arr[below_uv_local].min(), 1e-300))
+            diag_arr[below_uv_local]     = sig_uv
+            inv_diag_arr[below_uv_local] = 1.0 / sig_uv
+            any_write = True
+
+    if any_write:
         B.diagonal.setArray(diag_arr)
         B.diagonal.assemble()
         B.inv_diagonal.setArray(inv_diag_arr)
@@ -629,10 +705,18 @@ def _apply_eq38_to_B_components(B, eq38_result, component_indices, rank=0):
     min_B = B.min_eigenvalue()
 
     if rank == 0:
-        print(f"  [Eq 38/components] h:  bound σ_b²_h  = {sig_h:.6e}  "
-              f"inflated {n_below_h}/{h_idx.size} DOFs", flush=True)
-        print(f"  [Eq 38/components] uv: bound σ_b²_uv = {sig_uv:.6e}  "
-              f"inflated {n_below_uv}/{uv_idx.size} DOFs", flush=True)
+        if sig_h is None:
+            print(f"  [Eq 38/components] h:  SKIPPED (unobservable)  "
+                  f"B_h unchanged for {h_idx.size} DOFs", flush=True)
+        else:
+            print(f"  [Eq 38/components] h:  bound σ_b²_h  = {sig_h:.6e}  "
+                  f"inflated {n_below_h}/{h_idx.size} DOFs", flush=True)
+        if sig_uv is None:
+            print(f"  [Eq 38/components] uv: SKIPPED (unobservable)  "
+                  f"B_uv unchanged for {uv_idx.size} DOFs", flush=True)
+        else:
+            print(f"  [Eq 38/components] uv: bound σ_b²_uv = {sig_uv:.6e}  "
+                  f"inflated {n_below_uv}/{uv_idx.size} DOFs", flush=True)
         print(f"  [Eq 38/components] min(B) = {min_B:.6e}", flush=True)
 
     return max_scale

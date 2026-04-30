@@ -22,7 +22,9 @@ from ufl import (
 
 from petsc4py import PETSc
 from petsc4py.PETSc import ScalarType
+from mpi4py import MPI
 import numpy as np
+import os
 
 try:
     from tqdm import tqdm
@@ -38,6 +40,96 @@ from swe4dvar.utils.visualization import SolverVisualizer
 from swe4dvar.utils.compat import interpolation_points as _ipts, create_vector_from_form as _cvf
 
 from .base_solver import BaseSolver
+
+
+# ============================================================================
+# Forward-solve diagnostics (env-gated). When SWE4DVAR_FORWARD_DIAG_CSV is set
+# to a path, every solve_timestep call appends a row containing:
+#   eval_id, timestep, t_seconds, newton_iters, newton_converged,
+#   correction_norm, residual_norm, min_h_global, max_u_global, max_v_global
+#
+# eval_id auto-increments at every solve_init() (one per forward-solve start).
+# Only rank 0 writes; min_h / max_u / max_v reductions are collective.
+#
+# Used to diagnose cycling-DA Newton failures inside the actual cost-function
+# forward path — see docs/idealized_inlet_cycling_basin_diagnosis.md.
+# ============================================================================
+_FWD_DIAG = {
+    "csv_path": os.environ.get("SWE4DVAR_FORWARD_DIAG_CSV", None),
+    "eval_id": 0,
+    "header_written": False,
+}
+
+
+def _fwd_diag_enabled():
+    return _FWD_DIAG["csv_path"] is not None
+
+
+def _fwd_diag_bump_eval_id():
+    """Increment eval_id at the start of each forward solve (solve_init)."""
+    if _fwd_diag_enabled():
+        _FWD_DIAG["eval_id"] += 1
+
+
+def _fwd_diag_log_step(comm, mpi_rank, solver_obj, newton_solver,
+                      timestep, t_seconds,
+                      h_local_indices, uv_local_indices,
+                      newton_converged, n_iter, correction_norm, residual_norm):
+    """Append one diagnostic row for this timestep.
+
+    Collective: all ranks call this; min/max reductions use comm.allreduce.
+    Only rank 0 writes the row.
+    """
+    if not _fwd_diag_enabled():
+        return
+
+    arr = solver_obj.u_n.x.array[:]
+    if h_local_indices is not None and h_local_indices.size > 0:
+        h_local = arr[h_local_indices]
+        local_min_h = float(h_local.min())
+    else:
+        local_min_h = float("inf")
+    if uv_local_indices is not None and uv_local_indices.size > 0:
+        uv_local = arr[uv_local_indices]
+        # Interleaved [u0, v0, u1, v1, ...]
+        local_max_u = float(np.max(np.abs(uv_local[0::2]))) if uv_local.size > 1 else 0.0
+        local_max_v = float(np.max(np.abs(uv_local[1::2]))) if uv_local.size > 1 else 0.0
+    else:
+        local_max_u = 0.0
+        local_max_v = 0.0
+
+    from mpi4py import MPI as _MPI
+    global_min_h = comm.allreduce(local_min_h, op=_MPI.MIN)
+    global_max_u = comm.allreduce(local_max_u, op=_MPI.MAX)
+    global_max_v = comm.allreduce(local_max_v, op=_MPI.MAX)
+
+    if mpi_rank != 0:
+        return
+
+    # Lazy CSV write — header on first call
+    path = _FWD_DIAG["csv_path"]
+    if not _FWD_DIAG["header_written"]:
+        try:
+            with open(path, "w") as f:
+                f.write("eval_id,timestep,t_seconds,newton_iters,"
+                        "newton_converged,correction_norm,residual_norm,"
+                        "min_h_global,max_u_global,max_v_global\n")
+            _FWD_DIAG["header_written"] = True
+        except Exception as e:
+            print(f"[fwd-diag] failed to write header to {path}: {e}",
+                  flush=True)
+            return
+
+    row = (f"{_FWD_DIAG['eval_id']},{int(timestep)},{float(t_seconds):.6f},"
+           f"{int(n_iter)},{int(bool(newton_converged))},"
+           f"{float(correction_norm):.6e},{float(residual_norm):.6e},"
+           f"{float(global_min_h):.6e},{float(global_max_u):.6e},"
+           f"{float(global_max_v):.6e}\n")
+    try:
+        with open(path, "a") as f:
+            f.write(row)
+    except Exception as e:
+        print(f"[fwd-diag] failed to append row: {e}", flush=True)
 
 
 class CGImplicit(BaseSolver):
@@ -238,6 +330,11 @@ class CGImplicit(BaseSolver):
         Returns:
             CustomNewtonProblem instance
         """
+        # Forward-solve diagnostics: bump eval_id every time a new forward
+        # solve begins (solve_init is called once at the top of time_loop).
+        # Lets the diag CSV correlate timesteps to specific cost-function
+        # evaluations.
+        _fwd_diag_bump_eval_id()
         from swe4dvar.utils.newton_diagnostics import NewtonDiagnostics
 
         # Create diagnostics instance if config provided
@@ -273,6 +370,43 @@ class CGImplicit(BaseSolver):
         For 4D-Var data assimilation, the Jacobian is automatically copied by
         the Newton solver to prevent overwriting in subsequent timesteps.
         """
+        # MPI-safe failure path. Newton.solve raises on ALL ranks when Newton
+        # doesn't converge (correction_norm is a collective PETSc op, so
+        # `converged` is consistent), so each rank enters the except block.
+        # Previously only rank 0 re-raised after the local diagnostics — other
+        # ranks swallowed the exception and returned to time_loop, causing
+        # rank-0 to unwind through Python while ranks 1..N-1 proceeded to the
+        # next timestep's collective assemble and deadlocked waiting for rank 0
+        # (observed on Vista OpenMPI in runs 678950 / 678961).
+        #
+        # Collective-safe pattern: capture local status in the except handler,
+        # do no raise there, then allreduce the status across ranks and have
+        # EVERY rank raise an identical exception when any rank reports failure.
+        _runtime_fail = 0
+        _value_fail = 0
+        _local_err_msg = ""
+        _local_result = None
+
+        # Compute h/uv local DOF indices once (cheap; cached on self after first
+        # call) so the per-step diagnostic logger can grab min(h)/max(|u|,|v|)
+        # without re-introspecting the function space each step.
+        _diag_h_idx = None
+        _diag_uv_idx = None
+        if _fwd_diag_enabled():
+            cached = getattr(self, "_fwd_diag_idx_cache", None)
+            if cached is None:
+                n_local = (self.V.dofmap.index_map.size_local
+                           * self.V.dofmap.index_map_bs)
+                _, h_map = self.V.sub(0).collapse()
+                h_idx = np.asarray(h_map, dtype=np.int64)
+                h_idx = h_idx[h_idx < n_local]
+                _, uv_map = self.V.sub(1).collapse()
+                uv_idx = np.asarray(uv_map, dtype=np.int64)
+                uv_idx = uv_idx[uv_idx < n_local]
+                self._fwd_diag_idx_cache = (h_idx, uv_idx)
+                cached = self._fwd_diag_idx_cache
+            _diag_h_idx, _diag_uv_idx = cached
+
         try:
             if store_jacobian:
                 _, J = solver.solve(
@@ -327,33 +461,104 @@ class CGImplicit(BaseSolver):
                 # extra defensive, you could uncomment the following line:
                 # J = J.copy()
 
-                return J
+                _local_result = J
             else:
                 solver.solve(
                     self.u, return_jacobian=False, timestep=timestep, time=time
                 )
-                return None
+                _local_result = None
+
+            # Forward-diag logging on the SUCCESS path. Newton's last_*
+            # attributes are populated by newton.py whether converged or not,
+            # so reading them here is safe.
+            if _fwd_diag_enabled():
+                _fwd_diag_log_step(
+                    MPI.COMM_WORLD, self.mpi_rank, self, solver,
+                    timestep=timestep if timestep is not None else 0,
+                    t_seconds=time if time is not None else self.problem.t,
+                    h_local_indices=_diag_h_idx,
+                    uv_local_indices=_diag_uv_idx,
+                    newton_converged=getattr(solver, "last_converged", True),
+                    n_iter=getattr(solver, "last_n_iters", -1),
+                    correction_norm=getattr(solver, "last_correction_norm", float("nan")),
+                    residual_norm=getattr(solver, "last_residual_norm", float("nan")),
+                )
 
         except RuntimeError as e:
-            # Handle negative water depth errors
-            h_fun = self.u.sub(0).collapse()
-            hvals = h_fun.x.array[:]
-            min_h = hvals.min()
-            print(f"Min h on process {self.mpi_rank}, {min_h}")
-            bad_h = hvals < 0
-            coords = h_fun.function_space.tabulate_dof_coordinates()[:, :2]
-            coords = self.problem.reverse_projection(coords)
-            print(f"first coords of negative h on {self.mpi_rank}", coords[bad_h][:1])
-            if not self.mpi_rank:
-                raise
+            # Typical cause: Newton did not converge + raise_on_failure=True.
+            # Per-rank diagnostic printing (bare print, no collective ops).
+            _runtime_fail = 1
+            _local_err_msg = str(e)
+            try:
+                h_fun = self.u.sub(0).collapse()
+                hvals = h_fun.x.array[:]
+                min_h = hvals.min()
+                print(f"Min h on process {self.mpi_rank}, {min_h}")
+                bad_h = hvals < 0
+                coords = h_fun.function_space.tabulate_dof_coordinates()[:, :2]
+                coords = self.problem.reverse_projection(coords)
+                print(f"first coords of negative h on {self.mpi_rank}",
+                      coords[bad_h][:1])
+            except Exception:
+                pass
+
+            # Forward-diag logging on the FAILURE path — captures the state
+            # at the failed Newton iterate. This is the row that actually
+            # diagnoses cycling-DA failures.
+            if _fwd_diag_enabled():
+                try:
+                    _fwd_diag_log_step(
+                        MPI.COMM_WORLD, self.mpi_rank, self, solver,
+                        timestep=timestep if timestep is not None else 0,
+                        t_seconds=time if time is not None else self.problem.t,
+                        h_local_indices=_diag_h_idx,
+                        uv_local_indices=_diag_uv_idx,
+                        newton_converged=False,
+                        n_iter=getattr(solver, "last_n_iters", -1),
+                        correction_norm=getattr(solver, "last_correction_norm", float("nan")),
+                        residual_norm=getattr(solver, "last_residual_norm", float("nan")),
+                    )
+                except Exception:
+                    pass
         except ValueError as e:
-            # Re-raise validation errors with context
-            if "Jacobian" in str(e):
-                print(f"ERROR on rank {self.mpi_rank}: {e}")
-                if not self.mpi_rank:
-                    raise
-            else:
-                raise
+            # Jacobian validation / other checks above.
+            _value_fail = 1
+            _local_err_msg = str(e)
+            print(f"ERROR on rank {self.mpi_rank}: {e}")
+
+        # Collective agreement. Newton's last ops are collective and complete
+        # before Python reaches this point, so MPI state is clean here. Any
+        # non-zero sum means at least one rank raised; we make ALL ranks raise
+        # identically to avoid rank-divergent control flow.
+        total_runtime_fail = MPI.COMM_WORLD.allreduce(_runtime_fail, op=MPI.SUM)
+        total_value_fail = MPI.COMM_WORLD.allreduce(_value_fail, op=MPI.SUM)
+        comm_size = MPI.COMM_WORLD.Get_size()
+
+        if total_runtime_fail > 0:
+            if self.mpi_rank == 0:
+                self.log(
+                    f"  [timestep failure] Newton solver failed at timestep "
+                    f"{timestep}: global consensus "
+                    f"{total_runtime_fail}/{comm_size} ranks reported RuntimeError"
+                )
+            # All ranks raise identically. Message is deterministic across ranks.
+            raise RuntimeError(
+                f"Newton solver failed at timestep {timestep} "
+                f"({total_runtime_fail}/{comm_size} ranks)"
+            )
+
+        if total_value_fail > 0:
+            if self.mpi_rank == 0:
+                self.log(
+                    f"  [timestep failure] ValueError at timestep {timestep}: "
+                    f"global consensus {total_value_fail}/{comm_size} ranks"
+                )
+            raise ValueError(
+                f"solve_timestep validation error at timestep {timestep} "
+                f"({total_value_fail}/{comm_size} ranks)"
+            )
+
+        return _local_result
 
     def update_solution(self):
         """Advance solution to next time step."""
@@ -580,10 +785,49 @@ class CGImplicit(BaseSolver):
             self.u_n.x.array[:] = u_0.x.array[:]
             self.u.x.array[:] = self.u_n.x.array[:]
 
-        self.solver = solver = self.solve_init(
-            solver_parameters=solver_parameters,
-            newton_diagnostics_config=newton_diagnostics_config,
+        # Forward Newton problem lifecycle (Phase C-1 of memory-leak fix).
+        # Default: REUSE the same CustomNewtonProblem across cost evals.
+        # The Newton problem's A matrix, L vector, and KSP+LU-factor are
+        # rebuilt at the C level on every Newton iteration anyway, so the
+        # only reason to discard the Python wrapper between evals is
+        # cleanliness — and it leaks: the destroy/create cycle pushes
+        # ~240 MB/eval into PETSc's allocator pool that destroy() does not
+        # reliably return. Reusing one persistent Newton problem closes
+        # that channel entirely (in the same way sweep-KSP closed the
+        # adjoint channel).
+        # Disable with SWE4DVAR_FORWARD_NEWTON_REUSE=0 to fall back to
+        # the legacy destroy+recreate path.
+        import os as _os_nr
+        _reuse_newton = (
+            _os_nr.environ.get("SWE4DVAR_FORWARD_NEWTON_REUSE", "1").strip() == "1"
         )
+        existing_solver = getattr(self, "solver", None)
+        if _reuse_newton and existing_solver is not None:
+            solver = existing_solver
+            # Update diagnostics if a new config was passed for this run.
+            if newton_diagnostics_config is not None:
+                from swe4dvar.utils.newton_diagnostics import NewtonDiagnostics
+                solver.diagnostics = NewtonDiagnostics(**newton_diagnostics_config)
+            # Update solver_parameters reference so any per-call overrides
+            # (rtol/atol/max_it/relaxation) take effect on the next solve.
+            solver._solver_parameters = solver_parameters
+            # Bump the forward-diag eval id (solve_init normally does this on
+            # every fresh creation). Keeps per-step CSV correlated with eval id.
+            _fwd_diag_bump_eval_id()
+        else:
+            if existing_solver is not None and hasattr(existing_solver, "destroy"):
+                try:
+                    existing_solver.destroy()
+                except Exception:
+                    pass
+            self.solver = self.solve_init(
+                solver_parameters=solver_parameters,
+                newton_diagnostics_config=newton_diagnostics_config,
+            )
+            solver = self.solver
+        # Ensure the persistent solver is recorded on self so subsequent
+        # time_loop calls find it.
+        self.solver = solver
 
         # Propagate raise_on_failure flag to Newton solver.
         # During optimization, the cost function sets this attribute so Newton failures

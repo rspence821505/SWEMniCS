@@ -131,6 +131,23 @@ class CartesianVortexConfig:
     # Temporal ramp
     ramp_time_s: float = 7200.0      # 2-hour ramp to full strength
 
+    # Track duration (decoupled from simulation length).
+    # If None, falls back to legacy "track spans full simulation length"
+    # behavior — kept for backward compatibility with experiments that
+    # rely on the old wind. For new cycling runs and any case where the
+    # SAME physical wind must reproduce across different ``n_windows``,
+    # set this to a fixed absolute duration (in seconds). When ``t``
+    # exceeds ``track_duration_s`` the storm is held at the end position.
+    #
+    # WHY: the legacy code linearly interpolated (start→end) across
+    # ``times[-1] - times[0]`` so the storm crossed the domain faster
+    # in shorter runs. Different ``n_windows`` therefore produced
+    # genuinely different truth winds at the same absolute time t,
+    # which destabilized the truth Newton at the first DA-window
+    # timestep when n_windows was bumped (observed: r24n24 OK,
+    # r24n36 truth Newton diverged).
+    track_duration_s: Optional[float] = None
+
 
 def generate_cartesian_vortex(
     config: CartesianVortexConfig,
@@ -165,9 +182,15 @@ def generate_cartesian_vortex(
     windy = np.zeros((nt, ny, nx))
     pressure = np.full((nt, ny, nx), config.p_ambient_Pa / 100.0)  # mbar
 
-    # Track interpolation
-    t_total = times[-1] - times[0]
+    # Track interpolation. Prefer absolute track_duration_s (independent of
+    # simulation length) so the same physical wind reproduces across runs
+    # with different n_windows / nt_total. Falls back to legacy behavior
+    # (track spans the times array) when track_duration_s is None.
     inflow_rad = np.deg2rad(config.inflow_angle_deg)
+    if config.track_duration_s is not None:
+        t_total = float(config.track_duration_s)
+    else:
+        t_total = times[-1] - times[0]
 
     xx, yy = np.meshgrid(x_grid, y_grid)  # (ny, nx)
 

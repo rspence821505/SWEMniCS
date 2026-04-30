@@ -85,11 +85,43 @@ class SolverStateStorage:
         self.saved_true_bathy: List[np.ndarray] = []
         """List of true bathymetry values (before wetting/drying adjustments)"""
 
+        # Persistent Jacobian pool (Phase B of memory-leak fix).
+        # Each cost-function evaluation does a forward solve that calls
+        # save_jacobian() once per timestep (~6 calls for nt_da=6). The
+        # naive `jacobian.copy()` allocates a fresh ~120 MB Mat per call;
+        # PETSc holds the slabs in its internal allocator pool even after
+        # destroy(), and that's the dominant residual leak after sweep-KSP
+        # (~720 MB of the remaining ~547 MB/eval growth).
+        #
+        # The pool keeps a stable set of Mats across evals, refilling them
+        # via SAME_NONZERO_PATTERN copy at each save_jacobian. clear() only
+        # rewinds an index counter; the Mats are not destroyed until
+        # release_pool() is explicitly called at end of life. For cycling
+        # DA, that means at end-of-window cleanup in run_single_method.
+        # Disable with SWE4DVAR_JACOBIAN_POOL=0.
+        # Default OFF until validated end-to-end. The pool helps in tightly-
+        # repeated identical-control reproducer cases but introduced numerical
+        # blow-up in real cycling DA on 6w_pool (3132492). Investigate before
+        # re-enabling by default; in the meantime sweep-KSP alone provides
+        # the dominant memory savings.
+        import os as _os
+        self._jacobian_pool_enabled = (
+            _os.environ.get("SWE4DVAR_JACOBIAN_POOL", "0").strip() == "1"
+        )
+        self._jacobian_pool: List[PETSc.Mat] = []
+        self._jacobian_pool_idx: int = 0
+
     def clear(self):
         """Clear all stored data to free memory.
 
-        For PETSc matrices (Jacobians and adjoints), this properly destroys
-        them before clearing the list to avoid memory leaks.
+        Saved Jacobians use the persistent pool when enabled — the pool's
+        Mats are NOT destroyed by clear(); only the index pointer is rewound
+        so the next eval refills them in place. This avoids the per-eval
+        ~120 MB × num_steps allocator churn that PETSc's internal pool
+        retains after destroy(). Call release_pool() at end of cost-function
+        life (run_single_method's teardown block) to actually free the pool.
+        Disable the pool with SWE4DVAR_JACOBIAN_POOL=0 to fall back to the
+        legacy destroy-per-clear behavior.
         """
         # Clear numpy arrays - no special handling needed
         self.saved_states.clear()
@@ -97,16 +129,23 @@ class SolverStateStorage:
         self.saved_bathy.clear()
         self.saved_true_bathy.clear()
 
-        # Destroy PETSc matrices before clearing
-        # Use defensive programming to avoid crashes
-        for J in self.saved_jacobians:
-            try:
-                if hasattr(J, 'destroy') and callable(J.destroy):
-                    J.destroy()
-            except (PETSc.Error, RuntimeError, AttributeError):
-                # Ignore errors - matrix may already be destroyed or invalid
-                pass
-        self.saved_jacobians.clear()
+        if self._jacobian_pool_enabled:
+            # Pool mode: don't destroy the Jacobian Mats — they live in
+            # _jacobian_pool and get refilled in place on the next eval.
+            # Just empty the public list and rewind the pool index.
+            self.saved_jacobians.clear()
+            self._jacobian_pool_idx = 0
+        else:
+            # Legacy mode: destroy each Mat (PETSc internal pool retains
+            # the freed slabs anyway, but at least we release them).
+            for J in self.saved_jacobians:
+                try:
+                    if hasattr(J, 'destroy') and callable(J.destroy):
+                        J.destroy()
+                except (PETSc.Error, RuntimeError, AttributeError):
+                    # Ignore errors - matrix may already be destroyed or invalid
+                    pass
+            self.saved_jacobians.clear()
 
         for A in self.saved_adjoints:
             try:
@@ -137,8 +176,18 @@ class SolverStateStorage:
     def save_jacobian(self, jacobian: PETSc.Mat):
         """Save a Jacobian matrix.
 
+        Pool-mode (default, when SWE4DVAR_JACOBIAN_POOL=1): refill the next
+        free Mat in self._jacobian_pool via SAME_NONZERO_PATTERN copy. The
+        Mat's nonzero pattern matches across timesteps because the
+        discretization (DG element + mesh + forms) is fixed. First call
+        seeds the pool with a fresh duplicate; subsequent calls reuse the
+        slot.
+
+        Legacy mode (SWE4DVAR_JACOBIAN_POOL=0): full ``jacobian.copy()``
+        every call (the original behavior).
+
         Args:
-            jacobian: Jacobian matrix to save (will be copied)
+            jacobian: Jacobian matrix to save.
         """
         # R2 handoff pre-copy check (one-shot, first call only)
         _first = not _HANDOFF["storage_fired"]
@@ -146,7 +195,30 @@ class SolverStateStorage:
             _jac_handoff_log("storage_pre_copy", jacobian)
 
         if hasattr(jacobian, 'copy'):
-            self.saved_jacobians.append(jacobian.copy())
+            if self._jacobian_pool_enabled:
+                idx = self._jacobian_pool_idx
+                if idx < len(self._jacobian_pool):
+                    target = self._jacobian_pool[idx]
+                    try:
+                        jacobian.copy(target,
+                                      structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
+                    except (PETSc.Error, RuntimeError) as _e:
+                        # Pattern mismatch (rare — e.g. mesh changed); replace slot.
+                        try:
+                            target.destroy()
+                        except Exception:
+                            pass
+                        target = jacobian.copy()
+                        self._jacobian_pool[idx] = target
+                else:
+                    # First time at this index: allocate and stash.
+                    target = jacobian.copy()
+                    self._jacobian_pool.append(target)
+                self.saved_jacobians.append(target)
+                self._jacobian_pool_idx += 1
+            else:
+                # Legacy: fresh allocation every save.
+                self.saved_jacobians.append(jacobian.copy())
         else:
             # For testing purposes, allow non-PETSc objects
             self.saved_jacobians.append(jacobian)
@@ -158,6 +230,28 @@ class SolverStateStorage:
                              extras={"aliased_input": aliased})
             _HANDOFF["last_saved"] = stored
             _HANDOFF["storage_fired"] = True
+
+    def release_pool(self) -> dict:
+        """Destroy all Mats in the persistent Jacobian pool.
+
+        Call this at end-of-life for the cost-function / solver / storage,
+        e.g. inside the cycling-DA window-teardown block. Process exit
+        also reclaims pool memory but explicit release is preferred when
+        the same Python process spans multiple windows.
+        """
+        n_destroyed = 0
+        for M in self._jacobian_pool:
+            try:
+                if hasattr(M, "destroy") and callable(M.destroy):
+                    M.destroy()
+                    n_destroyed += 1
+            except (PETSc.Error, RuntimeError, AttributeError):
+                pass
+        self._jacobian_pool.clear()
+        self._jacobian_pool_idx = 0
+        # The public saved_jacobians may still hold references; drop them.
+        self.saved_jacobians.clear()
+        return {"jacobian_pool_destroyed": int(n_destroyed)}
 
     def save_adjoint(self, adjoint: PETSc.Mat):
         """Save an adjoint Jacobian matrix.

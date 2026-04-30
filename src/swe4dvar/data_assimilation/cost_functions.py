@@ -247,17 +247,28 @@ class CostFunction(ABC):
         # Clear solver storage and old trajectory/Jacobians to free memory.
         # Each eval stores 36 Jacobians at 52K DOFs (~504 MB); without clearing,
         # Armijo backtracking accumulates multiple sets and causes OOM.
+        # Determine whether storage owns Jacobian lifetimes via the pool: when
+        # SWE4DVAR_JACOBIAN_POOL=1 the storage retains the Mats across evals
+        # and refills them in place, so destroying them here would zombie the
+        # pool slots and produce garbage on the next eval's save_jacobian.
+        _pool_owns_jac = False
         if hasattr(self.forward_model, 'solver') and hasattr(self.forward_model.solver, 'storage'):
-            self.forward_model.solver.storage.clear()
-        # Also release previous trajectory/Jacobian references so GC can reclaim.
+            _storage = self.forward_model.solver.storage
+            _pool_owns_jac = bool(getattr(_storage, '_jacobian_pool_enabled', False))
+            _storage.clear()
+        # Release previous trajectory references; vec.destroy() always safe
+        # (trajectory is not pooled).
         if self._trajectory is not None:
             for vec in self._trajectory:
                 vec.destroy()
             self._trajectory = None
+        # Jacobian destroys: only when storage is NOT managing the lifetime.
         if self._jacobians is not None:
-            for jac in self._jacobians:
-                if hasattr(jac, 'destroy'):
-                    jac.destroy()
+            if not _pool_owns_jac:
+                for jac in self._jacobians:
+                    if hasattr(jac, 'destroy'):
+                        jac.destroy()
+            # In pool mode just drop the Python references; pool retains the Mats.
             self._jacobians = None
         # Force garbage collection to reclaim PETSc memory
         import gc
@@ -570,11 +581,29 @@ class FourDVarCost(CostFunction):
         This avoids the typical pattern where value() and gradient() each
         independently run the forward model, doubling the computation cost.
         """
+        # Eval-boundary memory diagnostic (gated by SWE4DVAR_EVAL_MEM_DIAG).
+        # Lets us classify the memory growth as live PETSc state vs. allocator
+        # retention by sampling RSS + PETSc memory at four points in the eval.
+        from swe4dvar.utils import eval_memory_diag as _emd
+        _eval_id = getattr(self, "_eval_counter", 0) + 1
+        self._eval_counter = _eval_id
+        # Publish the current eval_id so deeper call sites (e.g. the adjoint
+        # transpose-solve loop) can stamp their per-step records with the same id.
+        _emd.set_current_eval_id(_eval_id)
+        _emd_comm = getattr(self.B, "comm", None) or PETSc.COMM_WORLD
+        _emd.record("before_value_gradient", eval_id=_eval_id, comm=_emd_comm)
+
         # Run forward model once, storing Jacobians for adjoint
         try:
             trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+            _emd.record("after_forward", eval_id=_eval_id, comm=_emd_comm)
+            # Clear any stale failure info on success
+            self._last_forward_failure_msg = None
         except Exception as e:
-            # Forward model failed - return infinity and zero gradient
+            # Forward model failed - return infinity and zero gradient.
+            # Stash the exception message so the optimizer wrapper can surface
+            # the failing timestep in its own log (see petsc_tao_wrapper).
+            self._last_forward_failure_msg = str(e)
             import warnings
             warnings.warn(
                 f"Forward model failed during value_gradient: {e}. "
@@ -643,6 +672,35 @@ class FourDVarCost(CostFunction):
                 arr = grad.getArray().copy()
                 arr = self.gradient_smoother(arr)
                 grad.setArray(arr)
+
+        _emd.record("after_adjoint_grad", eval_id=_eval_id, comm=_emd_comm)
+
+        # Per-eval cleanup hook: destroy short-lived intermediates and
+        # (gated) call malloc_trim(0) so we can compare RSS before/after
+        # the OS-allocator release. Live trajectory/Jacobians are kept on
+        # self for the next eval's _run_forward_model() to release them
+        # at the start of the next solve (existing pattern).
+        try:
+            if 'delta_m' in locals():
+                delta_m.destroy()
+            grad_background.destroy()
+            lambda_0.destroy()
+        except Exception:
+            pass
+
+        # Optional: PETSc-level pool sweep + Python GC, then sample.
+        try:
+            PETSc.garbage_cleanup()
+        except Exception:
+            pass
+        import gc as _gc
+        _gc.collect()
+        _emd.record(
+            "after_cleanup",
+            eval_id=_eval_id,
+            comm=_emd_comm,
+            do_trim=_emd.malloc_trim_enabled(),
+        )
 
         return cost, grad
 
@@ -755,6 +813,31 @@ class FourDVarCost(CostFunction):
             duration_s=float(time.perf_counter() - solve_start),
         )
 
+        # Release adjoint-side resources before the solver goes out of scope.
+        # ImplicitAdjointSolver caches a mass matrix (~120 MB at 207K DOFs)
+        # whose Mat is otherwise never destroyed — Python GC drops the ref
+        # but PETSc retains the C-level allocation. solve_adjoint_equations
+        # already calls release_sweep_resources() internally for the sweep
+        # KSP + J_reg. cleanup() additionally destroys the cached mass matrix.
+        try:
+            adjoint_solver.cleanup()
+        except Exception:
+            pass
+        # Also destroy the terminal vec we duplicated above (otherwise leaks
+        # ~1.6 MB/eval).
+        try:
+            terminal.destroy()
+        except Exception:
+            pass
+        # Destroy the per-obs forcings now that the adjoint has consumed them.
+        # Each is small (~obs_size Vec) but accumulates across evals.
+        for _f in obs_forcings:
+            if _f is not None:
+                try:
+                    _f.destroy()
+                except Exception:
+                    pass
+
         return lambda_0
 
     def _compute_observation_forcings(
@@ -784,6 +867,16 @@ class FourDVarCost(CostFunction):
 
             # Apply adjoint observation operator: H_k^T R_k^{-1} d_k
             forcings[k] = self.obs_op.adjoint(R_inv_d)
+
+            # Release per-obs intermediates — Python ref drop alone leaves
+            # PETSc Vecs alive in the allocator pool. Small individual size,
+            # but ~9 Vecs/eval and they accumulate across many evals.
+            try:
+                Hu_k.destroy()
+                d_k.destroy()
+                R_inv_d.destroy()
+            except Exception:
+                pass
 
         return forcings
 

@@ -567,6 +567,25 @@ class ImplicitAdjointSolver:
         self._ksp_cache_builds = 0
         self._ksp_cache_hits = 0
 
+        # Persistent sweep-KSP (Part 3 of the memory-leak fix).
+        # When enabled (default ON), the LU-direct transpose path uses ONE
+        # KSP across all timesteps in a single backward sweep, calling
+        # setOperators(J_solve) per step. This collapses ~5 fresh KSP+LU-
+        # factor allocations per eval down to 1, which the per-eval RSS
+        # measurement on LS6 attributed to ~800 MB/eval of PETSc allocator
+        # pool retention. Disable with SWE4DVAR_ADJOINT_SWEEP_KSP=0.
+        # The sweep-KSP is created on first transpose solve in a sweep and
+        # released by release_sweep_resources() at end of solve_adjoint_equations.
+        _env_sweep = os.environ.get("SWE4DVAR_ADJOINT_SWEEP_KSP", "1").strip()
+        self._sweep_ksp_enabled = (_env_sweep == "1")
+        self._sweep_ksp: Optional[PETSc.KSP] = None
+        # J_reg reuse buffer (Part 4): one shifted-Jacobian Mat allocated per
+        # sweep, refilled via SAME_NONZERO_PATTERN copy at each timestep.
+        # Avoids per-step J.copy() allocator churn when regularization fires.
+        self._sweep_J_reg: Optional[PETSc.Mat] = None
+        self._sweep_ksp_builds = 0
+        self._sweep_ksp_reuses = 0
+
         # Flux formulation handling
         self.flux_formulation = flux_formulation
         self.h_dof_indices = h_dof_indices
@@ -1109,22 +1128,94 @@ class ImplicitAdjointSolver:
             if lambda_history is not None:
                 lambda_history[n] = lambda_n.copy()
 
-            # Shift for next iteration
+            # Shift for next iteration. Destroy the OLD lambda_next_next
+            # before overwriting — Python ref drop alone leaves PETSc Vec
+            # alive in the allocator pool. Avoids ~3-5 leaked Vecs per
+            # sweep (~5-8 MB/eval contribution at 207K DOFs). See Phase C-2
+            # of the cycling-DA memory work.
+            if lambda_next_next is not None:
+                try:
+                    lambda_next_next.destroy()
+                except Exception:
+                    pass
             lambda_next_next = lambda_next
             lambda_next = lambda_n
 
-            # Clean up intermediate vectors (except final result)
-            if n > 1:
+            # Always destroy forcing — the previous "if n > 1" guard leaked
+            # the final iteration's forcing Vec on every sweep.
+            try:
                 forcing.destroy()
+            except Exception:
+                pass
 
         # Special handling for n=0 (initial condition)
         # The gradient w.r.t. initial condition comes from time-coupling only
         gradient_u0 = self._compute_initial_gradient(
             lambda_next, lambda_next_next, observation_forcings[0]
         )
+        # The two terminal lambda Vecs (lambda_1, lambda_2 in the n=1 case)
+        # are no longer needed after _compute_initial_gradient consumes them.
+        # Destroy explicitly so PETSc reclaims the Vec storage instead of
+        # pooling it.
+        try:
+            if lambda_next is not None:
+                lambda_next.destroy()
+        except Exception:
+            pass
+        try:
+            if lambda_next_next is not None:
+                lambda_next_next.destroy()
+        except Exception:
+            pass
+        # Release the persistent sweep-KSP and J_reg buffer at the end of the
+        # sweep. Without this, the per-cost-eval ImplicitAdjointSolver objects
+        # would each leak ~120 MB of LU-factor + KSP context to PETSc's pool.
+        try:
+            self.release_sweep_resources()
+        except Exception:
+            pass
         if return_history:
             return gradient_u0, lambda_history
         return gradient_u0
+
+    def release_sweep_resources(self) -> dict:
+        """Destroy the persistent sweep-KSP and J_reg buffer (Parts 3+4).
+
+        Called at the end of solve_adjoint_equations to release the LU
+        factorization + KSP + reusable J_reg matrix that were kept alive
+        across timesteps in the backward sweep. Process exit / Python GC is
+        not reliable enough at PETSc's C level — explicit destroy is needed.
+
+        Returns
+        -------
+        dict with builds / reuses counters for diagnostic logging.
+        """
+        stats = {
+            "sweep_ksp_builds": int(self._sweep_ksp_builds),
+            "sweep_ksp_reuses": int(self._sweep_ksp_reuses),
+        }
+        if self._sweep_ksp is not None:
+            try:
+                pc = self._sweep_ksp.getPC()
+                _factor = pc.getFactorMatrix()
+                if _factor is not None:
+                    _factor.destroy()
+            except Exception:
+                pass
+            try:
+                self._sweep_ksp.destroy()
+            except Exception:
+                pass
+            self._sweep_ksp = None
+        if self._sweep_J_reg is not None:
+            try:
+                self._sweep_J_reg.destroy()
+            except Exception:
+                pass
+            self._sweep_J_reg = None
+        self._sweep_ksp_builds = 0
+        self._sweep_ksp_reuses = 0
+        return stats
 
     def clear_transpose_solver_cache(self) -> dict:
         """Release all cached per-timestep transpose-solver state.
@@ -1246,7 +1337,26 @@ class ImplicitAdjointSolver:
                 cached_tiny_mask = _entry["tiny_mask"]
                 cached_n_regularized = _entry["n_regularized"]
                 lambda_n = forcing.duplicate()
+                # Per-step adjoint memory diagnostic (gated). Lets us see whether
+                # PETSc memory rises monotonically across n=N..1 within a single
+                # backward sweep — the smoking-gun pattern for adjoint-LU pool
+                # retention.
+                try:
+                    from swe4dvar.utils import eval_memory_diag as _emd
+                    if _emd.is_enabled():
+                        _eid = _emd.get_current_eval_id()
+                        _ec = J_solve.getComm().tompi4py() if hasattr(J_solve, "getComm") else None
+                        _emd.record(f"before_transpose_solve_n={n}_cache",
+                                    eval_id=_eid, comm=_ec)
+                except Exception:
+                    pass
                 cached_ksp.solveTranspose(forcing, lambda_n)
+                try:
+                    if _emd.is_enabled():
+                        _emd.record(f"after_transpose_solve_n={n}_cache",
+                                    eval_id=_eid, comm=_ec)
+                except Exception:
+                    pass
                 # Post-solve dry-node zeroing (unchanged from primary path).
                 if cached_n_regularized > 0:
                     arr = lambda_n.getArray()
@@ -1303,8 +1413,27 @@ class ImplicitAdjointSolver:
         #    so serial and distributed LU/MUMPS converge to the same solution)
         # Do NOT modify J in-place — it's shared across multiple adjoint solves.
         eps = self.adjoint_regularization
+        # Whether this call is allowed to keep J_reg around for sweep reuse.
+        # Disabled when the existing transpose-solver-cache is on (it owns the
+        # J_reg lifecycle keyed by n) or when sweep-KSP is opted out.
+        _can_reuse_J_reg = (self._sweep_ksp_enabled
+                            and not self._transpose_solver_cache_enabled)
         if n_regularized > 0 or eps > 0:
-            J_reg = J.copy()
+            if _can_reuse_J_reg and self._sweep_J_reg is not None:
+                # Refill the existing J_reg buffer in place. SAME_NONZERO_PATTERN
+                # avoids the malloc/free of nnz value+index arrays that the per-
+                # step J.copy() pattern triggered, which was a measurable chunk
+                # of the per-eval pool churn. This requires J's pattern to match
+                # self._sweep_J_reg's pattern — which is true here because the
+                # forward solver's stored Jacobians all share one DG element on
+                # one mesh (same forms, same sparsity).
+                J.copy(self._sweep_J_reg,
+                       structure=PETSc.Mat.Structure.SAME_NONZERO_PATTERN)
+                J_reg = self._sweep_J_reg
+            else:
+                J_reg = J.copy()
+                if _can_reuse_J_reg:
+                    self._sweep_J_reg = J_reg  # adopt for subsequent timesteps
             shift_diag = J_reg.getDiagonal()
             shift_arr = shift_diag.getArray()
             if n_regularized > 0:
@@ -1349,7 +1478,23 @@ class ImplicitAdjointSolver:
             iter_maxit = int(os.environ.get("SWE4DVAR_ADJOINT_ITER_MAXIT", "5000"))
             ksp.setTolerances(rtol=iter_rtol, atol=iter_atol, max_it=iter_maxit)
             ksp.setErrorIfNotConverged(False)
+            try:
+                from swe4dvar.utils import eval_memory_diag as _emd
+                _emd_ok = _emd.is_enabled()
+                if _emd_ok:
+                    _eid = _emd.get_current_eval_id()
+                    _ec = J_solve.getComm().tompi4py() if hasattr(J_solve, "getComm") else None
+                    _emd.record(f"before_transpose_solve_n={n}_iter",
+                                eval_id=_eid, comm=_ec)
+            except Exception:
+                _emd_ok = False
             ksp.solveTranspose(forcing, lambda_n)
+            try:
+                if _emd_ok:
+                    _emd.record(f"after_transpose_solve_n={n}_iter",
+                                eval_id=_eid, comm=_ec)
+            except Exception:
+                pass
             reason = ksp.getConvergedReason()
             ksp.destroy()
         else:
@@ -1362,23 +1507,76 @@ class ImplicitAdjointSolver:
             import os as _os
             _lu_solver = _os.environ.get("SWE4DVAR_ADJOINT_LU_SOLVER", "").strip().lower()
 
-            ksp = PETSc.KSP().create(J_solve.getComm())
-            ksp.setOperators(J_solve)
-            ksp.setType(PETSc.KSP.Type.PREONLY)
-            pc = ksp.getPC()
-            pc.setType(PETSc.PC.Type.LU)
-            if _lu_solver:
-                try:
-                    pc.setFactorSolverType(_lu_solver)
-                except Exception as _e:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        f"setFactorSolverType('{_lu_solver}') failed: {_e}. "
-                        f"Falling back to PETSc default."
-                    )
-            ksp.setErrorIfNotConverged(False)
+            # Persistent sweep-KSP path (Part 3): one KSP across all timesteps
+            # in this backward sweep. Disabled when the existing transpose-
+            # solver-cache is enabled (the cache owns its own per-n KSPs and
+            # we don't want both managing factorizations).
+            _use_sweep_ksp = (self._sweep_ksp_enabled
+                              and not self._transpose_solver_cache_enabled)
 
+            if _use_sweep_ksp:
+                if self._sweep_ksp is None:
+                    # Build once, on first transpose solve in the sweep.
+                    self._sweep_ksp = PETSc.KSP().create(J_solve.getComm())
+                    self._sweep_ksp.setType(PETSc.KSP.Type.PREONLY)
+                    _pc = self._sweep_ksp.getPC()
+                    _pc.setType(PETSc.PC.Type.LU)
+                    if _lu_solver:
+                        try:
+                            _pc.setFactorSolverType(_lu_solver)
+                        except Exception as _e:
+                            import logging
+                            logging.getLogger(__name__).warning(
+                                f"setFactorSolverType('{_lu_solver}') failed: {_e}. "
+                                f"Falling back to PETSc default."
+                            )
+                    self._sweep_ksp.setErrorIfNotConverged(False)
+                    self._sweep_ksp_builds += 1
+                else:
+                    self._sweep_ksp_reuses += 1
+                # setOperators triggers re-factor of J_solve in-place. PETSc
+                # reuses the existing factor matrix's storage rather than
+                # malloc-then-free per step, which is the main mechanism by
+                # which this collapses the per-eval slab churn observed at
+                # ~120 MB × num_steps in the prior pre-fix runs.
+                self._sweep_ksp.setOperators(J_solve)
+                ksp = self._sweep_ksp
+                pc = ksp.getPC()
+            else:
+                ksp = PETSc.KSP().create(J_solve.getComm())
+                ksp.setOperators(J_solve)
+                ksp.setType(PETSc.KSP.Type.PREONLY)
+                pc = ksp.getPC()
+                pc.setType(PETSc.PC.Type.LU)
+                if _lu_solver:
+                    try:
+                        pc.setFactorSolverType(_lu_solver)
+                    except Exception as _e:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            f"setFactorSolverType('{_lu_solver}') failed: {_e}. "
+                            f"Falling back to PETSc default."
+                        )
+                ksp.setErrorIfNotConverged(False)
+
+            try:
+                from swe4dvar.utils import eval_memory_diag as _emd
+                _emd_ok = _emd.is_enabled()
+                if _emd_ok:
+                    _eid = _emd.get_current_eval_id()
+                    _ec = J_solve.getComm().tompi4py() if hasattr(J_solve, "getComm") else None
+                    _label_suffix = "_lu_sweep" if _use_sweep_ksp else "_lu"
+                    _emd.record(f"before_transpose_solve_n={n}{_label_suffix}",
+                                eval_id=_eid, comm=_ec)
+            except Exception:
+                _emd_ok = False
             ksp.solveTranspose(forcing, lambda_n)
+            try:
+                if _emd_ok:
+                    _emd.record(f"after_transpose_solve_n={n}{_label_suffix}",
+                                eval_id=_eid, comm=_ec)
+            except Exception:
+                pass
             reason = ksp.getConvergedReason()
 
             # If caching is enabled AND LU succeeded, store the KSP (and its
@@ -1395,6 +1593,12 @@ class ImplicitAdjointSolver:
                 }
                 self._ksp_cache_builds += 1
                 _cached_this_call = True
+            elif _use_sweep_ksp:
+                # Sweep-KSP path: do NOT destroy the KSP here. It is reused on
+                # the next timestep (setOperators triggers re-factor) and
+                # released at end of solve_adjoint_equations via
+                # release_sweep_resources().
+                pass
             else:
                 # Aggressive cleanup: distributed LU factor-solver packages
                 # (MUMPS, SuperLU_DIST) allocate large internal workspace that
@@ -1419,6 +1623,22 @@ class ImplicitAdjointSolver:
                 f"Adjoint LU transpose solve failed at step {n} (reason={reason}). "
                 f"Falling back to GMRES+ILU."
             )
+
+            # Sweep-KSP: tear down the persistent KSP whose factorization just
+            # failed. The next timestep will rebuild it (Part 3 invariant: the
+            # sweep KSP is only valid while LU is succeeding).
+            if self._sweep_ksp is not None and ksp is self._sweep_ksp:
+                try:
+                    _factor = self._sweep_ksp.getPC().getFactorMatrix()
+                    if _factor is not None:
+                        _factor.destroy()
+                except Exception:
+                    pass
+                try:
+                    self._sweep_ksp.destroy()
+                except Exception:
+                    pass
+                self._sweep_ksp = None
 
             ksp2 = PETSc.KSP().create(J_solve.getComm())
             ksp2.setOperators(J_solve)
@@ -1477,9 +1697,12 @@ class ImplicitAdjointSolver:
                         f"iters={iters2}), GMRES(reason={reason3}, iters={iters3})"
                     )
 
-        # Clean up regularized copy — EXCEPT when we cached it for reuse
-        # (then clear_transpose_solver_cache() is responsible for destroying).
-        if J_reg is not None and not _cached_this_call:
+        # Clean up regularized copy — EXCEPT:
+        #   - we cached it in the per-n cache (clear_transpose_solver_cache destroys it later)
+        #   - it IS the sweep-reuse buffer (release_sweep_resources destroys it later)
+        if (J_reg is not None
+                and not _cached_this_call
+                and J_reg is not self._sweep_J_reg):
             J_reg.destroy()
 
         # UV bisector: state right after solve, before tiny-mask zeroing
@@ -1783,10 +2006,41 @@ class ImplicitAdjointSolver:
         Clean up allocated resources.
 
         Call this method to explicitly release PETSc objects when done.
+        Includes: cached mass matrix, persistent sweep-KSP + J_reg buffer,
+        and the per-flux DOLFINx Functions (each backed by a PETSc Vec).
         """
         if self._mass_matrix is not None:
-            self._mass_matrix.destroy()
+            try:
+                self._mass_matrix.destroy()
+            except Exception:
+                pass
             self._mass_matrix = None
+        # Per-eval ImplicitAdjointSolver creates two DOLFINx Functions for
+        # the flux mass operator (~1.6 MB each at 207K DOFs); without the
+        # explicit destroy here the underlying PETSc Vecs are pooled.
+        for _attr in ("_flux_state_func", "_flux_lambda_func"):
+            _f = getattr(self, _attr, None)
+            if _f is not None:
+                try:
+                    _f.x.petsc_vec.destroy()
+                except Exception:
+                    pass
+                setattr(self, _attr, None)
+        # Drop the form reference too — the JIT'd kernel stays in FFCx's
+        # global cache, but the form object itself can go.
+        self._flux_mass_form = None
+        # Make sure persistent sweep-KSP / J_reg buffer are released even
+        # if the user calls cleanup() outside the normal solve path.
+        try:
+            self.release_sweep_resources()
+        except Exception:
+            pass
+        # And the transpose-solver cache (used by the Eq 38 Gram loop) if
+        # it was populated by a prior solve.
+        try:
+            self.clear_transpose_solver_cache()
+        except Exception:
+            pass
 
 
 class ImplicitAdjointStepAnalyzer:
