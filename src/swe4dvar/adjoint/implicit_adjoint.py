@@ -1268,7 +1268,11 @@ class ImplicitAdjointSolver:
         # ---- Pull both Jacobians ---------------------------------------
         J_stored = self.jacobians[n - 1]
         try:
-            J_replay = self._recompute_jacobian_at(n)
+            # Force copy=True for the bisector — it holds J_stored and
+            # J_replay simultaneously and diffs them; aliasing the
+            # persistent form A to J_replay would conflict with the
+            # production transpose-solve that follows.
+            J_replay = self._recompute_jacobian_at(n, copy=True)
         except Exception as _e:
             if _rank == 0:
                 print(f"[replay-bisector] n={n}: replay reassembly failed: "
@@ -1402,7 +1406,7 @@ class ImplicitAdjointSolver:
         except Exception:
             pass
 
-    def _recompute_jacobian_at(self, n: int) -> "PETSc.Mat":
+    def _recompute_jacobian_at(self, n: int, copy: Optional[bool] = None) -> "PETSc.Mat":
         """Re-assemble the forward Jacobian at trajectory step n via the
         snapshot-protected JacobianReplayContext.
 
@@ -1412,8 +1416,22 @@ class ImplicitAdjointSolver:
             u_bc, theta1, t) for step n
           * assembles J via the same form & same A Mat the legacy stored-J
             path uses
-          * returns a copy of J
+          * returns A in-place (copy=False, default) or a copy (copy=True)
           * restores the live forward solver state from the snapshot
+
+        ``copy`` parameter:
+          - None (default): use copy=False unless SWE4DVAR_RECOMPUTE_COPY_J=1
+          - False: return the persistent form Mat A. Required for the
+            production transpose-solve path so the persistent sweep-KSP
+            and transpose-cache can reuse one factor allocation across
+            all backward steps (each step refills A in-place). Without
+            this, every backward step allocates a fresh ~120 MB Mat copy
+            and a fresh distributed LU factor whose MUMPS/SuperLU_DIST
+            workspace ksp.destroy() does not actually free — observed
+            ~190 MB leak per backward step in 3136139 (52 GB / 15 evals).
+          - True: return a fresh Mat. Required by the bisector so it can
+            hold J_stored and J_replay simultaneously for direct algebraic
+            comparison.
 
         Replaces the legacy in-place mutation path (which only restored
         owned-only u/u_n/u_n_old slices, never touched ``problem.u_bc``,
@@ -1467,21 +1485,25 @@ class ImplicitAdjointSolver:
             from .jacobian_replay import JacobianReplayContext
             self._replay_ctx = JacobianReplayContext(solver)
 
-        # ``copy=True`` returns a fresh Mat per backward step. Necessary for
-        # correctness: with ``copy=False``, every recompute returns the
-        # SAME live A Mat object. The persistent sweep-KSP holds an
-        # operator pointer to that Mat, and even though A.assemble() bumps
-        # PETSc's state counter, the in-place re-fill across backward steps
-        # was empirically producing λ_0 = 0 (3135686). Returning a fresh
-        # Mat forces ``setOperators`` to see a different Mat object each
-        # time, guaranteeing refactorization.
-        # Memory cost: ~120 MB Mat copy per backward step at our DOF count.
-        # Net working-set is still much smaller than the legacy stored-J
-        # path because (a) only ONE step's worth is alive at a time
-        # (released when the next replay-context call returns), (b)
-        # ``store_jacobians=False`` in cost_functions skips the upstream
-        # ~720 MB pre-stored Jacobian set entirely.
-        return self._replay_ctx.reassemble(meta, copy=True)
+        # Default: copy=False. Returns the persistent form Mat A
+        # in-place. Same Mat identity across all backward steps, so the
+        # persistent sweep-KSP / transpose-cache binds once and PETSc's
+        # in-place re-factor reuses the factor matrix's allocation —
+        # bounding memory at ~one LU factor regardless of nt_da.
+        # Caller can pass copy=True (bisector) or set
+        # SWE4DVAR_RECOMPUTE_COPY_J=1 (escape hatch) to force a copy.
+        # NOTE: the prior λ_0 = 0 observation in 3135686 that motivated
+        # an earlier copy=True default was due to Bug 3 (no replay
+        # metadata captured) and Bug 4 (adjoint ctor rejected None
+        # jacobians) — not an actual sweep-KSP+in-place-A interaction.
+        # 3135858 stage 2 bisector confirmed replay-J + fresh KSPs
+        # produces correct λ; sweep-KSP is just the same fresh-KSP
+        # pattern with allocation reuse.
+        if copy is None:
+            import os as _os_copy
+            copy = (_os_copy.environ.get(
+                "SWE4DVAR_RECOMPUTE_COPY_J", "0").strip() == "1")
+        return self._replay_ctx.reassemble(meta, copy=bool(copy))
 
     def clear_transpose_solver_cache(self) -> dict:
         """Release all cached per-timestep transpose-solver state.

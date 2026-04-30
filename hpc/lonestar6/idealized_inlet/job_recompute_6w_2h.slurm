@@ -39,12 +39,12 @@ git -C $WORK/SWEMniCS rev-parse HEAD
 cd $WORK/SWEMniCS
 
 # --- Recompute mode -----------------------------------------------------
-# Forces SWE4DVAR_CAPTURE_REPLAY_META=1 inside cost_functions and skips
-# legacy stored-J. Also forces SWE4DVAR_ADJOINT_SWEEP_KSP=0 and
-# SWE4DVAR_ADJOINT_TRANSPOSE_CACHE=0 (Bug 2 fix) — per-step LU is the
-# correct path under recompute.
+# With Bug 5 fix (copy=False default), recompute returns the persistent
+# form Mat A in-place. Sweep-KSP MUST be on so the LU factor is reused
+# across backward steps — without it, per-step LU factor leaks ~190 MB.
 export SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS=1
 export SWE4DVAR_FORWARD_NEWTON_REUSE=1
+export SWE4DVAR_ADJOINT_SWEEP_KSP=1
 export SWE4DVAR_MALLOC_TRIM=1
 
 # --- Diagnostics -------------------------------------------------------

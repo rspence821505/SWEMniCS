@@ -31,8 +31,13 @@ git -C $WORK/SWEMniCS rev-parse HEAD
 cd $WORK/SWEMniCS
 
 # --- Recompute mode -----------------------------------------------------
+# With Bug 5 fix (copy=False default), recompute returns the persistent
+# form Mat A in-place. Sweep-KSP MUST be on so the LU factor is reused
+# across backward steps — without it, per-step LU factor leaks ~190 MB
+# (observed in 3136139: 52 GB after 15 evals at nt_da=12).
 export SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS=1
 export SWE4DVAR_FORWARD_NEWTON_REUSE=1
+export SWE4DVAR_ADJOINT_SWEEP_KSP=1
 export SWE4DVAR_MALLOC_TRIM=1
 
 # --- Diagnostics -------------------------------------------------------
