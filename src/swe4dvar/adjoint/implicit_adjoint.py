@@ -495,8 +495,14 @@ class ImplicitAdjointSolver:
 
         self.num_steps = len(trajectory) - 1
 
-        # Validate inputs
-        if len(jacobians) != self.num_steps:
+        # Validate inputs.
+        # In recompute-Jacobians mode the forward solve runs with
+        # store_jacobians=False, so jacobians arrives here as None or an
+        # empty list. _solve_transpose_system handles that case by
+        # routing through _recompute_jacobian_at(n) for every backward
+        # step. Don't fail the length check on those calls — the only
+        # invalid case is a non-empty list with the wrong length.
+        if jacobians is not None and len(jacobians) > 0 and len(jacobians) != self.num_steps:
             raise ValueError(
                 f"Expected {self.num_steps} Jacobians for {len(trajectory)} states, "
                 f"got {len(jacobians)}"
