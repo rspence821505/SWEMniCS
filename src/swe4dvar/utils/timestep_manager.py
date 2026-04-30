@@ -96,30 +96,24 @@ class TimeStepDataManager:
         if self._start_time is None:
             self._start_time = time.time()
 
-        if not self.should_save_at(timestep):
-            self._skipped_count += 1
-            return
-
-        # Track if anything was actually saved
-        saved_anything = False
-
-        if J is not None and self.store_jacobians:
-            self.solver.save_jacobians(J)
-            saved_anything = True
-
-        # Replay-metadata capture (parity-debug hook for the recompute-J
-        # adjoint feature). Stores the *exact* full ghosted form-visible
-        # state at this timestep into solver.storage.replay_metadata so a
-        # JacobianReplayContext can reproduce J_n bit-equivalently. Gated
-        # by SWE4DVAR_CAPTURE_REPLAY_META=1; off by default.
+        # Replay-metadata capture is the LIFEBLOOD of the recompute-J
+        # adjoint path. When recompute mode is on, store_jacobians=False
+        # and (typically) no other save flag is on either, so
+        # should_save_at() would return False and the replay-meta block
+        # below would never run. Check + capture FIRST, independent of
+        # should_save_at, so recompute mode actually has metadata to
+        # consume in the backward pass.
+        # Gated by SWE4DVAR_CAPTURE_REPLAY_META=1; off by default.
         import os as _os_replay
-        if (timestep > 0
-                and _os_replay.environ.get(
-                    "SWE4DVAR_CAPTURE_REPLAY_META", "0").strip() == "1"
-                and hasattr(self.solver, "_capture_replay_metadata")):
+        _replay_capture_on = (
+            timestep > 0
+            and _os_replay.environ.get(
+                "SWE4DVAR_CAPTURE_REPLAY_META", "0").strip() == "1"
+            and hasattr(self.solver, "_capture_replay_metadata")
+        )
+        if _replay_capture_on:
             try:
                 self.solver._capture_replay_metadata(timestep=timestep)
-                saved_anything = True
             except Exception as _e:
                 # Diagnostic only — never block the forward solve
                 if hasattr(self.solver, "log"):
@@ -128,6 +122,23 @@ class TimeStepDataManager:
                                         f"timestep {timestep}: {_e}")
                     except Exception:
                         pass
+
+        if not self.should_save_at(timestep):
+            # Replay capture above is not counted by should_save_at; if
+            # it fired and nothing else needs saving, count this step as
+            # saved so the summary reflects what actually happened.
+            if _replay_capture_on:
+                self._saved_count += 1
+            else:
+                self._skipped_count += 1
+            return
+
+        # Track if anything was actually saved
+        saved_anything = bool(_replay_capture_on)
+
+        if J is not None and self.store_jacobians:
+            self.solver.save_jacobians(J)
+            saved_anything = True
 
         # Residual derivatives dR_k/dtheta only exist for solved timesteps k >= 1.
         # Saving a synthetic row at timestep 0 misaligns the augmented adjoint
