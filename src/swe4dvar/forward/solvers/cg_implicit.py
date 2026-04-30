@@ -713,6 +713,167 @@ class CGImplicit(BaseSolver):
         if derivative_vectors:
             self.storage.save_parameter_derivatives(derivative_vectors)
 
+    def _capture_replay_metadata(self, timestep: int) -> None:
+        """Capture the full ghosted form-visible state at this timestep.
+
+        Called by the data manager after ``solve_timestep`` returns J at
+        timestep n, when SWE4DVAR_CAPTURE_REPLAY_META=1 is set. Saves the
+        EXACT byte-level state the form references at the moment the stored
+        Jacobian was assembled. Used by the JacobianReplayContext parity
+        harness to reproduce J_n without any owned-only / ghost-recompute
+        approximation.
+
+        Order of state at this call site (matches the "Reassembling at
+        converged solution" point in the legacy stored-J path):
+          self.u         = u_n           (Newton-converged)
+          self.u_n       = u_{n-1}       (NOT YET shifted by update_solution)
+          self.u_n_old   = u_{n-2}
+          self.theta1.value = 0  for n in {1,2}, self.theta for n >= 3
+          self.problem.t = t at end of timestep n
+          self.problem.u_bc.x.array = BC values for time t
+        """
+        u_arr = self.u.x.array.copy()
+        u_n_arr = self.u_n.x.array.copy()
+        u_n_old_arr = self.u_n_old.x.array.copy()
+        u_bc_arr = None
+        try:
+            if hasattr(self.problem, "u_bc"):
+                u_bc_arr = self.problem.u_bc.x.array.copy()
+        except Exception:
+            u_bc_arr = None
+        try:
+            theta1_value = float(self.theta1.value)
+        except Exception:
+            theta1_value = float(getattr(self, "theta", 1.0))
+        try:
+            problem_t = float(self.problem.t)
+        except Exception:
+            problem_t = -1.0
+
+        self.storage.save_replay_metadata(
+            timestep=timestep,
+            u_array=u_arr,
+            u_n_array=u_n_arr,
+            u_n_old_array=u_n_old_arr,
+            u_bc_array=u_bc_arr,
+            theta1_value=theta1_value,
+            problem_t=problem_t,
+        )
+
+        # Immediate replay-at-capture diagnostic. Right after the forward
+        # has stored its J_n and we've just captured the corresponding
+        # replay metadata, reassemble J from that metadata via the shadow
+        # JacobianReplayContext and diff against the just-stored J. This
+        # isolates "is replay correct in isolation?" from "is replay-J
+        # correctly used in the backward sweep?". Strictly observational —
+        # never throws, never alters production state.
+        # Gated by SWE4DVAR_REPLAY_CAPTURE_DIAG=1.
+        import os as _os_diag
+        if _os_diag.environ.get("SWE4DVAR_REPLAY_CAPTURE_DIAG", "0").strip() == "1":
+            try:
+                self._run_replay_capture_diag(timestep)
+            except Exception as _e:
+                # Diagnostic must never block forward solve.
+                if hasattr(self, "log"):
+                    try:
+                        self.log(f"[replay-cap-diag] capture-diff failed at "
+                                 f"timestep {timestep}: {_e}")
+                    except Exception:
+                        pass
+
+    def _run_replay_capture_diag(self, timestep: int) -> None:
+        """Compare just-stored J_n vs reassembled-from-replay J_n.
+
+        Runs at the very moment the storage holds both:
+          (a) the freshly-saved Jacobian Mat in saved_jacobians[-1]
+          (b) the freshly-saved replay metadata at replay_metadata[-1]
+        The live solver state is still exactly what produced J_n.
+
+        If parity is at FP noise here, replay is correct in isolation and
+        any later DA-time mismatch is integration-side (sweep-KSP, J_reg,
+        operator handling). If parity already fails here, replay itself
+        is the bug.
+
+        Output (rank 0 only, by default):
+          [replay-cap-diag] n=K  |J_s|=...  |J_r|=...  |diff|=...  rel=...
+                                 [optional: random matvec parity ratios]
+        """
+        import numpy as _np
+        try:
+            from mpi4py import MPI as _MPI
+            _rank = _MPI.COMM_WORLD.Get_rank()
+        except Exception:
+            _rank = 0
+
+        # 1) Pull the stored J and replay record we just emitted.
+        if not self.storage.saved_jacobians:
+            return
+        if not self.storage.replay_metadata:
+            return
+        J_stored = self.storage.saved_jacobians[-1]
+        meta = self.storage.replay_metadata[-1]
+        # Sanity: timestep tags should agree.
+        if int(meta.get("timestep", -1)) != int(timestep):
+            return
+
+        # 2) Build / reuse the shadow replay context. Cache on self so
+        # repeated diags across timesteps don't re-instantiate.
+        from swe4dvar.adjoint.jacobian_replay import JacobianReplayContext
+        if not hasattr(self, "_capture_diag_ctx") or self._capture_diag_ctx is None:
+            self._capture_diag_ctx = JacobianReplayContext(self)
+
+        # 3) Replay J. ``copy=True`` so the diff Mat below doesn't
+        # accidentally alias the live Newton-problem A.
+        J_replay = self._capture_diag_ctx.reassemble(meta, copy=True)
+
+        # 4) Frobenius norms + diff norm.
+        from petsc4py import PETSc
+        nF_s = J_stored.norm(PETSc.NormType.NORM_FROBENIUS)
+        nF_r = J_replay.norm(PETSc.NormType.NORM_FROBENIUS)
+        diff = J_replay.duplicate(copy=True)
+        diff.axpy(-1.0, J_stored)
+        nF_d = diff.norm(PETSc.NormType.NORM_FROBENIUS)
+        rel = nF_d / max(nF_s, 1e-30)
+
+        # 5) Optional matvec parity (1 deterministic seed per step).
+        import os as _os_mvd
+        do_matvec = (_os_mvd.environ.get(
+            "SWE4DVAR_REPLAY_CAPTURE_DIAG_MATVEC", "1").strip() == "1")
+        mv_ratio = -1.0
+        if do_matvec:
+            try:
+                rng = _np.random.default_rng(11_111 + 7 * int(timestep))
+                x = J_stored.createVecRight()
+                xa = rng.standard_normal(x.getLocalSize())
+                x.setArray(xa); x.assemble()
+                ys = J_stored.createVecLeft()
+                yr = J_stored.createVecLeft()
+                J_stored.mult(x, ys)
+                J_replay.mult(x, yr)
+                ys.axpy(-1.0, yr)
+                err = ys.norm(PETSc.NormType.NORM_2)
+                ref = max(yr.norm(PETSc.NormType.NORM_2), 1e-30)
+                mv_ratio = err / ref
+                x.destroy(); ys.destroy(); yr.destroy()
+            except Exception:
+                mv_ratio = -1.0
+
+        if _rank == 0:
+            print(f"[replay-cap-diag] n={timestep}  "
+                  f"|J_s|={nF_s:.6e}  |J_r|={nF_r:.6e}  "
+                  f"|diff|={nF_d:.6e}  rel={rel:.3e}  "
+                  f"matvec_ratio={mv_ratio:.3e}", flush=True)
+
+        # 6) Cleanup buffer + diff Mat. J_replay is owned by us (copy=True).
+        try:
+            diff.destroy()
+        except Exception:
+            pass
+        try:
+            J_replay.destroy()
+        except Exception:
+            pass
+
     def save_states(self, water_height=None, dry_node_indices=None):
         """Save global state vector with optional wetting/drying adjustments."""
         u_sol = self.u.x.array.copy().flatten()

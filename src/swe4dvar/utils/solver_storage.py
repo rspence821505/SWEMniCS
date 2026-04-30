@@ -85,6 +85,30 @@ class SolverStateStorage:
         self.saved_true_bathy: List[np.ndarray] = []
         """List of true bathymetry values (before wetting/drying adjustments)"""
 
+        # Replay metadata (parity-debug infrastructure for the recompute
+        # Jacobians-in-adjoint feature). Captured per solved timestep at the
+        # *exact* moment the forward solver assembles its stored J_n
+        # ("Reassembling Jacobian at converged solution"). Stores full
+        # ghosted ``Function.x.array`` snapshots — not owned-only Vec
+        # representations — so a shadow reassembly context can restore the
+        # form's state byte-for-byte and produce a J that should be
+        # bit-equal (up to assembly floating-point) to the stored J_n.
+        #
+        # Each entry is a dict with:
+        #   "u":          np.ndarray (full ghosted, copied)
+        #   "u_n":        np.ndarray
+        #   "u_n_old":    np.ndarray
+        #   "u_bc":       np.ndarray (problem.u_bc.x.array, full ghosted)
+        #   "theta1":     float
+        #   "t":          float
+        #   "timestep":   int (the n that produced this Jacobian)
+        #
+        # Captured only when SWE4DVAR_CAPTURE_REPLAY_META=1. Cheap (~MB-scale
+        # numpy data per timestep, no Mat allocation). Independent of the
+        # legacy ``saved_jacobians`` storage path so the parity harness can
+        # run side-by-side without disturbing production paths.
+        self.replay_metadata: List[dict] = []
+
         # Persistent Jacobian pool (Phase B of memory-leak fix).
         # Each cost-function evaluation does a forward solve that calls
         # save_jacobian() once per timestep (~6 calls for nt_da=6). The
@@ -128,6 +152,10 @@ class SolverStateStorage:
         self.dry_nodes.clear()
         self.saved_bathy.clear()
         self.saved_true_bathy.clear()
+
+        # Replay metadata is per-eval and ALWAYS cleared with the rest of
+        # the per-eval data — it has no pool semantics.
+        self.replay_metadata.clear()
 
         if self._jacobian_pool_enabled:
             # Pool mode: don't destroy the Jacobian Mats — they live in
@@ -230,6 +258,41 @@ class SolverStateStorage:
                              extras={"aliased_input": aliased})
             _HANDOFF["last_saved"] = stored
             _HANDOFF["storage_fired"] = True
+
+    def save_replay_metadata(
+        self,
+        timestep: int,
+        u_array: np.ndarray,
+        u_n_array: np.ndarray,
+        u_n_old_array: np.ndarray,
+        u_bc_array: Optional[np.ndarray],
+        theta1_value: float,
+        problem_t: float,
+    ) -> None:
+        """Capture a per-timestep replay snapshot.
+
+        Stores the FULL ghosted ``Function.x.array`` for u/u_n/u_n_old/u_bc,
+        plus the discretization scalar ``theta1`` and the time ``t``. These
+        are exactly the form-visible inputs at the moment the forward
+        solver finalized J_n via "Reassembling Jacobian at converged
+        solution". A downstream JacobianReplayContext restores this state
+        verbatim into a snapshot/restore-protected forward solver and
+        reassembles a Jacobian that should match the stored J_n to
+        floating-point assembly noise.
+
+        Cheap: scalar metadata + a few numpy arrays per timestep. No PETSc
+        Mat allocation.
+        """
+        self.replay_metadata.append({
+            "timestep":   int(timestep),
+            "u":          np.asarray(u_array).copy(),
+            "u_n":        np.asarray(u_n_array).copy(),
+            "u_n_old":    np.asarray(u_n_old_array).copy(),
+            "u_bc":       (np.asarray(u_bc_array).copy()
+                           if u_bc_array is not None else None),
+            "theta1":     float(theta1_value),
+            "t":          float(problem_t),
+        })
 
     def release_pool(self) -> dict:
         """Destroy all Mats in the persistent Jacobian pool.

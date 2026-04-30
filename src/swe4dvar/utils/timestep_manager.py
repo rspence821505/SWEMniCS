@@ -107,6 +107,28 @@ class TimeStepDataManager:
             self.solver.save_jacobians(J)
             saved_anything = True
 
+        # Replay-metadata capture (parity-debug hook for the recompute-J
+        # adjoint feature). Stores the *exact* full ghosted form-visible
+        # state at this timestep into solver.storage.replay_metadata so a
+        # JacobianReplayContext can reproduce J_n bit-equivalently. Gated
+        # by SWE4DVAR_CAPTURE_REPLAY_META=1; off by default.
+        import os as _os_replay
+        if (timestep > 0
+                and _os_replay.environ.get(
+                    "SWE4DVAR_CAPTURE_REPLAY_META", "0").strip() == "1"
+                and hasattr(self.solver, "_capture_replay_metadata")):
+            try:
+                self.solver._capture_replay_metadata(timestep=timestep)
+                saved_anything = True
+            except Exception as _e:
+                # Diagnostic only — never block the forward solve
+                if hasattr(self.solver, "log"):
+                    try:
+                        self.solver.log(f"[replay-meta] capture failed at "
+                                        f"timestep {timestep}: {_e}")
+                    except Exception:
+                        pass
+
         # Residual derivatives dR_k/dtheta only exist for solved timesteps k >= 1.
         # Saving a synthetic row at timestep 0 misaligns the augmented adjoint
         # accumulation with lambda-history indexing.

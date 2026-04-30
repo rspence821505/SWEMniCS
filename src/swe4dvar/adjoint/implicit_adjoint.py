@@ -1217,6 +1217,266 @@ class ImplicitAdjointSolver:
         self._sweep_ksp_reuses = 0
         return stats
 
+    def _run_replay_bisector_at(self, n: int, forcing: "PETSc.Vec") -> None:
+        """Side-by-side stored-J vs replay-J transpose-solve diagnostic.
+
+        Runs ONLY when armed (see env-var gating in _solve_transpose_system).
+        Strictly observational: does not alter the production transpose
+        solve that follows. Always uses FRESH KSPs (no sweep-KSP reuse,
+        no transpose-cache, no iterative override) so the comparison is
+        clean and any production-path side-effects are out of the picture.
+
+        Compares for the same RHS ``forcing`` and the same direct LU PC:
+          - stored: J = self.jacobians[n - 1]
+          - replay: J = self._recompute_jacobian_at(n)  (via JacobianReplayContext)
+
+        Logs (rank 0):
+          n, ||forcing||, ||J_s - J_r|| / ||J_s||,
+          n_regularized, diag_max, tiny_thresh,
+          ||lambda_s||, ||lambda_r||, ||lambda_s - lambda_r||/||lambda_s||,
+          plus stored-only and replay-only KSP convergence reasons.
+
+        Honors SWE4DVAR_ADJOINT_REPLAY_BISECTOR_NO_REG=1 to skip the
+        dry-node + εI shift on both branches (closer to a pure
+        algebraic comparison).
+        """
+        import os as _os_b
+        import numpy as _np
+        try:
+            from mpi4py import MPI as _MPI
+            _rank = _MPI.COMM_WORLD.Get_rank()
+        except Exception:
+            _rank = 0
+
+        # Need both branches to be available.
+        if self.jacobians is None or n - 1 >= len(self.jacobians):
+            if _rank == 0:
+                print(f"[replay-bisector] n={n}: stored Jacobians not "
+                      f"available (need store_jacobians=True). skipping.",
+                      flush=True)
+            return
+
+        no_reg = (_os_b.environ.get(
+            "SWE4DVAR_ADJOINT_REPLAY_BISECTOR_NO_REG", "0").strip() == "1")
+
+        # ---- Pull both Jacobians ---------------------------------------
+        J_stored = self.jacobians[n - 1]
+        try:
+            J_replay = self._recompute_jacobian_at(n)
+        except Exception as _e:
+            if _rank == 0:
+                print(f"[replay-bisector] n={n}: replay reassembly failed: "
+                      f"{_e}. skipping.", flush=True)
+            return
+
+        # ---- Frobenius diff --------------------------------------------
+        nF_s = J_stored.norm(PETSc.NormType.NORM_FROBENIUS)
+        nF_r = J_replay.norm(PETSc.NormType.NORM_FROBENIUS)
+        diff = J_replay.duplicate(copy=True)
+        diff.axpy(-1.0, J_stored)
+        nF_d = diff.norm(PETSc.NormType.NORM_FROBENIUS)
+        rel_F = nF_d / max(nF_s, 1e-30)
+        try:
+            diff.destroy()
+        except Exception:
+            pass
+
+        # ---- Diagnostics on the stored J's diagonal --------------------
+        diag_v = J_stored.getDiagonal()
+        diag_a = diag_v.getArray()
+        local_max = float(_np.max(_np.abs(diag_a))) if diag_a.size > 0 else 0.0
+        try:
+            comm_j = J_stored.getComm().tompi4py()
+            diag_max = comm_j.allreduce(local_max, op=_MPI.MAX)
+        except Exception:
+            diag_max = local_max
+        abs_floor = 1e-20
+        rel_floor = 1e-12 * diag_max if diag_max > 0.0 else 0.0
+        tiny_thresh = max(abs_floor, rel_floor)
+        tiny_mask = _np.abs(diag_a) < tiny_thresh
+        n_reg_local = int(_np.sum(tiny_mask))
+        try:
+            n_reg = comm_j.allreduce(n_reg_local, op=_MPI.SUM)
+        except Exception:
+            n_reg = n_reg_local
+        diag_v.destroy()
+
+        # ---- Optionally apply regularization to both branches ----------
+        eps = self.adjoint_regularization
+        def _maybe_reg(J):
+            """Return J_reg = J + dry-node identity + εI (or J unchanged)."""
+            if no_reg or (n_reg == 0 and eps == 0):
+                return J, False  # use as-is, caller does NOT destroy
+            J_reg = J.copy()
+            sd = J_reg.getDiagonal()
+            sa = sd.getArray()
+            if n_reg_local > 0:
+                sa[tiny_mask] = 1.0
+            if eps > 0:
+                sa = sa + eps
+            sd.setArray(sa)
+            J_reg.setDiagonal(sd)
+            J_reg.assemble()
+            sd.destroy()
+            return J_reg, True
+        Js_solve, owns_s = _maybe_reg(J_stored)
+        Jr_solve, owns_r = _maybe_reg(J_replay)
+
+        # ---- Direct LU transpose solves with FRESH KSPs ---------------
+        # No sweep-KSP, no cache, no iterative override. Same RHS for both.
+        def _solve_lu_transpose(J_op, label):
+            ksp = PETSc.KSP().create(J_op.getComm())
+            ksp.setOperators(J_op)
+            ksp.setType(PETSc.KSP.Type.PREONLY)
+            ksp.getPC().setType(PETSc.PC.Type.LU)
+            ksp.setErrorIfNotConverged(False)
+            lam = forcing.duplicate()
+            lam.zeroEntries()
+            ksp.solveTranspose(forcing, lam)
+            reason = int(ksp.getConvergedReason())
+            try:
+                pc = ksp.getPC()
+                _factor = pc.getFactorMatrix()
+                if _factor is not None:
+                    _factor.destroy()
+            except Exception:
+                pass
+            ksp.destroy()
+            return lam, reason
+
+        lambda_s, reason_s = _solve_lu_transpose(Js_solve, "stored")
+        lambda_r, reason_r = _solve_lu_transpose(Jr_solve, "replay")
+
+        # ---- Lambda comparison ----------------------------------------
+        nF_force = forcing.norm(PETSc.NormType.NORM_2)
+        nL_s = lambda_s.norm(PETSc.NormType.NORM_2)
+        nL_r = lambda_r.norm(PETSc.NormType.NORM_2)
+        ldiff = lambda_s.duplicate()
+        ldiff.zeroEntries()
+        ldiff.axpy(1.0, lambda_s)
+        ldiff.axpy(-1.0, lambda_r)
+        nL_d = ldiff.norm(PETSc.NormType.NORM_2)
+        rel_L = nL_d / max(nL_s, 1e-30)
+
+        # ---- Print summary --------------------------------------------
+        if _rank == 0:
+            print(
+                f"[replay-bisector] n={n}  "
+                f"|forcing|={nF_force:.3e}  "
+                f"|J_s|={nF_s:.6e}  |J_r|={nF_r:.6e}  "
+                f"||J_s - J_r||/|J_s|={rel_F:.3e}  "
+                f"n_reg={n_reg}  diag_max={diag_max:.3e}  "
+                f"tiny_thresh={tiny_thresh:.3e}  no_reg={no_reg}  "
+                f"reason_s={reason_s}  reason_r={reason_r}  "
+                f"|lam_s|={nL_s:.6e}  |lam_r|={nL_r:.6e}  "
+                f"||lam_s - lam_r||/|lam_s|={rel_L:.3e}",
+                flush=True,
+            )
+
+        # ---- Cleanup --------------------------------------------------
+        for v in (lambda_s, lambda_r, ldiff):
+            try:
+                v.destroy()
+            except Exception:
+                pass
+        if owns_s:
+            try:
+                Js_solve.destroy()
+            except Exception:
+                pass
+        if owns_r:
+            try:
+                Jr_solve.destroy()
+            except Exception:
+                pass
+        # J_replay was returned with copy=True from _recompute_jacobian_at;
+        # we own it and must destroy.
+        try:
+            J_replay.destroy()
+        except Exception:
+            pass
+
+    def _recompute_jacobian_at(self, n: int) -> "PETSc.Mat":
+        """Re-assemble the forward Jacobian at trajectory step n via the
+        snapshot-protected JacobianReplayContext.
+
+        This routes through ``swe4dvar.adjoint.jacobian_replay`` which:
+          * snapshots the live forward solver state
+          * loads the saved replay metadata (full ghosted u, u_n, u_n_old,
+            u_bc, theta1, t) for step n
+          * assembles J via the same form & same A Mat the legacy stored-J
+            path uses
+          * returns a copy of J
+          * restores the live forward solver state from the snapshot
+
+        Replaces the legacy in-place mutation path (which only restored
+        owned-only u/u_n/u_n_old slices, never touched ``problem.u_bc``,
+        used a heuristic theta1, and left the live solver in the last-n
+        state — corrupting subsequent forward solves with BC and theta1
+        carry-over).
+
+        Requires SWE4DVAR_CAPTURE_REPLAY_META=1 during the forward solve
+        that produced this trajectory so ``solver.storage.replay_metadata``
+        is populated. Raises if the metadata is missing — recompute mode
+        is meaningless without it.
+        """
+        fm = self.forward_model
+        solver = getattr(fm, "solver", None)
+        if solver is None:
+            raise RuntimeError(
+                "recompute-Jacobians-in-adjoint requires forward_model to "
+                "expose a 'solver' attribute (CGImplicit or compatible).")
+        storage = getattr(solver, "storage", None)
+        if storage is None:
+            raise RuntimeError(
+                "recompute-Jacobians-in-adjoint requires "
+                "forward_model.solver.storage to expose replay metadata.")
+        replay_records = getattr(storage, "replay_metadata", None)
+        if not replay_records:
+            raise RuntimeError(
+                "recompute-Jacobians-in-adjoint requires "
+                "SWE4DVAR_CAPTURE_REPLAY_META=1 to have been set during "
+                "the forward solve so replay metadata is populated. "
+                "Storage has no replay_metadata records.")
+
+        # Build a lookup once and cache it on self. Records are keyed by
+        # the absolute timestep index they captured; this matches the
+        # adjoint's n directly.
+        if (not hasattr(self, "_replay_lookup")
+                or self._replay_lookup is None
+                or len(self._replay_lookup) != len(replay_records)):
+            self._replay_lookup = {
+                int(rec["timestep"]): rec for rec in replay_records
+            }
+
+        meta = self._replay_lookup.get(int(n))
+        if meta is None:
+            raise IndexError(
+                f"recompute-Jacobians: no replay record for n={n}. "
+                f"Available steps: {sorted(self._replay_lookup.keys())}.")
+
+        # Build the replay context once per adjoint instance (it's stateless
+        # apart from caching the forward-solver reference, so reusing is fine).
+        if not hasattr(self, "_replay_ctx") or self._replay_ctx is None:
+            from .jacobian_replay import JacobianReplayContext
+            self._replay_ctx = JacobianReplayContext(solver)
+
+        # ``copy=True`` returns a fresh Mat per backward step. Necessary for
+        # correctness: with ``copy=False``, every recompute returns the
+        # SAME live A Mat object. The persistent sweep-KSP holds an
+        # operator pointer to that Mat, and even though A.assemble() bumps
+        # PETSc's state counter, the in-place re-fill across backward steps
+        # was empirically producing λ_0 = 0 (3135686). Returning a fresh
+        # Mat forces ``setOperators`` to see a different Mat object each
+        # time, guaranteeing refactorization.
+        # Memory cost: ~120 MB Mat copy per backward step at our DOF count.
+        # Net working-set is still much smaller than the legacy stored-J
+        # path because (a) only ONE step's worth is alive at a time
+        # (released when the next replay-context call returns), (b)
+        # ``store_jacobians=False`` in cost_functions skips the upstream
+        # ~720 MB pre-stored Jacobian set entirely.
+        return self._replay_ctx.reassemble(meta, copy=True)
+
     def clear_transpose_solver_cache(self) -> dict:
         """Release all cached per-timestep transpose-solver state.
 
@@ -1300,7 +1560,57 @@ class ImplicitAdjointSolver:
         # CRITICAL FIX: jacobians[k] stores Jacobian from timestep k+1
         # To solve for λ^n, we need J_n = ∂R^n/∂u^n
         # This is stored in jacobians[n-1]
-        J = self.jacobians[n - 1]
+        #
+        # Recompute path (Tier-1 memory fix): instead of reading from a
+        # pre-stored list of nt_da Jacobian Mats (~120 MB each), assemble
+        # J_n on-the-fly from the trajectory state in the forward solver's
+        # existing A matrix. Saves ~720 MB / eval at nt_da=6, ~1.4 GB / eval
+        # at nt_da=12. Same J_n mathematically (see _recompute_jacobian_at
+        # docstring). Gated by SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS=1.
+        import os as _os_recompute
+        _recompute_J = (
+            _os_recompute.environ.get(
+                "SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS", "0"
+            ).strip() == "1"
+        )
+        # Auto-recompute when caller passed jacobians=None (forward solve
+        # ran with store_jacobians=False because env var is on). This is
+        # the canonical recompute path: forward never stores J at all.
+        if _recompute_J or self.jacobians is None:
+            J = self._recompute_jacobian_at(n)
+        else:
+            J = self.jacobians[n - 1]
+
+        # ============ STORED-vs-REPLAY ADJOINT BISECTOR ===================
+        # Gated diagnostic. When armed and this is the chosen step, run a
+        # side-by-side comparison: solve J_n^T λ_n = forcing twice
+        # (once with stored J_n, once with replayed J_n) using FRESH KSPs
+        # so neither sweep-KSP reuse nor the transpose-cache contaminates
+        # the comparison. Logs Frobenius / lambda diffs. Does not alter
+        # the production solve that follows.
+        # Gated by SWE4DVAR_ADJOINT_REPLAY_BISECTOR=1.
+        # Optional step selection: SWE4DVAR_ADJOINT_REPLAY_BISECTOR_STEP=K
+        # (default: every step that has both stored and replay metadata).
+        # Optional regularization bypass: SWE4DVAR_ADJOINT_REPLAY_BISECTOR_NO_REG=1.
+        try:
+            _bisect = (_os_recompute.environ.get(
+                "SWE4DVAR_ADJOINT_REPLAY_BISECTOR", "0"
+            ).strip() == "1")
+            if _bisect:
+                _bs_step = _os_recompute.environ.get(
+                    "SWE4DVAR_ADJOINT_REPLAY_BISECTOR_STEP", ""
+                ).strip()
+                _bs_target_step = int(_bs_step) if _bs_step else None
+                if _bs_target_step is None or n == _bs_target_step:
+                    self._run_replay_bisector_at(n, forcing)
+        except Exception as _e:
+            try:
+                from mpi4py import MPI as _MPI
+                if _MPI.COMM_WORLD.Get_rank() == 0:
+                    print(f"[replay-bisector] n={n} failed: {_e}", flush=True)
+            except Exception:
+                pass
+        # =================================================================
 
         # Stored-Jacobian structural diagnostic: one-shot, fires on the FIRST
         # J consumed while the bisector is armed. Opt-in via env var —

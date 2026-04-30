@@ -593,9 +593,24 @@ class FourDVarCost(CostFunction):
         _emd_comm = getattr(self.B, "comm", None) or PETSc.COMM_WORLD
         _emd.record("before_value_gradient", eval_id=_eval_id, comm=_emd_comm)
 
-        # Run forward model once, storing Jacobians for adjoint
+        # Run forward model once, storing Jacobians for adjoint — UNLESS the
+        # adjoint will recompute J_n on-the-fly from the trajectory state.
+        # In recompute mode, storing the per-timestep Jacobian Mats wastes
+        # ~720 MB / eval (nt_da=6) or ~1.4 GB / eval (nt_da=12) of memory.
+        # Recompute also requires per-timestep replay metadata; force the
+        # capture env var so users only need to set one flag to enable
+        # the full recompute pipeline.
+        import os as _os_recompute
+        _recompute_on = (
+            _os_recompute.environ.get(
+                "SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS", "0"
+            ).strip() == "1"
+        )
+        if _recompute_on:
+            _os_recompute.environ["SWE4DVAR_CAPTURE_REPLAY_META"] = "1"
+        _store_J = not _recompute_on
         try:
-            trajectory, jacobians = self._run_forward_model(m, store_jacobians=True)
+            trajectory, jacobians = self._run_forward_model(m, store_jacobians=_store_J)
             _emd.record("after_forward", eval_id=_eval_id, comm=_emd_comm)
             # Clear any stale failure info on success
             self._last_forward_failure_msg = None
