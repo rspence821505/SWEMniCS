@@ -209,6 +209,10 @@ def run_single_method(args, method, l_wme_mode, output_dir,
         Rmax=args.rmax_km * 1000,
         ramp_time_s=nt_ramp * dt,
         track_duration_s=track_duration_s,
+        track_start_x=float(args.track_start_x),
+        track_start_y=float(args.track_start_y),
+        track_end_x=float(args.track_end_x),
+        track_end_y=float(args.track_end_y),
     )
 
     wind_dir = output_dir / "wind"
@@ -231,7 +235,13 @@ def run_single_method(args, method, l_wme_mode, output_dir,
     # SAME physical t are independent of n_windows; the file name reflects
     # that by including the track-duration explicitly.
     _td_tag = f"td{int(round(track_duration_s))}"
-    _wind_tag = f"_{_v_tag}_{_ts_tag}_{_t_tag}_{_td_tag}"
+    # Track-endpoints tag — also part of the cache key so a cached wind file
+    # from a different track geometry can't be silently reused.
+    _trk_tag = (f"sx{int(round(args.track_start_x/1000))}"
+                f"sy{int(round(args.track_start_y/1000))}"
+                f"ex{int(round(args.track_end_x/1000))}"
+                f"ey{int(round(args.track_end_y/1000))}")
+    _wind_tag = f"_{_v_tag}_{_ts_tag}_{_t_tag}_{_td_tag}_{_trk_tag}"
     truth_file = wind_dir / f"truth{_wind_tag}.h5"
     pert_file = wind_dir / f"perturbed{_wind_tag}.h5"
 
@@ -1292,6 +1302,26 @@ def main():
                              "for different simulation lengths, which produced "
                              "n_windows-specific truth Newton divergence in "
                              "single-process cycling runs.")
+    # Track endpoints in METERS. Default to the legacy CartesianVortexConfig
+    # values (40, -20) → (25, 50) km. Override to put landfall (storm
+    # crossing y=0) at a chosen window, e.g. (40, -20) → (10, 20) km with
+    # track-duration-s=64800 puts landfall at the inlet at t=9h (mid-W2 of
+    # a 3w/2h cycling run with nt_ramp=24).
+    parser.add_argument("--track-start-x", type=float, default=40000.0,
+                        help="Storm track start x in METERS (default 40000 = "
+                             "40 km, far east). Inlet/coast is at y=0; "
+                             "domain x ∈ [0, 50] km.")
+    parser.add_argument("--track-start-y", type=float, default=-20000.0,
+                        help="Storm track start y in METERS (default -20000 = "
+                             "20 km south of coast / out at sea).")
+    parser.add_argument("--track-end-x", type=float, default=25000.0,
+                        help="Storm track end x in METERS (default 25000 = "
+                             "mid-domain).")
+    parser.add_argument("--track-end-y", type=float, default=50000.0,
+                        help="Storm track end y in METERS (default 50000 = "
+                             "50 km inland from coast). For landfall-at-W2 "
+                             "experiments use 20000 (storm exits over the "
+                             "shelf rather than crossing the whole domain).")
     parser.add_argument("--dt", type=float, default=600.0)
     parser.add_argument("--nt-ramp", type=int, default=24)
     parser.add_argument("--nt-da", type=int, default=12)
