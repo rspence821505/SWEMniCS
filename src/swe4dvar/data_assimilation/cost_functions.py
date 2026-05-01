@@ -712,6 +712,31 @@ class FourDVarCost(CostFunction):
         except Exception:
             pass
 
+        # Bug 6 fix: forward Newton refactor leak.
+        # Tear down the forward Newton's inner KSP and rebuild it. The
+        # Newton problem itself is reused (Phase C-1 SWE4DVAR_FORWARD_NEWTON_REUSE=1),
+        # but its inner KSP holds a MUMPS LU factor whose internal
+        # workspace is pool-retained at ~1.4 MB / refactorization. With
+        # ~13 Newton iters × 12 timesteps = ~156 refactors per cost-eval,
+        # that's ~212 MB/eval the malloc_trim path can't recover.
+        # Rebuilding the KSP at the end of each cost-eval forces the
+        # MUMPS factor matrix to actually free; the Newton problem's
+        # _setup_ksp() recreates a fresh KSP bound to the same A. Cost:
+        # one extra symbolic factor on the next eval's first Newton
+        # iteration (~0.5s).
+        # Gate: SWE4DVAR_FORWARD_KSP_RESET=1 (default 1; set 0 to bypass).
+        try:
+            import os as _os_kr
+            if _os_kr.environ.get(
+                    "SWE4DVAR_FORWARD_KSP_RESET", "1").strip() == "1":
+                _fm = self.forward_model
+                _cg = getattr(_fm, 'solver', _fm)
+                _nt = getattr(_cg, 'solver', None)
+                if _nt is not None and hasattr(_nt, '_setup_ksp'):
+                    _nt._setup_ksp()
+        except Exception:
+            pass
+
         # Optional: PETSc-level pool sweep + Python GC, then sample.
         try:
             PETSc.garbage_cleanup()
