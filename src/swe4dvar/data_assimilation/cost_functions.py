@@ -712,23 +712,20 @@ class FourDVarCost(CostFunction):
         except Exception:
             pass
 
-        # Bug 6 fix: forward Newton refactor leak.
-        # Tear down the forward Newton's inner KSP and rebuild it. The
-        # Newton problem itself is reused (Phase C-1 SWE4DVAR_FORWARD_NEWTON_REUSE=1),
-        # but its inner KSP holds a MUMPS LU factor whose internal
-        # workspace is pool-retained at ~1.4 MB / refactorization. With
-        # ~13 Newton iters × 12 timesteps = ~156 refactors per cost-eval,
-        # that's ~212 MB/eval the malloc_trim path can't recover.
-        # Rebuilding the KSP at the end of each cost-eval forces the
-        # MUMPS factor matrix to actually free; the Newton problem's
-        # _setup_ksp() recreates a fresh KSP bound to the same A. Cost:
-        # one extra symbolic factor on the next eval's first Newton
-        # iteration (~0.5s).
-        # Gate: SWE4DVAR_FORWARD_KSP_RESET=1 (default 1; set 0 to bypass).
+        # Bug 6 attempt: rebuilding the forward Newton inner KSP per
+        # cost-eval was meant to release MUMPS LU factor pool retention
+        # (~165 MB/eval residual after Bug 5 sweep-KSP fix). Empirically
+        # it REGRESSED memory: 3136376 showed ~200 MB/eval growth vs
+        # 3136299's ~165 MB/eval, and added ~0.5s/eval cost. The destroy
+        # appears to either not actually release MUMPS workspace until a
+        # later GC cycle, or be exceeded by the new symbolic factor's
+        # allocation. Default OFF; gate retained so future diagnosis can
+        # toggle without code changes.
+        # Gate: SWE4DVAR_FORWARD_KSP_RESET=1 to enable (default 0).
         try:
             import os as _os_kr
             if _os_kr.environ.get(
-                    "SWE4DVAR_FORWARD_KSP_RESET", "1").strip() == "1":
+                    "SWE4DVAR_FORWARD_KSP_RESET", "0").strip() == "1":
                 _fm = self.forward_model
                 _cg = getattr(_fm, 'solver', _fm)
                 _nt = getattr(_cg, 'solver', None)

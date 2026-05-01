@@ -36,7 +36,9 @@ cd $WORK/SWEMniCS
 
 export SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS=1
 export SWE4DVAR_FORWARD_NEWTON_REUSE=1
-export SWE4DVAR_FORWARD_KSP_RESET=1
+# SWE4DVAR_FORWARD_KSP_RESET intentionally NOT set — Bug 6 attempt
+# was a regression (3136376 showed ~200 MB/eval vs 3136299's ~165).
+# Default in code is now off.
 export SWE4DVAR_ADJOINT_SWEEP_KSP=1
 export SWE4DVAR_MALLOC_TRIM=1
 
