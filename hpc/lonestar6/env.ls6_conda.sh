@@ -27,6 +27,16 @@ if [[ ! -f "$WORK/miniforge3/etc/profile.d/conda.sh" ]]; then
   return 1 2>/dev/null || exit 1
 fi
 
+# CRITICAL: LS6 login default env loads `python3/3.9.7` and its mpi4py via
+# Intel MPI 19. That puts /opt/apps/.../python3/3.9.7/.../site-packages on
+# PYTHONPATH, which shadows the conda env's mpi4py (built against the
+# bundled OpenMPI 5). Without clearing it, `import mpi4py` resolves to the
+# system Intel MPI build inside a Python that has conda's libraries — a
+# broken hybrid.
+module purge 2>/dev/null || true
+unset PYTHONPATH
+unset PYTHONHOME
+
 source "$WORK/miniforge3/etc/profile.d/conda.sh"
 conda activate fenics-ls6
 
