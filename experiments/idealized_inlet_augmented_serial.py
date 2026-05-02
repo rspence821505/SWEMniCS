@@ -299,12 +299,11 @@ def _build_da_objects(
     # Synthetic observations from truth states + noise
     observations = []
     obs_cov = {}
+    from swe4dvar.utils.compat import create_petsc_vector_from_map as _cvm
     for k_obs in obs_times:
         truth_state_k = truth_da_states[k_obs]
         # Apply observation operator to truth state
-        from petsc4py import PETSc as _PETSc
-        from dolfinx import la as _la
-        truth_vec = _la.create_petsc_vector(
+        truth_vec = _cvm(
             solver_da.V.dofmap.index_map, solver_da.V.dofmap.index_map_bs,
         )
         truth_vec.setArray(truth_state_k[: solver_da.V.dofmap.index_map.size_local
