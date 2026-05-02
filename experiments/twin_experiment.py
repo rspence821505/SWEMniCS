@@ -65,6 +65,13 @@ class TwinExperimentConfig:
     obs_noise_level: float = 0.01
     obs_points_file: Optional[str] = None  # JSON file with pre-selected points
     interior_only: bool = True  # Only observe interior nodes
+    # When True, sample obs locations with probability proportional to nodal
+    # dual-area (Voronoi-equivalent for triangular meshes). Yields spatially
+    # uniform coverage even on highly refined meshes (e.g. inlet refinement).
+    # When False, samples uniformly from interior nodes — coverage follows
+    # mesh density. Default True (new behavior); set False to reproduce
+    # legacy node-uniform sampling.
+    obs_area_weighted: bool = True
 
     # Background error configuration
     background_error_std: float = 0.1
@@ -878,10 +885,36 @@ class TwinExperiment:
         IMPORTANT: In parallel, mesh.geometry.x is LOCAL to each rank.
         We must gather ALL coordinates to rank 0, generate points there,
         then broadcast to all ranks for consistency.
+
+        When ``self.config.obs_area_weighted`` is True (default), samples are
+        drawn with probability proportional to each interior node's dual area
+        (= 1/3 × sum of incident triangle areas). This yields spatially-uniform
+        coverage even on highly refined meshes. Falls back to node-uniform
+        sampling if mesh topology is unavailable.
         """
         # Gather all coordinates to rank 0
         local_coords = self.problem.mesh.geometry.x
         all_coords = self.comm.gather(local_coords, root=0)
+
+        # Try to obtain mesh topology for dual-area weights. The cleanest
+        # source is the original h5 mesh file (single-source-of-truth, no
+        # MPI gathering of indices needed). For IdealizedInlet this lives at
+        # ``self.problem.xdmf_file`` with .h5 sidecar.
+        topology_global = None
+        geom_global = None
+        if self.config.obs_area_weighted and self.comm.rank == 0:
+            try:
+                xdmf = getattr(self.problem, "xdmf_file", None)
+                if xdmf:
+                    h5_path = str(xdmf).replace(".xdmf", ".h5")
+                    import h5py as _h5py
+                    with _h5py.File(h5_path, "r") as _h5:
+                        if "Mesh/mesh/geometry" in _h5 and "Mesh/mesh/topology" in _h5:
+                            geom_global = _h5["Mesh/mesh/geometry"][:]
+                            topology_global = _h5["Mesh/mesh/topology"][:]
+            except Exception as _e:
+                self.log(f"  [obs] could not load topology for area-weighted "
+                         f"sampling ({_e}); falling back to node-uniform.")
 
         if self.comm.rank == 0:
             # Concatenate all coordinates from all ranks, deduplicate, and sort
@@ -892,6 +925,24 @@ class TwinExperiment:
                 np.round(coords_all[:, :2], decimals=10), axis=0, return_index=True
             )
             coords = coords_all[unique_idx]  # sorted by np.unique
+
+            # If we have global geometry+topology from h5, use that as the
+            # canonical source for dual-area computation. Otherwise we cannot
+            # compute dual areas (topology indices in the h5 reference h5
+            # geometry, not the gathered coords) and must fall back.
+            use_area_weighted = (
+                self.config.obs_area_weighted
+                and geom_global is not None
+                and topology_global is not None
+            )
+            if use_area_weighted:
+                # Replace `coords` with the canonical h5 geometry so topology
+                # indices align. Same set of unique vertices either way.
+                if geom_global.shape[1] == 2:
+                    coords = np.zeros((len(geom_global), 3))
+                    coords[:, :2] = geom_global
+                else:
+                    coords = geom_global
 
             rng = np.random.default_rng(self.config.obs_seed)
 
@@ -912,9 +963,36 @@ class TwinExperiment:
                 raise ValueError("No interior nodes found. Mesh may be too coarse.")
 
             n_obs = max(1, int(len(interior_indices) * self.config.obs_fraction))
-            selected = rng.choice(
-                len(interior_indices), size=min(n_obs, len(interior_indices)), replace=False
-            )
+
+            if use_area_weighted:
+                # Dual area: 1/3 × sum of incident triangle areas, per vertex.
+                v = coords[:, :2]
+                tri = v[topology_global]                    # (n_tri, 3, 2)
+                a = tri[:, 1] - tri[:, 0]
+                b = tri[:, 2] - tri[:, 0]
+                tri_area = 0.5 * np.abs(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0])
+                dual = np.zeros(len(coords))
+                for k in range(3):
+                    np.add.at(dual, topology_global[:, k], tri_area / 3.0)
+                weights = dual[interior_indices]
+                weights = weights / weights.sum()
+                selected = rng.choice(
+                    len(interior_indices),
+                    size=min(n_obs, len(interior_indices)),
+                    replace=False,
+                    p=weights,
+                )
+                self.log(f"  [obs] area-weighted sampling: "
+                         f"{n_obs} of {len(interior_indices)} interior nodes "
+                         f"(dual-area range "
+                         f"{dual[interior_indices].min():.2e} – "
+                         f"{dual[interior_indices].max():.2e} m²)")
+            else:
+                selected = rng.choice(
+                    len(interior_indices), size=min(n_obs, len(interior_indices)), replace=False
+                )
+                self.log(f"  [obs] node-uniform sampling: "
+                         f"{n_obs} of {len(interior_indices)} interior nodes")
             selected_indices = interior_indices[selected]
 
             obs_points = np.zeros((len(selected_indices), 3))
