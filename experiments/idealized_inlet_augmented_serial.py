@@ -309,7 +309,7 @@ def _build_da_objects(
         truth_vec.setArray(truth_state_k[: solver_da.V.dofmap.index_map.size_local
                                           * solver_da.V.dofmap.index_map_bs])
         truth_vec.assemble()
-        h_obs_truth = obs_operator.apply(truth_vec)
+        h_obs_truth = obs_operator.forward(truth_vec)
         h_arr = h_obs_truth.getArray(readonly=True).copy()
         truth_vec.destroy()
         h_obs_truth.destroy()
