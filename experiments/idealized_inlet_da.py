@@ -275,6 +275,16 @@ def run_single_method(args, method, l_wme_mode, output_dir,
     )
     solver_truth = get_solver("DG")(prob_truth, theta=1.0, p_degree=[1, 1])
 
+    # Manning's-n override: must be set on the problem BEFORE the friction
+    # form is built (i.e. before solver init). Setting TAU_const causes the
+    # mannings friction branch in IdealizedInlet.get_friction to use this
+    # value instead of the 0.02 default.
+    if getattr(args, "mannings_n", None) is not None:
+        from petsc4py.PETSc import ScalarType as _ST
+        from dolfinx import fem as _fe
+        prob_truth.TAU_const = _fe.Constant(prob_truth.mesh, _ST(float(args.mannings_n)))
+        print(f"  Manning's-n (truth): {args.mannings_n}")
+
     # Use iterative solver (GMRES+ILU) with increased KSP iterations.
     # The idealized inlet's 208K-DOF system needs more linear solver
     # iterations than the default, especially for optimizer trial states
@@ -388,6 +398,13 @@ def run_single_method(args, method, l_wme_mode, output_dir,
         forcing=forcing_da,
     )
     solver_da = get_solver("DG")(prob_da, theta=1.0, p_degree=[1, 1])
+
+    # Match truth Manning's-n on the DA problem
+    if getattr(args, "mannings_n", None) is not None:
+        from petsc4py.PETSc import ScalarType as _ST
+        from dolfinx import fem as _fe
+        prob_da.TAU_const = _fe.Constant(prob_da.mesh, _ST(float(args.mannings_n)))
+        print(f"  Manning's-n (DA):    {args.mannings_n}")
 
     # Apply same depth floor to DA problem
     if args.min_depth > 5.0:
@@ -1291,6 +1308,11 @@ def main():
     parser.add_argument("--vmax", type=float, default=30.0)
     parser.add_argument("--rmax-km", type=float, default=15.0)
     parser.add_argument("--track-shift", type=float, default=10.0)
+    parser.add_argument("--mannings-n", type=float, default=None,
+                        help="Override Manning's-n on truth+DA problems "
+                             "(uniform). Default None = problem default (~0.02). "
+                             "Higher values damp the surge response and reduce "
+                             "cycling-DA forecast drift.")
     parser.add_argument("--track-duration-s", type=float, default=0.0,
                         help="Absolute duration (s) for the vortex track from "
                              "start to end position. 0 (default) → use the "
