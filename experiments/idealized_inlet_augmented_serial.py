@@ -78,6 +78,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path,
                    default=PROJECT_ROOT / "outputs" / "idealized_inlet_augmented_serial")
     p.add_argument("--seed", type=int, default=42)
+    # ----- coarse-mesh mode -----
+    p.add_argument("--coarse-mesh", action="store_true",
+                   help="Use a generated coarse rectangular mesh covering the same "
+                        "physical domain (x∈[0,50000] m, y∈[0,30500] m) and the same "
+                        "boundary/bathymetry/friction logic as the production "
+                        "Ideal_Inlet mesh, but with a much smaller DOF count. "
+                        "Required for serial augmented prototypes — the production "
+                        "207k-DOF mesh is too expensive for serial GMRES+ILU.")
+    p.add_argument("--nx", type=int, default=50,
+                   help="Coarse-mesh cells in x direction (default 50). "
+                        "Each cell becomes 2 triangles. With --ny the resulting state "
+                        "size is roughly 3 × (nx+1) × (ny+1) for DG-mixed P1 elements.")
+    p.add_argument("--ny", type=int, default=30,
+                   help="Coarse-mesh cells in y direction (default 30).")
     return p.parse_args()
 
 
@@ -95,14 +109,53 @@ def _build_idealized_inlet_problem(args: argparse.Namespace, *, nt: int):
     """Construct an IdealizedInlet problem + DG solver. Returns (prob, solver)."""
     from swe4dvar.forward.problems import IdealizedInlet
     from swe4dvar.forward.solvers import get_solver
-    prob = IdealizedInlet(
-        dt=args.dt,
-        nt=nt,
-        xdmf_file=str(PROJECT_ROOT / "data" / "Ideal_Inlet" / "Ideal_Inlet.xdmf"),
-        friction_law="mannings",
-        solution_var="h",
-        dramp=args.nt_ramp * args.dt / 86400.0,
-    )
+
+    if getattr(args, "coarse_mesh", False):
+        # Generate a coarse rectangular mesh covering the same physical
+        # domain as the production Ideal_Inlet (x∈[0,50000] m,
+        # y∈[0,30500] m). Inherit bathymetry/boundaries/friction/forcing
+        # from IdealizedInlet so only mesh resolution differs from
+        # the production setup.
+        nx = int(getattr(args, "nx", 50))
+        ny = int(getattr(args, "ny", 30))
+
+        class _CoarseIdealizedInlet(IdealizedInlet):
+            def _create_mesh(self):
+                from dolfinx import mesh as _dmesh
+                from mpi4py import MPI as _MPI
+                self.mesh = _dmesh.create_rectangle(
+                    _MPI.COMM_WORLD,
+                    [(0.0, 0.0), (50000.0, 30500.0)],
+                    [nx, ny],
+                    cell_type=_dmesh.CellType.triangle,
+                )
+                self.boundaries = [
+                    (1, lambda x: np.isclose(x[1], 0)),
+                    (
+                        2,
+                        lambda x: np.logical_not(np.isclose(x[1], 0))
+                        | np.logical_and(np.isclose(x[1], 0), np.isclose(x[0], 0))
+                        | np.logical_and(np.isclose(x[1], 0), np.isclose(x[0], 50000)),
+                    ),
+                ]
+
+        prob = _CoarseIdealizedInlet(
+            dt=args.dt,
+            nt=nt,
+            xdmf_file=str(PROJECT_ROOT / "data" / "Ideal_Inlet" / "Ideal_Inlet.xdmf"),
+            friction_law="mannings",
+            solution_var="h",
+            dramp=args.nt_ramp * args.dt / 86400.0,
+        )
+    else:
+        prob = IdealizedInlet(
+            dt=args.dt,
+            nt=nt,
+            xdmf_file=str(PROJECT_ROOT / "data" / "Ideal_Inlet" / "Ideal_Inlet.xdmf"),
+            friction_law="mannings",
+            solution_var="h",
+            dramp=args.nt_ramp * args.dt / 86400.0,
+        )
     solver = get_solver("DG")(prob, theta=1.0, p_degree=[1, 1])
     return prob, solver
 
@@ -158,7 +211,12 @@ def _spin_up_and_truth(args: argparse.Namespace, truth_wind_file: Path):
     from swe4dvar.physics.forcing import GriddedForcing
     from swe4dvar.utils import get_default_solver_params
 
-    print("\n=== Truth: ramp + W0 + forecast ===", flush=True)
+    mesh_mode = (
+        f"COARSE generated rectangle ({args.nx}x{args.ny} cells)"
+        if args.coarse_mesh
+        else "PRODUCTION Ideal_Inlet xdmf"
+    )
+    print(f"\n=== Truth: ramp + W0 + forecast (mesh={mesh_mode}) ===", flush=True)
     forcing = GriddedForcing(str(truth_wind_file), cartesian=True)
     prob, solver = _build_idealized_inlet_problem(args, nt=args.nt_ramp)
     prob.forcing = forcing
@@ -166,7 +224,10 @@ def _spin_up_and_truth(args: argparse.Namespace, truth_wind_file: Path):
     forcing.evaluate(prob.t)
 
     state_size = solver.V.dofmap.index_map.size_local * solver.V.dofmap.index_map_bs
-    print(f"  State size: {state_size} DOFs", flush=True)
+    n_vertices = prob.mesh.geometry.x.shape[0]
+    n_cells = prob.mesh.topology.index_map(prob.mesh.topology.dim).size_local
+    print(f"  Mesh:  {n_vertices} vertices, {n_cells} cells", flush=True)
+    print(f"  State: {state_size} DOFs", flush=True)
 
     params = get_default_solver_params(
         rtol=1e-5, atol=1e-6, max_it=20, relaxation_parameter=0.7,
