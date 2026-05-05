@@ -51,8 +51,10 @@ export SWE4DVAR_FORWARD_DIAG_CSV="$RES_DIR/forward_diag_vista_perf_${SLURM_JOB_I
 rm -f "$SWE4DVAR_FORWARD_DIAG_CSV"
 rm -f $RES_DIR/chain_bg_after_w*_rank*.npy
 
-# --- Binding: numa instead of core, so OMP can spread across cores ---
-mpirun -n 4 --bind-to numa --map-by ppr:1:numa --timeout 6000 \
+# --- Binding: numa instead of core. Vista GH200 has 2 NUMA zones x ~72
+#     cores each; 2 ranks/NUMA = 4 total. Each rank's 8 OMP threads
+#     spreads inside its NUMA quadrant (16 threads total per NUMA, fits). ---
+mpirun -n 4 --bind-to numa --map-by ppr:2:numa --timeout 6000 \
   python -u experiments/idealized_inlet_da.py \
   --method 4dvar \
   --vmax 7 --track-shift 0 \
