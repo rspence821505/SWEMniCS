@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-bounds", type=float, nargs=2, default=(0.01, 0.08))
     p.add_argument("--theta-prior-std", type=float, default=0.5,
                    help="Prior std on theta (background term scaling)")
+    p.add_argument("--truth-theta-coefficients", type=float, nargs="*", default=None,
+                   help="Inject Manning's-n model error into the truth trajectory. "
+                        "Length must equal basis-shape[0]*basis-shape[1]. When set, "
+                        "truth uses n(theta_truth) while bg uses n(theta=0); state-only "
+                        "DA cannot represent this mismatch, augmented can recover via theta.")
     p.add_argument("--output-dir", type=Path,
                    default=PROJECT_ROOT / "outputs" / "idealized_inlet_augmented_serial")
     p.add_argument("--seed", type=int, default=42)
@@ -228,6 +233,30 @@ def _spin_up_and_truth(args: argparse.Namespace, truth_wind_file: Path):
     n_cells = prob.mesh.topology.index_map(prob.mesh.topology.dim).size_local
     print(f"  Mesh:  {n_vertices} vertices, {n_cells} cells", flush=True)
     print(f"  State: {state_size} DOFs", flush=True)
+
+    if args.truth_theta_coefficients is not None:
+        from swe4dvar.forward.augmented_control import ManningsBasisController
+        expected = args.basis_shape[0] * args.basis_shape[1]
+        truth_theta = np.asarray(args.truth_theta_coefficients, dtype=float)
+        if truth_theta.size != expected:
+            raise ValueError(
+                f"--truth-theta-coefficients length {truth_theta.size} != "
+                f"basis_shape product {expected}"
+            )
+        truth_controller = ManningsBasisController(
+            basis_shape=tuple(args.basis_shape),
+            basis_width_fraction=args.basis_width_fraction,
+            n_bounds=tuple(args.n_bounds),
+            reference_n=args.reference_n,
+        )
+        truth_controller.bind(prob, solver)
+        truth_controller.apply(prob, solver, truth_theta)
+        n_field = truth_controller._mannings_field_function.x.array
+        print(
+            f"  Truth Manning: theta_norm={np.linalg.norm(truth_theta):.4f} "
+            f"n.min={n_field.min():.4f} n.mean={n_field.mean():.4f} n.max={n_field.max():.4f}",
+            flush=True,
+        )
 
     params = get_default_solver_params(
         rtol=1e-5, atol=1e-6, max_it=20, relaxation_parameter=0.7,
