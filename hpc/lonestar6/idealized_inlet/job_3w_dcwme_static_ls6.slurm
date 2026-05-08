@@ -22,7 +22,7 @@
 #SBATCH -p normal
 #SBATCH -N 1
 #SBATCH -n 4
-#SBATCH -t 04:00:00
+#SBATCH -t 06:00:00
 #SBATCH -o 3w_dcwme_ls6.%j.out
 #SBATCH -e 3w_dcwme_ls6.%j.err
 
@@ -34,8 +34,13 @@ git -C $WORK/SWEMniCS rev-parse HEAD
 cd $WORK/SWEMniCS
 
 export SWE4DVAR_NEWTON_RELAX=0.3
-export SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS=1
-export SWE4DVAR_CAPTURE_REPLAY_META=1   # required by DC-WME TLM Eq 38 path
+# Recompute-Jacobians-in-adjoint disabled for DC-WME (validated by
+# 3150948 smoke test): Eq 38 TLM adjoint can't honor the replay-meta
+# capture path on the truth-solver code path. Using stored Jacobians
+# instead — ~1-2 GB more memory per window, but pipeline works
+# end-to-end (Step 7a Gram cond 4-5.6 vs Shinnecock 1.0).
+unset SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS
+unset SWE4DVAR_CAPTURE_REPLAY_META
 export SWE4DVAR_FORWARD_NEWTON_REUSE=1
 export SWE4DVAR_ADJOINT_SWEEP_KSP=1
 export SWE4DVAR_MALLOC_TRIM=1
