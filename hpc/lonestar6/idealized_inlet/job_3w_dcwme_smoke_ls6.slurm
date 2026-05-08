@@ -34,8 +34,14 @@ git -C $WORK/SWEMniCS rev-parse HEAD
 cd $WORK/SWEMniCS
 
 export SWE4DVAR_NEWTON_RELAX=0.3
-export SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS=1
-export SWE4DVAR_CAPTURE_REPLAY_META=1   # required by DC-WME TLM Eq 38 path
+# Recompute-Jacobians-in-adjoint disabled for DC-WME: the Eq 38 TLM
+# adjoint path requires replay_metadata captured during the truth's
+# forward solve, but capture isn't being honored on this code path
+# (3148371 + 3150728 both crashed at Step 7a despite both env vars
+# set). Stored Jacobians work fine; trade ~1-2 GB memory for working
+# code.
+unset SWE4DVAR_ADJOINT_RECOMPUTE_JACOBIANS
+unset SWE4DVAR_CAPTURE_REPLAY_META
 export SWE4DVAR_FORWARD_NEWTON_REUSE=1
 export SWE4DVAR_ADJOINT_SWEEP_KSP=1
 export SWE4DVAR_MALLOC_TRIM=1
