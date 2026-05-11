@@ -99,6 +99,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--truth-kl-n-modes", type=int, default=None,
                    help="Number of KL modes for the TRUTH Manning field (defaults to --kl-n-modes). "
                         "Allows decoupling truth-side spatial complexity from DA-side basis.")
+    p.add_argument("--cost-method", choices=["4dvar", "dc_wme"], default="4dvar",
+                   help="Cost function variant for the augmented DA. '4dvar' = standard "
+                        "augmented 4D-Var (default). 'dc_wme' = DC-WME bundled cost with "
+                        "Eq 38 auto-inflation — first empirical test of augmented DC-WME.")
+    p.add_argument("--dcwme-predictability-gamma", type=float, default=0.1,
+                   help="DC-WME predictability assumption gamma (default 0.1). Only used "
+                        "when --cost-method dc_wme.")
     p.add_argument("--output-dir", type=Path,
                    default=PROJECT_ROOT / "outputs" / "idealized_inlet_augmented_serial")
     p.add_argument("--seed", type=int, default=42)
@@ -486,8 +493,7 @@ def _build_da_objects(
     else:
         background_cov = B_state
 
-    cost = create_cost_function(
-        "4dvar",
+    cost_kwargs = dict(
         forward_model=forward_model,
         observation_operator=obs_operator,
         background_cov=background_cov,
@@ -496,9 +502,16 @@ def _build_da_objects(
         observations=observations,
         obs_times=obs_times,
     )
+    if args.cost_method == "dc_wme":
+        cost_kwargs.update(
+            auto_inflate_B=True,
+            predictability_gamma=args.dcwme_predictability_gamma,
+            adaptive_gamma=True,
+        )
+    cost = create_cost_function(args.cost_method, **cost_kwargs)
     cost_type = type(cost).__name__
-    print(f"  cost function: {cost_type} "
-          f"(theta_size={layout.theta_size})", flush=True)
+    print(f"  cost function: {cost_type} (method={args.cost_method}, "
+          f"theta_size={layout.theta_size})", flush=True)
 
     return {
         "forward_model": forward_model,
