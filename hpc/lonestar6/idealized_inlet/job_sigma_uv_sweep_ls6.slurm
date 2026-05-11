@@ -79,10 +79,10 @@ run_one 4dvar         0.1     "4dvar_uv0p1"
 run_one dcwme_static  0.1     "dcwme_uv0p1"
 run_one 4dvar         10      "4dvar_uv10"
 run_one dcwme_static  10      "dcwme_uv10"
+run_one 4dvar         100     "4dvar_uv100"
+run_one dcwme_static  100     "dcwme_uv100"
 run_one 4dvar         1000    "4dvar_uv1000"
 run_one dcwme_static  1000    "dcwme_uv1000"
-run_one 4dvar         100000  "4dvar_uv100k"
-run_one dcwme_static  100000  "dcwme_uv100k"
 
 echo
 echo "=========================================================="
@@ -96,7 +96,7 @@ print()
 print(fmt % ("variant","bg_rmse","an_rmse","imp%","evals"))
 print("-"*72)
 for tag in ("4dvar_uv0p1","dcwme_uv0p1","4dvar_uv10","dcwme_uv10",
-            "4dvar_uv1000","dcwme_uv1000","4dvar_uv100k","dcwme_uv100k"):
+            "4dvar_uv100","dcwme_uv100","4dvar_uv1000","dcwme_uv1000"):
     files = sorted(glob.glob(os.path.join(res_dir, f"swp_{tag}_result_*.json")))
     if not files:
         print(fmt % (tag, "<missing>", "", "", ""))
