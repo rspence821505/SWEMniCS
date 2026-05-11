@@ -85,6 +85,20 @@ def parse_args() -> argparse.Namespace:
                         "Allows decoupling truth-side spatial structure from DA-side controller "
                         "for ablation experiments (e.g. 1-DOF DA controller recovering a "
                         "6-DOF spatial truth).")
+    # ----- KL (Karhunen-Loève) basis args -----
+    p.add_argument("--basis-type", choices=["gaussian", "kl"], default="gaussian",
+                   help="Manning basis type. 'gaussian' = RBF lobes on a grid (default). "
+                        "'kl' = Karhunen-Loève expansion of a squared-exponential covariance "
+                        "kernel — the canonical Gaussian random field parameterization.")
+    p.add_argument("--kl-correlation-length", type=float, default=None,
+                   help="KL covariance correlation length L (meters). Default: 1/4 of domain extent.")
+    p.add_argument("--kl-prior-std", type=float, default=0.5,
+                   help="KL prior std sigma for the covariance kernel C = sigma^2 * exp(-r^2/(2L^2))")
+    p.add_argument("--kl-n-modes", type=int, default=None,
+                   help="Number of KL modes to retain (DA-side). If None, auto-truncate at 99%% variance.")
+    p.add_argument("--truth-kl-n-modes", type=int, default=None,
+                   help="Number of KL modes for the TRUTH Manning field (defaults to --kl-n-modes). "
+                        "Allows decoupling truth-side spatial complexity from DA-side basis.")
     p.add_argument("--output-dir", type=Path,
                    default=PROJECT_ROOT / "outputs" / "idealized_inlet_augmented_serial")
     p.add_argument("--seed", type=int, default=42)
@@ -243,24 +257,47 @@ def _spin_up_and_truth(args: argparse.Namespace, truth_wind_file: Path):
         from swe4dvar.forward.augmented_control import ManningsBasisController
         truth_basis_shape = tuple(args.truth_basis_shape) if args.truth_basis_shape is not None \
                             else tuple(args.basis_shape)
-        expected = truth_basis_shape[0] * truth_basis_shape[1]
         truth_theta = np.asarray(args.truth_theta_coefficients, dtype=float)
-        if truth_theta.size != expected:
-            raise ValueError(
-                f"--truth-theta-coefficients length {truth_theta.size} != "
-                f"truth-basis-shape product {expected} (truth_basis_shape={truth_basis_shape})"
+        truth_kl_n_modes = args.truth_kl_n_modes if args.truth_kl_n_modes is not None \
+                           else args.kl_n_modes
+        if args.basis_type == "gaussian":
+            expected = truth_basis_shape[0] * truth_basis_shape[1]
+            if truth_theta.size != expected:
+                raise ValueError(
+                    f"--truth-theta-coefficients length {truth_theta.size} != "
+                    f"truth-basis-shape product {expected} (truth_basis_shape={truth_basis_shape})"
+                )
+            truth_controller = ManningsBasisController(
+                basis_shape=truth_basis_shape,
+                basis_width_fraction=args.basis_width_fraction,
+                n_bounds=tuple(args.n_bounds),
+                reference_n=args.reference_n,
+                basis_type="gaussian",
             )
-        truth_controller = ManningsBasisController(
-            basis_shape=truth_basis_shape,
-            basis_width_fraction=args.basis_width_fraction,
-            n_bounds=tuple(args.n_bounds),
-            reference_n=args.reference_n,
-        )
+        else:
+            # KL: parameter count = truth_kl_n_modes (auto if None)
+            if truth_kl_n_modes is not None and truth_theta.size != truth_kl_n_modes:
+                raise ValueError(
+                    f"--truth-theta-coefficients length {truth_theta.size} != "
+                    f"--truth-kl-n-modes {truth_kl_n_modes}"
+                )
+            truth_controller = ManningsBasisController(
+                basis_shape=(1, 1),  # ignored for KL
+                basis_width_fraction=args.basis_width_fraction,
+                n_bounds=tuple(args.n_bounds),
+                reference_n=args.reference_n,
+                basis_type="kl",
+                kl_correlation_length=args.kl_correlation_length,
+                kl_prior_std=args.kl_prior_std,
+                kl_n_modes=truth_kl_n_modes,
+            )
         truth_controller.bind(prob, solver)
         truth_controller.apply(prob, solver, truth_theta)
         n_field = truth_controller._mannings_field_function.x.array
+        basis_descr = (f"basis_shape={truth_basis_shape}" if args.basis_type == "gaussian"
+                       else f"kl_n_modes={truth_controller.parameter_size()}")
         print(
-            f"  Truth Manning: basis_shape={truth_basis_shape} "
+            f"  Truth Manning: basis={args.basis_type} {basis_descr} "
             f"theta_norm={np.linalg.norm(truth_theta):.4f} "
             f"n.min={n_field.min():.4f} n.mean={n_field.mean():.4f} n.max={n_field.max():.4f}",
             flush=True,
@@ -347,12 +384,25 @@ def _build_da_objects(
     controller = None
     theta_size = 0
     if mode == "augmented":
-        controller = ManningsBasisController(
-            basis_shape=tuple(args.basis_shape),
-            basis_width_fraction=args.basis_width_fraction,
-            n_bounds=tuple(args.n_bounds),
-            reference_n=args.reference_n,
-        )
+        if args.basis_type == "gaussian":
+            controller = ManningsBasisController(
+                basis_shape=tuple(args.basis_shape),
+                basis_width_fraction=args.basis_width_fraction,
+                n_bounds=tuple(args.n_bounds),
+                reference_n=args.reference_n,
+                basis_type="gaussian",
+            )
+        else:
+            controller = ManningsBasisController(
+                basis_shape=(1, 1),  # ignored for KL
+                basis_width_fraction=args.basis_width_fraction,
+                n_bounds=tuple(args.n_bounds),
+                reference_n=args.reference_n,
+                basis_type="kl",
+                kl_correlation_length=args.kl_correlation_length,
+                kl_prior_std=args.kl_prior_std,
+                kl_n_modes=args.kl_n_modes,
+            )
         controller.bind(prob_da, solver_da)
         theta_size = controller.parameter_size()
         print(f"  Augmented theta_size = {theta_size} "
