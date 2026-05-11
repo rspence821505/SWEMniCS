@@ -619,29 +619,31 @@ def _apply_eq38_to_B(B, eq38_result, rank=0, component_indices=None):
             print(f"  [Eq 38] Above-bound range: [{diag_arr[~below_mask].min():.6e}, "
                   f"{diag_arr[~below_mask].max():.6e}]")
 
+    # MPI safety: setArray/assemble and min_eigenvalue are COLLECTIVE. Must be
+    # called unconditionally on every rank. The local-only modifications are
+    # guarded; the collectives are not. Previously the entire block was inside
+    # `if n_below > 0:` which is rank-local, causing PETSc error 77
+    # (inconsistent data) when ranks disagreed on whether to inflate — observed
+    # at LS6 3156445 dcwme_tight with σ_b²=1e-6 and component-aware B.
     if n_below > 0:
-        # Only inflate DOFs that are below the bound
         max_scale = sigma_b_sq / diag_arr[below_mask].min()
         diag_arr[below_mask] = sigma_b_sq
         inv_diag_arr[below_mask] = 1.0 / sigma_b_sq
+    else:
+        max_scale = 1.0
 
-        B.diagonal.setArray(diag_arr)
-        B.diagonal.assemble()
-        B.inv_diagonal.setArray(inv_diag_arr)
-        B.inv_diagonal.assemble()
+    B.diagonal.setArray(diag_arr)
+    B.diagonal.assemble()
+    B.inv_diagonal.setArray(inv_diag_arr)
+    B.inv_diagonal.assemble()
+    min_B = B.min_eigenvalue()
 
-        # B.min_eigenvalue() is a COLLECTIVE (comm.allreduce on line 362 of
-        # covariance.py). Must be called by every rank, NOT inside the
-        # rank==0 guard — that deadlocks at np>=2 (LS6 Step 7b hang,
-        # run 3098388 / 3099557 / 3099697).
-        min_B = B.min_eigenvalue()
-        if rank == 0:
+    if rank == 0:
+        if n_below > 0:
             print(f"  [Eq 38] Inflated {n_below} DOFs to σ_b²={sigma_b_sq:.6e} "
                   f"(max scale: {max_scale:.2f}x)", flush=True)
             print(f"  [Eq 38] min(B) = {min_B:.6e}", flush=True)
-    else:
-        max_scale = 1.0
-        if rank == 0:
+        else:
             print(f"  [Eq 38] All DOFs already satisfy Eq 38 (no inflation needed)")
 
     return max_scale
@@ -695,13 +697,15 @@ def _apply_eq38_to_B_components(B, eq38_result, component_indices, rank=0):
             inv_diag_arr[below_uv_local] = 1.0 / sig_uv
             any_write = True
 
-    if any_write:
-        B.diagonal.setArray(diag_arr)
-        B.diagonal.assemble()
-        B.inv_diagonal.setArray(inv_diag_arr)
-        B.inv_diagonal.assemble()
-
-    # Collective for correct global reporting at np>=2
+    # MPI safety: setArray/assemble/min_eigenvalue are COLLECTIVE. Must be
+    # called unconditionally on every rank. The `if any_write` guard around
+    # them was a long-dormant bug that triggered LS6 3156445 dcwme_tight crash
+    # (σ_b²=1e-6: rank 0 had any_write=True for h block while other ranks
+    # had any_write=False for uv block, desyncing the assemble collectives).
+    B.diagonal.setArray(diag_arr)
+    B.diagonal.assemble()
+    B.inv_diagonal.setArray(inv_diag_arr)
+    B.inv_diagonal.assemble()
     min_B = B.min_eigenvalue()
 
     if rank == 0:
