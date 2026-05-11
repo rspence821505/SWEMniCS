@@ -81,7 +81,13 @@ class CovarianceMatrix(ABC):
             self.local_size = template_vec.getLocalSize()
             self.ownership_range = template_vec.getOwnershipRange()
         else:
-            self.comm = comm
+            # Mirror the conversion done in the template_vec branch: callers
+            # sometimes pass PETSc.COMM_SELF/PETSc.COMM_WORLD (petsc4py.PETSc.Comm)
+            # which lacks .allreduce/.Get_size used by this class. Convert via
+            # .tompi4py() when available. Bug surfaced at Vista 703191 augmented
+            # DC-WME (BlockDiagonalCovariance constructed with PETSc.COMM_SELF
+            # by the augmented prototype) hitting AttributeError on min_eigenvalue.
+            self.comm = comm.tompi4py() if hasattr(comm, "tompi4py") else comm
             # Let PETSc decide partitioning automatically
             ownership_range = PETSc.Vec().create(comm=comm)
             ownership_range.setSizes((PETSc.DECIDE, size))
