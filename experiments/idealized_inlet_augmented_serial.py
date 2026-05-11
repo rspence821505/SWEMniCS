@@ -77,9 +77,14 @@ def parse_args() -> argparse.Namespace:
                    help="Prior std on theta (background term scaling)")
     p.add_argument("--truth-theta-coefficients", type=float, nargs="*", default=None,
                    help="Inject Manning's-n model error into the truth trajectory. "
-                        "Length must equal basis-shape[0]*basis-shape[1]. When set, "
-                        "truth uses n(theta_truth) while bg uses n(theta=0); state-only "
+                        "Length must equal truth-basis-shape product (defaults to basis-shape). "
+                        "When set, truth uses n(theta_truth) while bg uses n(theta=0); state-only "
                         "DA cannot represent this mismatch, augmented can recover via theta.")
+    p.add_argument("--truth-basis-shape", type=int, nargs=2, default=None,
+                   help="Basis shape for the TRUTH Manning field (defaults to --basis-shape). "
+                        "Allows decoupling truth-side spatial structure from DA-side controller "
+                        "for ablation experiments (e.g. 1-DOF DA controller recovering a "
+                        "6-DOF spatial truth).")
     p.add_argument("--output-dir", type=Path,
                    default=PROJECT_ROOT / "outputs" / "idealized_inlet_augmented_serial")
     p.add_argument("--seed", type=int, default=42)
@@ -236,15 +241,17 @@ def _spin_up_and_truth(args: argparse.Namespace, truth_wind_file: Path):
 
     if args.truth_theta_coefficients is not None:
         from swe4dvar.forward.augmented_control import ManningsBasisController
-        expected = args.basis_shape[0] * args.basis_shape[1]
+        truth_basis_shape = tuple(args.truth_basis_shape) if args.truth_basis_shape is not None \
+                            else tuple(args.basis_shape)
+        expected = truth_basis_shape[0] * truth_basis_shape[1]
         truth_theta = np.asarray(args.truth_theta_coefficients, dtype=float)
         if truth_theta.size != expected:
             raise ValueError(
                 f"--truth-theta-coefficients length {truth_theta.size} != "
-                f"basis_shape product {expected}"
+                f"truth-basis-shape product {expected} (truth_basis_shape={truth_basis_shape})"
             )
         truth_controller = ManningsBasisController(
-            basis_shape=tuple(args.basis_shape),
+            basis_shape=truth_basis_shape,
             basis_width_fraction=args.basis_width_fraction,
             n_bounds=tuple(args.n_bounds),
             reference_n=args.reference_n,
@@ -253,7 +260,8 @@ def _spin_up_and_truth(args: argparse.Namespace, truth_wind_file: Path):
         truth_controller.apply(prob, solver, truth_theta)
         n_field = truth_controller._mannings_field_function.x.array
         print(
-            f"  Truth Manning: theta_norm={np.linalg.norm(truth_theta):.4f} "
+            f"  Truth Manning: basis_shape={truth_basis_shape} "
+            f"theta_norm={np.linalg.norm(truth_theta):.4f} "
             f"n.min={n_field.min():.4f} n.mean={n_field.mean():.4f} n.max={n_field.max():.4f}",
             flush=True,
         )
