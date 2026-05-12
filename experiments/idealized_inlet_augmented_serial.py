@@ -260,6 +260,18 @@ def _spin_up_and_truth(args: argparse.Namespace, truth_wind_file: Path):
     print(f"  Mesh:  {n_vertices} vertices, {n_cells} cells", flush=True)
     print(f"  State: {state_size} DOFs", flush=True)
 
+    # Manning symmetry fix (Vista audit 703605):
+    # IdealizedInlet default TAU = 0.03 but --reference-n = 0.025 (typical).
+    # This asymmetry made state-only and augmented modes use different
+    # Manning baselines, contaminating every prior augmented-vs-state-only
+    # comparison. Force truth's baseline Manning = args.reference_n so it
+    # matches the controller's θ=0 baseline used in augmented mode.
+    from petsc4py.PETSc import ScalarType as _ST
+    from dolfinx import fem as _fe
+    prob.TAU_const = _fe.Constant(prob.mesh, _ST(float(args.reference_n)))
+    print(f"  Truth Manning baseline forced to --reference-n = {args.reference_n}",
+          flush=True)
+
     if args.truth_theta_coefficients is not None:
         from swe4dvar.forward.augmented_control import ManningsBasisController
         truth_basis_shape = tuple(args.truth_basis_shape) if args.truth_basis_shape is not None \
@@ -386,6 +398,20 @@ def _build_da_objects(
         rtol=1e-5, atol=1e-6, max_it=50, relaxation_parameter=0.7,
         comm=solver_da.problem.mesh.comm, error_if_not_converged=False,
     )
+
+    # Manning symmetry fix (Vista audit 703605):
+    # IdealizedInlet default TAU = 0.03 but --reference-n = 0.025 (typical).
+    # In augmented mode the controller overrides prob_da.TAU to a Function
+    # initialized at n_ref · exp(0) = args.reference_n. In state-only mode
+    # nothing overrides it, so DA-side Manning stays at IdealizedInlet's
+    # default 0.03. That asymmetry tautologically biased every prior
+    # augmented-vs-state-only forecast comparison. Force the DA-side baseline
+    # to args.reference_n in BOTH modes so they start from the same Manning.
+    from petsc4py.PETSc import ScalarType as _ST
+    from dolfinx import fem as _fe
+    prob_da.TAU_const = _fe.Constant(prob_da.mesh, _ST(float(args.reference_n)))
+    print(f"  DA Manning baseline forced to --reference-n = {args.reference_n} "
+          f"(mode={mode})", flush=True)
 
     # Controller (only for augmented mode)
     controller = None
