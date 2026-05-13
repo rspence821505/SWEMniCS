@@ -1519,6 +1519,14 @@ def main():
         from mpi4py import MPI as _MPI
         rank = _MPI.COMM_WORLD.Get_rank()
 
+        # Pre-compute aggregate JSON path so we can save incrementally after
+        # each window (not just at end). Lets walltime-capped runs preserve
+        # partial cycling data instead of losing everything.
+        _end_window_planned = start_window + n_windows - 1
+        _agg_file_path = (output_dir /
+                          f"result_{method}_{l_wme_mode.replace('/', '_')}"
+                          f"_cycling_w{start_window}-{_end_window_planned}.json")
+
         # Window 0 of the chain uses the perturbed bg generated internally.
         # Subsequent windows of THIS job pull bg from the prior window's
         # in-memory `_m_analysis_advanced_arr`. When this job is itself a
@@ -1562,6 +1570,22 @@ def main():
                 "opt_time_s": r["opt_time_s"],
                 "best_iterate": r.get("best_iterate"),
             })
+
+            # Incremental save after each window so walltime-capped runs
+            # preserve completed-window data. Negligible I/O cost.
+            if rank == 0:
+                with open(_agg_file_path, "w") as _f:
+                    json.dump({
+                        "method": method,
+                        "l_wme_mode": l_wme_mode,
+                        "start_window": start_window,
+                        "n_windows": n_windows,
+                        "windows": per_window,
+                        "partial": (local_w + 1) < n_windows,
+                    }, _f, indent=2)
+                print(f"  [incr] saved partial cycling aggregate "
+                      f"({local_w + 1}/{n_windows} windows): {_agg_file_path.name}",
+                      flush=True)
             # Persist the chained bg to disk (always — even on the last
             # window of this job, in case a follow-up job extends the chain).
             if r.get("_m_analysis_advanced_arr") is not None:
@@ -1575,12 +1599,9 @@ def main():
             else:
                 bg_arr_for_next = None
 
-        # Aggregate JSON for the cycling run. Tag with absolute window range
-        # so multi-job chains do not clobber each other's aggregates.
-        end_window = start_window + n_windows - 1
-        agg_file = (output_dir /
-                    f"result_{method}_{l_wme_mode.replace('/', '_')}"
-                    f"_cycling_w{start_window}-{end_window}.json")
+        # Final aggregate JSON (full run completed). Overwrites the
+        # incremental version with partial=False as a completion marker.
+        agg_file = _agg_file_path
         if _MPI.COMM_WORLD.Get_rank() == 0:
             with open(agg_file, "w") as f:
                 json.dump({
@@ -1589,6 +1610,7 @@ def main():
                     "start_window": start_window,
                     "n_windows": n_windows,
                     "windows": per_window,
+                    "partial": False,
                 }, f, indent=2)
             print(f"\n  Saved cycling aggregate: {agg_file}")
         results[f"{method}_{l_wme_mode}_cycling"] = {
