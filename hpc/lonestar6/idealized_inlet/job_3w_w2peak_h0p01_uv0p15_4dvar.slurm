@@ -3,11 +3,11 @@
 # sigma_b^2_h=0.01, sigma_b^2_uv=0.15
 # track-duration-s=43200 places peak at simulation t=6h (start of W2)
 # --------------------------------------------------------
-#SBATCH -J 3w_4dvar_h0p01
+#SBATCH -J 3w_4dv_np8
 #SBATCH -A ADCIRC
 #SBATCH -p development
 #SBATCH -N 1
-#SBATCH -n 4
+#SBATCH -n 8
 #SBATCH -t 02:00:00
 #SBATCH -o 3w_w2peak_h0p01_uv0p15_4dvar.%j.out
 #SBATCH -e 3w_w2peak_h0p01_uv0p15_4dvar.%j.err
