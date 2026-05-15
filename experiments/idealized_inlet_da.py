@@ -1183,6 +1183,35 @@ def run_single_method(args, method, l_wme_mode, output_dir,
     m_analysis.destroy()
     lower.destroy()
     upper.destroy()
+
+    # DC-WME-specific PETSc cleanup (Vista 3162647 OOM diagnosis):
+    # DCWMEFourDVarCost holds _L_wme (CovarianceMatrix with PETSc Vec/Mat),
+    # qoi_map._trajectory_cache (state vectors + Jacobian refs), and assorted
+    # internal Q_wme cached vectors. CovarianceMatrix has no destroy method,
+    # so Python GC alone leaves the underlying PETSc objects in PETSc's pool
+    # — accumulating ~5-10 GB/rank/window in cycling mode.
+    try:
+        _L = getattr(cost_fn, "_L_wme", None)
+        if _L is not None:
+            for _attr in ("diagonal", "inv_diagonal"):
+                _v = getattr(_L, _attr, None)
+                if _v is not None and hasattr(_v, "destroy"):
+                    try: _v.destroy()
+                    except Exception: pass
+    except Exception:
+        pass
+    try:
+        _qm = getattr(cost_fn, "qoi_map", None)
+        if _qm is not None and hasattr(_qm, "_trajectory_cache"):
+            _qm._trajectory_cache.clear()
+    except Exception:
+        pass
+    for _attr in ("_L_wme", "_L_k", "_m_b_qoi", "_Q_wme_cache"):
+        try:
+            setattr(cost_fn, _attr, None)
+        except Exception:
+            pass
+
     del cost_fn, optimizer, forward_model
 
     # Free truth-side state (large: 6+ Jacobians × ~100 MB/rank + trajectory
