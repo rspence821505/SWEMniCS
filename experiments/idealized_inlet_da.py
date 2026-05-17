@@ -616,7 +616,28 @@ def run_single_method(args, method, l_wme_mode, output_dir,
         f"(n_h={n_h}, ~{nnz_per_row:.0f} nnz/row, ~{est_nnz/1e6:.0f}M nnz)",
         est_bytes,
     )
-    smoothing_matrix = exp._build_smoothing_matrix(h_indices, smooth_L)
+    # Module-level cache to avoid rebuilding the smoothing matrix every
+    # cycling window. The matrix depends only on (smooth_L, n_h) which are
+    # invariant across windows for a given run. Building anew each window
+    # peaks Python heap at ~5 GB/rank (rows/cols/data lists pre-CSR), and
+    # OS-level memory isn't returned even after Python GC — by W5-W7 the
+    # process OOMs. Cache hit: ~10 MB reuse cost.
+    # 3162647 + 3164752 both crashed at smoothing-matrix build during W5
+    # despite the cb769b0 patch (which targeted L_wme, the wrong leak).
+    global _smoothing_matrix_cache
+    try:
+        _smoothing_matrix_cache  # type: ignore[name-defined]
+    except NameError:
+        _smoothing_matrix_cache = {}
+    _smkey = (round(float(smooth_L), 6), int(n_h))
+    if _smkey in _smoothing_matrix_cache:
+        smoothing_matrix = _smoothing_matrix_cache[_smkey]
+        if rank == 0:
+            print(f"  [smoothing] reusing cached matrix for L={smooth_L:.0f}m "
+                  f"n_h={n_h} (cycling-window cache hit)", flush=True)
+    else:
+        smoothing_matrix = exp._build_smoothing_matrix(h_indices, smooth_L)
+        _smoothing_matrix_cache[_smkey] = smoothing_matrix
     _cleanup()
     _check_memory("after gradient smoother build")
 
