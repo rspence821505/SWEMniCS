@@ -216,6 +216,9 @@ examples/data/
 paper/
 !paper/.gitkeep
 
+# Docs directory
+docs/
+
 # Notebooks (development only)
 notebooks/
 !notebooks/.gitkeep
