@@ -581,6 +581,20 @@ class DenseCovariance(CovarianceMatrix):
             pc = self.ksp.getPC()
             pc.setType(PETSc.PC.Type.CHOLESKY)
             self.ksp.setUp()
+        elif self.inverse_method == "iterative":
+            # Iterative CG with Jacobi PC — avoids MUMPS factorization
+            # entirely. Used for DC-WME's L_wme (3172771 segfaulted in
+            # MUMPS MatSolveTranspose at W3 with the default cholesky
+            # path; the factorization was reused across cycling windows
+            # and the cached state went stale). L_wme is small (~581²)
+            # and well-conditioned, so CG+Jacobi converges in <200 iter.
+            self.ksp = PETSc.KSP().create(comm=self.comm)
+            self.ksp.setOperators(self.mat)
+            self.ksp.setType(PETSc.KSP.Type.CG)
+            pc = self.ksp.getPC()
+            pc.setType(PETSc.PC.Type.JACOBI)
+            self.ksp.setTolerances(rtol=1e-10, atol=1e-12, max_it=2000)
+            self.ksp.setUp()
         else:
             raise NotImplementedError(
                 f"Inverse method '{self.inverse_method}' not implemented"

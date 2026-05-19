@@ -1989,7 +1989,11 @@ class DCWMEFourDVarCost(DCFourDVarCost):
                 self.B = self._B_original
             self._B_original = None
 
-        return DenseCovariance(comm, mat)
+        # Use iterative inverse (CG + Jacobi) instead of default cholesky
+        # to avoid MUMPS factor reuse pathology across cycling windows.
+        # 3172771 segfaulted at W3 with cholesky/MUMPS; iterative path
+        # has no persistent factorization to go stale.
+        return DenseCovariance(comm, mat, inverse_method="iterative")
 
     def _ensure_wme_predicted_covariance(self):
         """Ensure WME predicted covariance is available.
