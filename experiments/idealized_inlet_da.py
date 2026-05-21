@@ -272,6 +272,8 @@ def run_single_method(args, method, l_wme_mode, output_dir,
         friction_law="mannings", solution_var="h",
         dramp=nt_ramp * dt / 86400.0,
         forcing=forcing_truth,
+        wd=bool(getattr(args, "wd", False)),
+        wd_alpha=float(getattr(args, "wd_alpha", 1.5)),
     )
     solver_truth = get_solver("DG")(prob_truth, theta=1.0, p_degree=[1, 1])
 
@@ -396,6 +398,8 @@ def run_single_method(args, method, l_wme_mode, output_dir,
         friction_law="mannings", solution_var="h",
         dramp=nt_ramp * dt / 86400.0,
         forcing=forcing_da,
+        wd=bool(getattr(args, "wd", False)),
+        wd_alpha=float(getattr(args, "wd_alpha", 1.5)),
     )
     solver_da = get_solver("DG")(prob_da, theta=1.0, p_degree=[1, 1])
 
@@ -1432,6 +1436,17 @@ def main():
     parser.add_argument("--min-depth", type=float, default=5.0,
                         help="Minimum bathymetric depth (m). Default 5.0 matches IdealizedInlet. "
                              "Increase to 8-10 to prevent shallow-cell instability under wind.")
+    parser.add_argument("--wd", action="store_true",
+                        help="Enable Karna-style smooth wetting/drying lift in the "
+                             "SWE forward+adjoint. h_wd = h + 0.5*(sqrt(h^2 + alpha^2) - h) "
+                             "keeps effective depth strictly positive under strong forcing "
+                             "(e.g. v=30 storm peak). Both truth and DA problems get the "
+                             "same setting. Default off (matches prior benchmarks).")
+    parser.add_argument("--wd-alpha", type=float, default=1.5,
+                        help="Wetting/drying smoothing parameter alpha (m). Larger alpha "
+                             "is more diffusive but more stable. 1.5 matches other "
+                             "experiments in this repo (augmented_wind, validation_ladder). "
+                             "Only used when --wd is set.")
     parser.add_argument("--h-min-bound", type=float, default=1.0,
                         help="Lower bound on analysis h DOFs in TAO box "
                              "constraints (BLMVM projection). Default 1.0 m. "
