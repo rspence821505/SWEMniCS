@@ -1214,7 +1214,9 @@ def run_single_method(args, method, l_wme_mode, output_dir,
     try:
         _L = getattr(cost_fn, "_L_wme", None)
         if _L is not None:
-            for _attr in ("diagonal", "inv_diagonal"):
+            # DiagonalCovariance: "diagonal", "inv_diagonal".
+            # DenseCovariance (iterative inverse path): "ksp", "mat".
+            for _attr in ("diagonal", "inv_diagonal", "ksp", "mat"):
                 _v = getattr(_L, _attr, None)
                 if _v is not None and hasattr(_v, "destroy"):
                     try: _v.destroy()
