@@ -129,12 +129,65 @@ class CustomNewtonProblem:
         else:
             self.pc = self.solver.getPC()
             self.pc.setType(self.pc_type)
+            # MUMPS null-pivot detection for parallel LU path. Storm-peak
+            # forward solves at v=20+ produce locally singular Jacobians
+            # (h ≈ 2 m + huge wind drag → unfactorizable system) and MUMPS
+            # bails with INFOG(1)=-9 → KSP_DIVERGED_PC_FAILED (code -11).
+            # ICNTL(24)=1 enables null-pivot detection and adjustment.
+            if self.pc_type == "lu":
+                import os as _os
+                if _os.environ.get("SWE4DVAR_FORWARD_MUMPS_NULLPIVOT") == "1":
+                    opts = PETSc.Options()
+                    opts["newton_pc_factor_mat_solver_type"] = "mumps"
+                    opts["newton_mat_mumps_icntl_24"] = "1"
+                    opts["newton_mat_mumps_cntl_3"] = _os.environ.get(
+                        "SWE4DVAR_FORWARD_MUMPS_CNTL3", "1e-8")
+                    opts["newton_mat_mumps_cntl_1"] = _os.environ.get(
+                        "SWE4DVAR_FORWARD_MUMPS_CNTL1", "1e-6")
+                    self.solver.setFromOptions()
+                    if self.comm.rank == 0:
+                        print(f"  [Newton MUMPS] null-pivot detection enabled "
+                              f"(icntl_24=1, cntl_3={opts['newton_mat_mumps_cntl_3']}, "
+                              f"cntl_1={opts['newton_mat_mumps_cntl_1']})",
+                              flush=True)
             if self.pc_type == "bjacobi":
                 opts = PETSc.Options()
-                opts["newton_sub_pc_type"] = "none"
+                import os as _os
+                sub_pc = _os.environ.get("SWE4DVAR_FORWARD_SUB_PC", "none")
+                sub_max_it = _os.environ.get("SWE4DVAR_FORWARD_SUB_KSP_MAX_IT", "100")
+                opts["newton_sub_pc_type"] = sub_pc
                 opts["newton_sub_ksp_type"] = "gmres"
-                opts["newton_sub_ksp_max_it"] = "100"
+                opts["newton_sub_ksp_max_it"] = sub_max_it
+                if sub_pc in ("ilu", "lu"):
+                    opts["newton_sub_pc_factor_shift_type"] = _os.environ.get(
+                        "SWE4DVAR_FORWARD_SUB_SHIFT", "NONZERO")
                 self.solver.setFromOptions()
+                # Force the sub-KSPs to be configured. PETSc creates sub-KSPs
+                # lazily, after first solve. Setting via options DB alone can
+                # miss them if the order isn't right. Explicitly iterate them
+                # here to lock the sub PC/KSP types in.
+                if sub_pc != "none":
+                    try:
+                        self.pc.setUp()
+                        sub_ksps = self.pc.getASMSubKSP() if self.pc_type == "asm" else self.pc.getSubKSP()
+                        for _sub in sub_ksps:
+                            _sub.setType(PETSc.KSP.Type.GMRES)
+                            _spc = _sub.getPC()
+                            _spc.setType(sub_pc)
+                            if sub_pc in ("ilu", "lu"):
+                                try:
+                                    _spc.setFactorShift(PETSc.PC.FactorShiftType.NONZERO)
+                                except Exception:
+                                    pass
+                        if self.comm.rank == 0:
+                            _check = self.pc.getSubKSP()[0].getPC().getType()
+                            print(f"  [Newton KSP] outer={self.pc_type} "
+                                  f"sub_pc={_check} sub_ksp_max_it={sub_max_it}",
+                                  flush=True)
+                    except Exception as _e:
+                        if self.comm.rank == 0:
+                            print(f"  [Newton KSP] sub-KSP config failed: {_e}",
+                                  flush=True)
 
     def log(self, *msg):
         if self.comm.rank == 0:

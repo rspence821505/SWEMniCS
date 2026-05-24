@@ -1548,7 +1548,10 @@ def main():
     print(f"[mem-limit] args.mem_limit_gb={args.mem_limit_gb}  "
           f"MEM_LIMIT_MB={MEM_LIMIT_MB}")
 
-    output_dir = PROJECT_ROOT / "results" / "idealized_inlet_da"
+    # SWE4DVAR_OUTPUT_SUBDIR lets parallel jobs isolate their chain_bg /
+    # result_*.json so they don't clobber each other's cycling state.
+    _output_subdir = os.environ.get("SWE4DVAR_OUTPUT_SUBDIR", "idealized_inlet_da")
+    output_dir = PROJECT_ROOT / "results" / _output_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("="*60)
