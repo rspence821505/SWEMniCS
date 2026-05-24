@@ -30,8 +30,9 @@ NT_RAMP=24
 NT_DA=6
 METHOD="4dvar"
 EXTRA=""
-RES_DIR="${RES_DIR:-$WORK/SWEMniCS/results/idealized_inlet_da}"
-TEMPLATE_REL="results/idealized_inlet_da/chain_bg_after_w{prev}_rank{rank}.npy"
+OUTPUT_SUBDIR="${SWE4DVAR_OUTPUT_SUBDIR:-idealized_inlet_da}"
+RES_DIR="${RES_DIR:-$WORK/SWEMniCS/results/$OUTPUT_SUBDIR}"
+TEMPLATE_PATH="$RES_DIR/chain_bg_after_w{prev}_rank{rank}.npy"
 LAUNCHER="${LAUNCHER:-srun}"   # set to "ibrun" on LS6 if preferred
 
 while [[ $# -gt 0 ]]; do
@@ -55,6 +56,8 @@ mkdir -p "$RES_DIR"
 rm -f "$RES_DIR"/chain_bg_after_w*_rank*.npy
 echo "[chain-alloc] cleared stale chain bg files in $RES_DIR"
 echo "[chain-alloc] config: nwin=$NWIN np=$NP launcher=$LAUNCHER vmax=$VMAX nt_da=$NT_DA"
+echo "[chain-alloc] output_subdir=$OUTPUT_SUBDIR"
+echo "[chain-alloc] chain template=$TEMPLATE_PATH"
 
 # Canonical operational defaults: persistent sweep-KSP + glibc trim. These
 # are the post-fix defaults that cut adjoint memory churn ~50% in real DA
@@ -93,7 +96,7 @@ for ((w=0; w<NWIN; w++)); do
   # First window of the chain has no prior background file.
   # Window K>0 loads the bg saved by window K-1 (per-rank).
   if [[ "$w" -gt 0 ]]; then
-    BG_FILE="${TEMPLATE_REL/\{prev\}/$((w-1))}"
+    BG_FILE="${TEMPLATE_PATH/\{prev\}/$((w-1))}"
     echo "[chain-alloc] window $w loads prior bg: $BG_FILE"
     CMD+=( --initial-bg-file "$BG_FILE" )
   fi

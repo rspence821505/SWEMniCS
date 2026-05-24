@@ -1,11 +1,7 @@
 #!/bin/bash
-# Production scale-up companion: DC-WME static v=20 + WD, 14-window
-# cycling DA with storm peak in W12. Same config as 4D-Var production
-# run (3182XXX wd_v20_4dvar) — only --method differs.
-#
-# Per finding_v20_wd_baseline.md: expect DC-WME imp~0.1-1% pre-peak
-# (vs 4D-Var ~5%) with same MUMPS ceiling at peak. Pre-peak windows
-# give the meaningful 4D-Var-vs-DC-WME comparison.
+# Production DC-WME static v=20 + WD, 14-window cycling DA with storm peak
+# in W12. Use one fresh MPI process per window inside a single allocation so
+# PETSc/MUMPS/glibc allocator state is reclaimed between windows.
 # --------------------------------------------------------
 #SBATCH -J 14w_dcw_v20
 #SBATCH -A ADCIRC
@@ -38,24 +34,20 @@ RES_DIR="$WORK/SWEMniCS/results/${SWE4DVAR_OUTPUT_SUBDIR}"
 mkdir -p "$RES_DIR"
 TAG="14w_w12peak_v20_wd_dcwme"
 export SWE4DVAR_FORWARD_DIAG_CSV="$RES_DIR/forward_diag_${TAG}_${SLURM_JOB_ID}.csv"
+export SWE4DVAR_EVAL_MEM_DIAG=1
 
 rm -f $RES_DIR/chain_bg_after_w*_rank*.npy
 rm -f $RES_DIR/result_dcwme_static_cycling_w*-*.json 2>/dev/null
 
-ibrun python -u experiments/idealized_inlet_da.py \
+bash hpc/lonestar6/idealized_inlet/run_chain_in_alloc.sh \
+  --nwin 14 \
+  --np 8 \
+  --vmax 20 \
+  --nt-ramp 96 \
+  --nt-da 24 \
   --method dcwme_static \
-  --vmax 20 --track-shift 0 \
-  --track-duration-s 118800 \
-  --dt 150 \
-  --nt-ramp 96 --nt-da 24 \
-  --n-windows 14 --start-window 0 --chain-mode \
-  --obs-fraction 0.05 --obs-frequency 6 \
-  --obs-noise-level 0.01 --background-error-std 0.02 \
-  --smooth-length 1500 \
-  --max-iterations 3 --max-funcs 3 \
-  --fixed-sigma-b-sq-h 0.01 --fixed-sigma-b-sq-uv 0.15 \
-  --wd --wd-alpha 1.5 \
-  --mem-limit-gb 240
+  --launcher ibrun \
+  --extra "--track-shift 0 --track-duration-s 118800 --dt 150 --obs-fraction 0.05 --obs-frequency 6 --obs-noise-level 0.01 --background-error-std 0.02 --smooth-length 1500 --max-iterations 3 --max-funcs 3 --fixed-sigma-b-sq-h 0.01 --fixed-sigma-b-sq-uv 0.15 --wd --wd-alpha 1.5 --mem-limit-gb 240"
 RET=$?
 
 for j in $RES_DIR/result_dcwme_static_cycling_w*-*.json; do
