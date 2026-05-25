@@ -1173,12 +1173,31 @@ def run_single_method(args, method, l_wme_mode, output_dir,
             solver_da.storage.clear()
         except Exception:
             pass
-        solver_da.time_loop(
-            solver_parameters=solver_params, stations=[], plot_every=9999,
-            save_state=False, store_jacobians=False, enable_video=False,
-        )
-        advanced_full = analysis_full.copy()
-        advanced_full[:state_size] = solver_da.u_n.x.array[:state_size]
+        # Wrap the forward-evolve in NaN guard. The storm-peak windows can
+        # produce Newton failures or NaN residuals in this 24-step advance,
+        # and without a check the corrupted state propagates to the next
+        # window's chain_bg, causing the next window to NaN-crash at
+        # timestep 1. Fall back to the un-advanced analysis on failure.
+        _forward_evolve_ok = True
+        try:
+            solver_da.time_loop(
+                solver_parameters=solver_params, stations=[], plot_every=9999,
+                save_state=False, store_jacobians=False, enable_video=False,
+            )
+        except Exception as _fe_exc:
+            _forward_evolve_ok = False
+            if rank == 0:
+                print(f"  [WARN] forward-evolve raised: {type(_fe_exc).__name__}: {_fe_exc}")
+        _u_n_arr = solver_da.u_n.x.array[:state_size]
+        if not _forward_evolve_ok or not np.isfinite(_u_n_arr).all():
+            if rank == 0:
+                _nbad = int(np.sum(~np.isfinite(_u_n_arr))) if _forward_evolve_ok else -1
+                print(f"  [WARN] forward-evolve produced non-finite state "
+                      f"(nbad={_nbad}); reverting chain_bg to un-advanced analysis")
+            advanced_full = analysis_full.copy()
+        else:
+            advanced_full = analysis_full.copy()
+            advanced_full[:state_size] = _u_n_arr
         result["_m_analysis_advanced_arr"] = advanced_full
         if rank == 0:
             print(f"  Forward-evolve done, t={prob_da.t:.0f}s "
