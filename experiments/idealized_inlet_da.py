@@ -105,6 +105,204 @@ def _cleanup():
     gc.collect()
 
 
+# ---------------------------------------------------------------------------
+# Pre-TAO background feasibility check + interpolated-seed recovery ladder.
+#
+# Failure mode being fixed: when the forward solve at the raw background m_b
+# fails (Newton diverges in the bg forward), the cost function returns
+# inf cost and zero gradient. TAO then sees ||grad||=0 at iter 0, exits as
+# "Converged after 0 iterations", and the analysis equals the background
+# with improvement = 0%. That is indistinguishable in logs from a true
+# converged optimization. These helpers:
+#   (a) detect bg infeasibility before TAO runs,
+#   (b) attempt a stricter-solver retry on the same point,
+#   (c) search for a feasible interpolated seed
+#       m_seed(α) = anchor + α (m_b − anchor) via α backoff,
+#   (d) if nothing works, signal an infeasible-bg window cleanly instead of
+#       producing a fake "0-iteration" TAO result.
+# Driver-level fix; no changes to the optimizer or cost function.
+# ---------------------------------------------------------------------------
+
+# Cost-function forward-failure marker. The cost function itself returns
+# float('inf'); the TAO wrapper clamps to 1e20. Treat anything ≥ this as a
+# forward-model failure.
+_COST_INF_THRESHOLD = 1e19
+
+
+def _is_cost_failure(cost_val):
+    """True iff cost_val signals a forward-model failure."""
+    try:
+        cv = float(cost_val)
+    except Exception:
+        return True
+    return (not np.isfinite(cv)) or (cv > _COST_INF_THRESHOLD)
+
+
+def _eval_feasibility(cost_fn, m_vec, rank, label=""):
+    """Evaluate cost_fn at m_vec once and decide whether the forward solve
+    is feasible. Returns (is_feasible, cost_value).
+
+    Catches the cost function's forward-failure sentinel (inf / 1e20) and
+    any direct exception. Destroys the returned gradient Vec to avoid a
+    leak from this diagnostic call.
+    """
+    suffix = f" {label}" if label else ""
+    try:
+        cost_val, grad = cost_fn.value_gradient(m_vec)
+        try:
+            grad.destroy()
+        except Exception:
+            pass
+        feasible = not _is_cost_failure(cost_val)
+        if rank == 0:
+            status = "feasible" if feasible else "INFEASIBLE (forward failure)"
+            print(f"  [bg-feasibility{suffix}] cost={float(cost_val):.4e}"
+                  f" → {status}", flush=True)
+        return feasible, float(cost_val)
+    except Exception as exc:
+        if rank == 0:
+            print(f"  [bg-feasibility{suffix}] value_gradient raised "
+                  f"{type(exc).__name__}: {exc} → INFEASIBLE", flush=True)
+        return False, float('inf')
+
+
+def _build_recovery_anchor(m_b_vec, h_indices, u_indices, v_indices, comm):
+    """Return a conservative interpolation anchor as a PETSc Vec.
+
+    Anchor choice: spatially-uniform constants per component — global mean
+    of h across all owned DOFs, zero velocity (u = v = 0). This represents
+    a flat-surface, at-rest state, which is physically meaningful and
+    known to lie comfortably inside the Newton basin (zero gradients ⇒
+    benign nonlinear residual). It is computed entirely from the current
+    bg (no truth dependence).
+
+    This is the documented "no distinct prior anchor available" conservative
+    fallback per the recovery-ladder spec. Cycling workflows could later
+    supply a richer prior anchor (e.g. the previous accepted analysis
+    before forward-evolve) via an explicit argument; that plumbing is not
+    threaded here to keep the change localized.
+    """
+    bg_arr = m_b_vec.getArray(readonly=True)
+    local_h_sum = float(np.sum(bg_arr[h_indices])) if len(h_indices) else 0.0
+    local_h_n = int(len(h_indices))
+    global_h_sum = comm.allreduce(local_h_sum)
+    global_h_n = comm.allreduce(local_h_n)
+    h_mean = global_h_sum / max(global_h_n, 1)
+
+    anchor_vec = m_b_vec.duplicate()
+    anchor_arr = anchor_vec.getArray()
+    anchor_arr[:] = 0.0
+    anchor_arr[h_indices] = h_mean
+    anchor_vec.setArray(anchor_arr)
+    anchor_vec.assemble()
+    return anchor_vec
+
+
+def _try_stricter_bg_retry(cost_fn, forward_model, m_vec, rank):
+    """Re-run the bg evaluation with tighter forward-Newton settings.
+
+    Temporarily lowers the Newton relaxation_parameter and raises max_it
+    on the DA forward solver, runs one cost_fn call, then restores the
+    previous values. If the forward Newton attributes can't be located
+    (wrapper layout differs), retries without mutation so caller still
+    sees a deterministic feasibility answer.
+
+    Returns (is_feasible, cost_value).
+    """
+    # Try forward_model.solver.newton (the ForwardModelWrapper -> CGImplicit
+    # path used by idealized_inlet); fall back to forward_model.newton.
+    nw = None
+    for path in ("solver.newton", "newton"):
+        cur = forward_model
+        ok = True
+        for attr in path.split('.'):
+            cur = getattr(cur, attr, None)
+            if cur is None:
+                ok = False
+                break
+        if ok:
+            nw = cur
+            break
+
+    saved_relax = getattr(nw, 'relaxation_parameter', None) if nw is not None else None
+    saved_maxit = getattr(nw, 'max_it', None) if nw is not None else None
+
+    mutated = False
+    if nw is not None and saved_relax is not None and saved_maxit is not None:
+        try:
+            nw.relaxation_parameter = min(float(saved_relax), 0.15)
+            nw.max_it = max(int(saved_maxit), 80)
+            mutated = True
+        except Exception:
+            mutated = False
+
+    # Rebuild KSP so this retry starts from a fresh MUMPS factorization
+    # state. Equivalent to a single-call SWE4DVAR_FORWARD_NEWTON_REUSE=0,
+    # so a prior failed solve's corrupted factor state cannot poison this
+    # attempt. (MUMPS null-pivot detection via icntl_24=1 — when
+    # SWE4DVAR_FORWARD_MUMPS_NULLPIVOT=1 is set in the slurm — remains
+    # active from its construction-time setup; no extra handling needed.)
+    if nw is not None and hasattr(nw, '_setup_ksp'):
+        try:
+            nw._setup_ksp()
+        except Exception:
+            pass
+
+    if rank == 0:
+        if mutated:
+            print(f"  [bg-feasibility] retrying with stricter Newton "
+                  f"(relax={nw.relaxation_parameter}, max_it={nw.max_it}; "
+                  f"prev relax={saved_relax}, max_it={saved_maxit}) + fresh KSP",
+                  flush=True)
+        else:
+            print(f"  [bg-feasibility] stricter Newton mutation unavailable; "
+                  f"retrying with current settings + fresh KSP", flush=True)
+
+    feasible, cost_val = _eval_feasibility(cost_fn, m_vec, rank,
+                                            label="strict-retry")
+
+    if mutated:
+        try:
+            nw.relaxation_parameter = saved_relax
+            nw.max_it = saved_maxit
+        except Exception:
+            pass
+    return feasible, cost_val
+
+
+def _find_feasible_seed(cost_fn, m_b_vec, anchor_vec, alphas, rank):
+    """Backoff search for a feasible interpolated seed.
+
+    Tries m_seed(α) = anchor + α (m_b − anchor) for α in alphas (descending).
+    Returns (seed_vec, alpha) for the first feasible α, or (None, None) if
+    none pass. The caller owns destruction of the returned seed_vec.
+    """
+    bg_arr = m_b_vec.getArray(readonly=True)
+    anchor_arr = anchor_vec.getArray(readonly=True)
+    for alpha in alphas:
+        seed_vec = m_b_vec.duplicate()
+        seed_arr = seed_vec.getArray()
+        seed_arr[:] = anchor_arr + float(alpha) * (bg_arr - anchor_arr)
+        seed_vec.setArray(seed_arr)
+        seed_vec.assemble()
+        if rank == 0:
+            print(f"  [bg-feasibility] trying interpolated seed "
+                  f"α={float(alpha):.3f}", flush=True)
+        feasible, _ = _eval_feasibility(cost_fn, seed_vec, rank,
+                                         label=f"α={float(alpha):.3f}")
+        if feasible:
+            if rank == 0:
+                print(f"  [bg-feasibility] feasible seed found at "
+                      f"α={float(alpha):.3f} — TAO will start from this seed",
+                      flush=True)
+            return seed_vec, float(alpha)
+        try:
+            seed_vec.destroy()
+        except Exception:
+            pass
+    return None, None
+
+
 # Import wind generation from the validated forward experiment
 from experiments.idealized_inlet_twin import (
     CartesianVortexConfig,
@@ -816,6 +1014,117 @@ def run_single_method(args, method, l_wme_mode, output_dir,
     inner.gradient_smoother = gradient_smoother
 
     # ================================================================
+    # Step 7c: Pre-TAO background feasibility check + recovery ladder
+    # ================================================================
+    # Prevents the "TAO converged after 0 iterations" pathology where the
+    # bg forward solve fails, cost_fn returns inf/zero-grad, and TAO exits
+    # with no descent direction. See module-level helpers for details.
+    print(f"\n--- Step 7c: Background feasibility preflight ---")
+    bg_status = "feasible"          # Overwritten if rescue or skip happens
+    recovery_alpha = None           # α used if seed-rescue succeeds
+    tao_start_vec = exp.m_background  # What optimizer.solve() is called with
+
+    bg_feasible, _bg_cost = _eval_feasibility(
+        cost_fn, exp.m_background, rank, label="raw bg")
+
+    if not bg_feasible:
+        # Step 1 — stricter-solver retry on the same point. Cheap and
+        # sometimes fixes a marginal Newton convergence failure.
+        bg_feasible, _bg_cost = _try_stricter_bg_retry(
+            cost_fn, forward_model, exp.m_background, rank)
+        if bg_feasible:
+            bg_status = "feasible_after_stricter_solver"
+
+    if not bg_feasible:
+        # Step 2 — interpolated-seed search. Anchor is a spatially-uniform
+        # mean-h state (zero velocity), built from bg only (no truth).
+        anchor_vec = _build_recovery_anchor(
+            exp.m_background, h_indices, u_indices, v_indices, comm)
+        seed_vec, found_alpha = _find_feasible_seed(
+            cost_fn, exp.m_background, anchor_vec,
+            alphas=[0.5, 0.25, 0.10, 0.05, 0.02], rank=rank)
+        try:
+            anchor_vec.destroy()
+        except Exception:
+            pass
+        if seed_vec is not None:
+            bg_feasible = True
+            bg_status = "feasible_after_seed"
+            recovery_alpha = found_alpha
+            tao_start_vec = seed_vec   # TAO starts from the rescued seed
+        else:
+            bg_status = "infeasible_no_seed"
+
+    if not bg_feasible:
+        # Recovery ladder exhausted — skip TAO entirely. Return a clearly
+        # labeled result so the cycling aggregator (and a downstream reader)
+        # can distinguish "infeasible bg → DA skipped" from a genuine TAO
+        # "converged after 0 iterations".
+        if rank == 0:
+            print(f"\n  [bg-feasibility] No feasible seed found in recovery "
+                  f"ladder. Skipping TAO; analysis = bg.\n"
+                  f"  bg_status = {bg_status}", flush=True)
+        analysis_arr_skip = exp.m_background.getArray(readonly=True)
+        truth_arr_skip = m_true.getArray(readonly=True)
+
+        def _global_rmse_skip(a, b):
+            local_sse = float(np.sum((a - b) ** 2))
+            local_n = len(a)
+            global_sse = comm.allreduce(local_sse)
+            global_n = comm.allreduce(local_n)
+            return float(np.sqrt(global_sse / max(global_n, 1)))
+
+        bg_rmse_skip = _global_rmse_skip(analysis_arr_skip, truth_arr_skip)
+        if rank == 0:
+            print(f"  Background RMSE:  {bg_rmse_skip:.6f}", flush=True)
+            print(f"  Analysis RMSE:    {bg_rmse_skip:.6f} (= bg, no DA)",
+                  flush=True)
+
+        # Honour the optional forward-evolve step downstream by NOT computing
+        # an advanced state here — the cycling loop in main() will see
+        # _m_analysis_advanced_arr=None and feed the un-advanced bg to the
+        # next window (the existing NaN-guard fallback path).
+        return {
+            "method": method,
+            "l_wme_mode": l_wme_mode,
+            "bg_rmse": bg_rmse_skip,
+            "analysis_rmse": bg_rmse_skip,
+            "improvement_pct": 0.0,
+            "n_func_evals": 0,
+            "opt_time_s": 0.0,
+            "mpi_size": comm.size,
+            "iteration_history": {"iter": [], "cost": [],
+                                   "grad_norm": [], "rmse_from_truth": []},
+            "best_iterate": {
+                "iter": -1, "cost": float('inf'),
+                "rmse": bg_rmse_skip, "gnorm": float('inf'),
+                "used_as_analysis": False,
+            },
+            "convergence": {
+                "converged": False,
+                "iteration": 0,
+                "reason": "infeasible_bg_skipped",
+            },
+            "bg_status": bg_status,
+            "bg_recovery_alpha": None,
+            "lwme_diagnostics": None,
+            "config": {
+                "vmax": args.vmax, "track_shift_km": args.track_shift,
+                "nt_ramp": nt_ramp, "nt_da": nt_da, "dt": dt,
+                "obs_fraction": args.obs_fraction,
+                "obs_frequency": args.obs_frequency,
+                "obs_noise_level": args.obs_noise_level,
+                "background_error_std": args.background_error_std,
+                "obs_correlation_length": args.obs_correlation_length,
+                "predictability_gamma": args.predictability_gamma,
+                "smooth_length": args.smooth_length,
+                "ls_step_max": args.ls_step_max,
+                "ls_init_step": args.ls_init_step,
+            },
+            "_m_analysis_advanced_arr": None,
+        }
+
+    # ================================================================
     # Step 8: Optimize (bounded L-BFGS with h >= h_min)
     # ================================================================
     print(f"\n--- Step 8: Bounded L-BFGS optimization ---")
@@ -1018,7 +1327,12 @@ def run_single_method(args, method, l_wme_mode, output_dir,
     )
 
     t_opt = time.time()
-    m_analysis_tao = optimizer.solve(exp.m_background)
+    # tao_start_vec is exp.m_background unless the recovery ladder rescued
+    # the bg with an interpolated seed (Step 7c). The cost function still
+    # holds the ORIGINAL m_background for its prior term, so the
+    # statistical interpretation is unchanged — we only changed where TAO
+    # starts its search.
+    m_analysis_tao = optimizer.solve(tao_start_vec)
     opt_time = time.time() - t_opt
 
     # ================================================================
@@ -1115,6 +1429,9 @@ def run_single_method(args, method, l_wme_mode, output_dir,
             ),
         },
         "convergence": conv_info,
+        "bg_status": bg_status,
+        "bg_recovery_alpha": (float(recovery_alpha)
+                              if recovery_alpha is not None else None),
         "lwme_diagnostics": lwme_diagnostics_summary,
         "config": {
             "vmax": args.vmax, "track_shift_km": args.track_shift,
@@ -1658,6 +1975,11 @@ def main():
                 "n_func_evals": r["n_func_evals"],
                 "opt_time_s": r["opt_time_s"],
                 "best_iterate": r.get("best_iterate"),
+                # bg-feasibility status: "feasible",
+                # "feasible_after_stricter_solver", "feasible_after_seed", or
+                # "infeasible_no_seed". None if the result predates this fix.
+                "bg_status": r.get("bg_status"),
+                "bg_recovery_alpha": r.get("bg_recovery_alpha"),
             })
 
             # Incremental save after each window so walltime-capped runs
