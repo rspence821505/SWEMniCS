@@ -1506,11 +1506,32 @@ def run_single_method(args, method, l_wme_mode, output_dir,
             if rank == 0:
                 print(f"  [WARN] forward-evolve raised: {type(_fe_exc).__name__}: {_fe_exc}")
         _u_n_arr = solver_da.u_n.x.array[:state_size]
-        if not _forward_evolve_ok or not np.isfinite(_u_n_arr).all():
+        # Two-part sanity check on the advanced state:
+        #   (1) np.isfinite catches NaN/±inf,
+        #   (2) magnitude bound catches finite-but-divergent values that
+        #       np.isfinite happily passes. Observed: 4D-Var v=20 W4 blew
+        #       up to bg ~5e14 and propagated through chain_bg with the
+        #       isfinite-only guard. Threshold 1000 covers any physical
+        #       water column (h <~ 50 m) + velocity (|u|,|v| <~ 30 m/s)
+        #       on this case while still trapping divergent garbage.
+        _MAG_BOUND = 1.0e3
+        _local_finite = bool(np.isfinite(_u_n_arr).all())
+        _local_max_mag = float(np.max(np.abs(_u_n_arr))) if len(_u_n_arr) else 0.0
+        _global_finite = bool(comm.allreduce(int(_local_finite), op=MPI.MIN))
+        _global_max_mag = float(comm.allreduce(_local_max_mag, op=MPI.MAX))
+        _within_bound = _global_max_mag < _MAG_BOUND
+        if not _forward_evolve_ok or not _global_finite or not _within_bound:
             if rank == 0:
-                _nbad = int(np.sum(~np.isfinite(_u_n_arr))) if _forward_evolve_ok else -1
-                print(f"  [WARN] forward-evolve produced non-finite state "
-                      f"(nbad={_nbad}); reverting chain_bg to un-advanced analysis")
+                if not _forward_evolve_ok:
+                    _reason = "forward-evolve raised"
+                elif not _global_finite:
+                    _nbad = int(np.sum(~np.isfinite(_u_n_arr)))
+                    _reason = f"non-finite state (nbad_rank0={_nbad})"
+                else:
+                    _reason = (f"divergent magnitude "
+                               f"|u_n|_max={_global_max_mag:.3e} > {_MAG_BOUND:.0e}")
+                print(f"  [WARN] forward-evolve {_reason}; reverting chain_bg "
+                      f"to un-advanced analysis")
             advanced_full = analysis_full.copy()
         else:
             advanced_full = analysis_full.copy()
