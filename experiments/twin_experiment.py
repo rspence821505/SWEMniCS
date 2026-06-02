@@ -1020,8 +1020,13 @@ class TwinExperiment:
             H_u = obs_operator.forward(self.truth_trajectory[k])
             H_u_array = H_u.getArray()
 
-            signal_magnitude = np.abs(H_u_array).mean() + 1e-10
-            noise_std = self.config.obs_noise_level * signal_magnitude
+            # obs_noise_level is an ABSOLUTE noise std (same units as the obs
+            # field), not a fraction of the signal. The prior fraction-of-signal
+            # scaling caused R to grow per cycling window as the storm signal
+            # grew, and to detonate (variance ~1e+19) when wet-dry transients
+            # poisoned the mean(|H_u|). R must be constant across all windows
+            # in cycling DA — it is a sensor property, not a signal property.
+            noise_std = float(self.config.obs_noise_level)
             noise_stds.append(noise_std)
 
             noise = rng.normal(0, noise_std, size=H_u_array.shape)
