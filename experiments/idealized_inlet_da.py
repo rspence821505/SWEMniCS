@@ -270,6 +270,58 @@ def _try_stricter_bg_retry(cost_fn, forward_model, m_vec, rank):
     return feasible, cost_val
 
 
+def _try_h_clipped_seed(cost_fn, m_b_vec, h_indices, h_min, rank, comm):
+    """Localized rescue: clip h values to h_min where they have dropped below.
+
+    Constructs a seed by setting h = max(h, h_min) for cells whose stored h
+    is sub-h_min, leaving u/v and feasible-h DOFs unchanged. This targets
+    the failure mode where storm-driven shallow-region dynamics leave a
+    handful of cells with h<h_min in the propagated state, defeating the
+    global anchor interpolation in _find_feasible_seed (which can't repair
+    those cells without also polluting the bulk DA-corrected solution).
+
+    Returns (seed_vec, n_clipped) where n_clipped is the global count of
+    DOFs that needed clipping. If 0, the bg already satisfies h>=h_min
+    and any infeasibility is not h-driven — caller can skip the cost
+    re-evaluation in that case.
+
+    The caller owns destruction of the returned seed_vec.
+    """
+    bg_arr = m_b_vec.getArray(readonly=True)
+    if len(h_indices):
+        local_violations = int(np.sum(bg_arr[h_indices] < h_min))
+    else:
+        local_violations = 0
+    n_clipped = int(comm.allreduce(local_violations))
+
+    seed_vec = m_b_vec.duplicate()
+    seed_arr = seed_vec.getArray()
+    seed_arr[:] = bg_arr[:]
+    if len(h_indices):
+        seed_arr[h_indices] = np.maximum(bg_arr[h_indices], h_min)
+    seed_vec.setArray(seed_arr)
+    seed_vec.assemble()
+
+    if rank == 0:
+        print(f"  [bg-feasibility] h-clip seed: {n_clipped} DOFs below "
+              f"h_min={h_min:.3f} → clipped", flush=True)
+
+    if n_clipped == 0:
+        # bg already satisfies h>=h_min everywhere — cost re-eval would just
+        # repeat the raw bg result, so skip and signal "no clipping done".
+        return None, 0
+
+    feasible, _ = _eval_feasibility(cost_fn, seed_vec, rank,
+                                     label="h-clip")
+    if feasible:
+        return seed_vec, n_clipped
+    try:
+        seed_vec.destroy()
+    except Exception:
+        pass
+    return None, n_clipped
+
+
 def _find_feasible_seed(cost_fn, m_b_vec, anchor_vec, alphas, rank):
     """Backoff search for a feasible interpolated seed.
 
@@ -1036,8 +1088,26 @@ def run_single_method(args, method, l_wme_mode, output_dir,
             bg_status = "feasible_after_stricter_solver"
 
     if not bg_feasible:
-        # Step 2 — interpolated-seed search. Anchor is a spatially-uniform
-        # mean-h state (zero velocity), built from bg only (no truth).
+        # Step 2 — localized h-clip rescue. Targets the storm-driven failure
+        # mode where the propagated state has a handful of shallow cells
+        # with h < h_min while the bulk solution is otherwise sound. Sets
+        # h = max(h, h_min) only in violating cells; leaves u/v and feasible
+        # h DOFs unchanged. Cheaper and less destructive than the global
+        # anchor interpolation (Step 3) since it preserves DA's bulk
+        # corrections.
+        h_clip_seed_vec, n_clipped = _try_h_clipped_seed(
+            cost_fn, exp.m_background, h_indices,
+            float(getattr(args, "h_min", 0.01)), rank, comm)
+        if h_clip_seed_vec is not None:
+            bg_feasible = True
+            bg_status = "feasible_after_h_clip"
+            tao_start_vec = h_clip_seed_vec
+
+    if not bg_feasible:
+        # Step 3 — global interpolated-seed search. Anchor is a spatially-
+        # uniform mean-h state (zero velocity), built from bg only (no truth).
+        # Less surgical than h-clip but catches infeasibilities that aren't
+        # purely h<h_min driven (e.g. velocity-field pathologies).
         anchor_vec = _build_recovery_anchor(
             exp.m_background, h_indices, u_indices, v_indices, comm)
         seed_vec, found_alpha = _find_feasible_seed(
