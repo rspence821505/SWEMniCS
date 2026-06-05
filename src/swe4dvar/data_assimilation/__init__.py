@@ -160,6 +160,15 @@ except ImportError:
     DAMetrics = None
     CostFunctionHistory = None
 
+# Import QPCA-EnDCF ensemble filter (numpy-only; no PETSc dep).
+from .qpca_endcf import QPCAEnDCF
+# Import stochastic 4D-EnKF baseline (numpy-only; uses qpca_endcf helpers).
+from .enkf_4d import EnKF4D
+# Import sequential stochastic EnKF baseline (per-observation-time updates).
+from .seq_enkf import SeqEnKF
+# Import deterministic 4D LETKF baseline (Hunt-Kostelich-Szunyogh 2007).
+from .letkf import LETKF
+
 __all__ = [
     # Covariance utilities
     "CovarianceMatrix",
@@ -198,6 +207,11 @@ __all__ = [
     # Metrics
     "DAMetrics",
     "CostFunctionHistory",
+    # Ensemble filters
+    "QPCAEnDCF",
+    "EnKF4D",
+    "SeqEnKF",
+    "LETKF",
 ]
 
 __version__ = "0.2.0"
